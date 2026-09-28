@@ -193,6 +193,7 @@ fn is_known_finish_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(from = "WorkerUsageBlock")]
 pub struct UsageBlock {
     #[serde(default)]
     pub prompt_tokens: u32,
@@ -202,6 +203,60 @@ pub struct UsageBlock {
     pub total_tokens: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<u32>,
+    /// OpenAI-compatible prompt-token breakdown. Absent when the worker's
+    /// engine does not report prefix-cache hits (and from older workers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+impl UsageBlock {
+    /// Prompt tokens served from the engine's prefix cache, clamped to
+    /// `prompt_tokens`. `None` when the worker did not report a count.
+    pub fn cached_prompt_tokens(&self) -> Option<u32> {
+        self.prompt_tokens_details
+            .as_ref()
+            .map(|details| details.cached_tokens.min(self.prompt_tokens))
+    }
+}
+
+/// The usage block exactly as a worker sent it. Decoding goes through this so
+/// the cached count is clamped to `prompt_tokens` once, before any surface
+/// serializes the block back out.
+#[derive(Deserialize)]
+struct WorkerUsageBlock {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
+    #[serde(default)]
+    total_tokens: u32,
+    #[serde(default)]
+    images: Option<u32>,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+impl From<WorkerUsageBlock> for UsageBlock {
+    fn from(raw: WorkerUsageBlock) -> Self {
+        let prompt_tokens_details = raw
+            .prompt_tokens_details
+            .map(|details| PromptTokensDetails {
+                cached_tokens: details.cached_tokens.min(raw.prompt_tokens),
+            });
+        Self {
+            prompt_tokens: raw.prompt_tokens,
+            completion_tokens: raw.completion_tokens,
+            total_tokens: raw.total_tokens,
+            images: raw.images,
+            prompt_tokens_details,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1201,6 +1256,7 @@ mod tests {
             usage: if done {
                 Some(UsageBlock {
                     images: None,
+                    prompt_tokens_details: None,
                     prompt_tokens: 5,
                     completion_tokens: 3,
                     total_tokens: 8,
@@ -1625,6 +1681,7 @@ mod tests {
         collector.output_event_count = 2;
         collector.final_meta.as_mut().expect("terminal").usage = Some(UsageBlock {
             images: None,
+            prompt_tokens_details: None,
             prompt_tokens: 1,
             completion_tokens: 4,
             total_tokens: 5,
