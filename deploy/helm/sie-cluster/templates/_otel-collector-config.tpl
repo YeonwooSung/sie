@@ -69,7 +69,7 @@ processors:
         value: {{ $cloudRegion | quote }}
         action: upsert
 {{- end }}
-{{- if or $metricsEnabled (and $tracesEnabled $betterStack.enabled) }}
+{{- if or $metricsEnabled $logsEnabled (and $tracesEnabled $betterStack.enabled) }}
   # Application producers share one receiver, so service.name is retained
   # only after the signal-specific allowlist accepts it. Environment and
   # region are still collector-authored routing dimensions.
@@ -509,7 +509,7 @@ processors:
           - set(status.message, "")
           - set(trace_state, "")
           - set(links, [])
-          - 'set(name, "other") where name != "gateway.request" and name != "gateway.dispatch" and name != "gateway.dispatch.ipc" and name != "gateway.dispatch.i6pn" and name != "dispatcher.dispatch" and name != "dispatcher.modal.remote" and name != "dispatcher.modal.stream" and name != "dispatcher.modal.spawn" and name != "dispatcher.websocket" and name != "dispatcher.i6pn" and name != "dispatcher.fallback" and name != "sidecar.local_ingest" and name != "worker.local_ingest" and name != "gateway.publish" and name != "gateway.proxy" and name != "gateway.proxy_chat" and name != "gateway.proxy_request" and name != "gateway.proxy_generate" and name != "sidecar.dispatch" and name != "worker.run_batch" and name != "worker.run_batch.request" and name != "sidecar.dispatch.request" and name != "worker.streaming_processor" and name != "encode" and name != "score" and name != "extract" and name != "generate" and name != "openai_embeddings" and name != "chat_completions" and name != "rerank" and name != "other"'
+          - 'set(name, "other") where name != "gateway.request" and name != "gateway.response_body" and name != "gateway.generation_stream" and name != "gateway.dispatch" and name != "gateway.dispatch.ipc" and name != "gateway.dispatch.i6pn" and name != "dispatcher.dispatch" and name != "dispatcher.modal.remote" and name != "dispatcher.modal.stream" and name != "dispatcher.modal.spawn" and name != "dispatcher.websocket" and name != "dispatcher.i6pn" and name != "dispatcher.fallback" and name != "sidecar.local_ingest" and name != "worker.local_ingest" and name != "gateway.publish" and name != "gateway.proxy" and name != "gateway.proxy_chat" and name != "gateway.proxy_request" and name != "gateway.proxy_generate" and name != "sidecar.dispatch" and name != "worker.run_batch" and name != "worker.run_batch.request" and name != "sidecar.dispatch.request" and name != "worker.streaming_processor" and name != "encode" and name != "score" and name != "extract" and name != "generate" and name != "openai_embeddings" and name != "chat_completions" and name != "rerank" and name != "other"'
 {{- end }}
 {{- if $logsEnabled }}
   # Logs are allowlisted just like metrics are declared: only the fixed,
@@ -535,7 +535,17 @@ processors:
     log_statements:
       - context: resource
         statements:
-          - keep_keys(attributes, ["service.name", "service.instance.id", "deployment.environment", "cloud.region", "service.version"])
+          - set(cache["service.name"], attributes["service.name"])
+          - set(cache["service.instance.id"], attributes["service.instance.id"])
+          - set(cache["deployment.environment"], attributes["deployment.environment"])
+          - set(cache["cloud.region"], attributes["cloud.region"])
+          - set(cache["service.version"], attributes["service.version"])
+          - keep_keys(attributes, [])
+          - set(attributes["service.name"], cache["service.name"]) where cache["service.name"] != nil
+          - set(attributes["service.instance.id"], cache["service.instance.id"]) where cache["service.instance.id"] != nil
+          - set(attributes["deployment.environment"], cache["deployment.environment"]) where cache["deployment.environment"] != nil
+          - set(attributes["cloud.region"], cache["cloud.region"]) where cache["cloud.region"] != nil
+          - set(attributes["service.version"], cache["service.version"]) where cache["service.version"] != nil
           - set(schema_url, "")
       - context: scope
         statements:
@@ -545,7 +555,25 @@ processors:
           - set(schema_url, "")
       - context: log
         statements:
-          - keep_keys(attributes, ["event.name", "event.schema.version", "operation", "outcome", "http.status_code", "model", "machine_profile", "duration_ms", "admission_outcome"])
+          - set(cache["event.name"], attributes["event.name"])
+          - set(cache["event.schema.version"], attributes["event.schema.version"])
+          - set(cache["operation"], attributes["operation"])
+          - set(cache["outcome"], attributes["outcome"])
+          - set(cache["http.status_code"], attributes["http.status_code"])
+          - set(cache["model"], attributes["model"])
+          - set(cache["machine_profile"], attributes["machine_profile"])
+          - set(cache["duration_ms"], attributes["duration_ms"])
+          - set(cache["admission_outcome"], attributes["admission_outcome"])
+          - keep_keys(attributes, [])
+          - set(attributes["event.name"], cache["event.name"]) where cache["event.name"] != nil
+          - set(attributes["event.schema.version"], cache["event.schema.version"]) where cache["event.schema.version"] != nil
+          - set(attributes["operation"], cache["operation"]) where cache["operation"] != nil
+          - set(attributes["outcome"], cache["outcome"]) where cache["outcome"] != nil
+          - set(attributes["http.status_code"], cache["http.status_code"]) where cache["http.status_code"] != nil
+          - set(attributes["model"], cache["model"]) where cache["model"] != nil
+          - set(attributes["machine_profile"], cache["machine_profile"]) where cache["machine_profile"] != nil
+          - set(attributes["duration_ms"], cache["duration_ms"]) where cache["duration_ms"] != nil
+          - set(attributes["admission_outcome"], cache["admission_outcome"]) where cache["admission_outcome"] != nil
           # Canonical release domains are rechecked at the collector boundary
           # so malformed producer values cannot become vendor dimensions.
           - 'set(attributes["model"], "other") where attributes["event.schema.version"] == "2" and not IsMatch(attributes["model"], "^(BAAI/bge-m3|IDEA-Research/grounding-dino-base|Qwen/Qwen3-Embedding-4B|Qwen/Qwen3-Reranker-0[.]6B|Qwen/Qwen3-Reranker-4B|Qwen/Qwen3-VL-Reranker-2B|Qwen/Qwen3[.]5-4B|Qwen/Qwen3[.]6-27B|Snowflake/snowflake-arctic-embed-l-v2[.]0|docling|fastino/gliguard-LLMGuardrails-300M|fastino/gliner2-base-v1|fastino/gliner2-large-v1|google/owlv2-base-patch16-ensemble|google/siglip-so400m-patch14-384|google/siglip2-base-patch16-224|ibm-granite/granite-guardian-3[.]0-2b|knowledgator/gliclass-large-v3[.]0|lightonai/GTE-ModernColBERT-v1|lightonai/LightOnOCR-2-1B|numind/NuNER_Zero|openai/whisper-large-v3-turbo|other|prithivida/Splade_PP_en_v2|tencent/R3-embedding-0[.]6b|tencent/R3-rerank-0[.]6b|urchade/gliner_multi-v2[.]1|urchade/gliner_multi_pii-v1)$")'
@@ -554,6 +582,77 @@ processors:
           - set(body, "inference.request.completed")
           - set(severity_text, "INFO")
           - set(severity_number, SEVERITY_NUMBER_INFO)
+  # Fixed structured lifecycle records only; never a stdout/logging bridge.
+  filter/lifecycle_logs:
+    error_mode: propagate
+    logs:
+      log_record:
+        - 'attributes["event.name"] != "inference.lifecycle.completed"'
+        - 'body != "inference.lifecycle.completed"'
+        - 'attributes["event.schema.version"] != "1"'
+        - 'attributes["phase"] != "request" and attributes["phase"] != "response_body" and attributes["phase"] != "generation_stream" and attributes["phase"] != "worker_generation" and attributes["phase"] != "dispatch_attempt"'
+        - 'attributes["operation"] != "encode" and attributes["operation"] != "score" and attributes["operation"] != "extract" and attributes["operation"] != "generate" and attributes["operation"] != "embeddings" and attributes["operation"] != "moderations" and attributes["operation"] != "other"'
+        - 'attributes["outcome"] != "success" and attributes["outcome"] != "rejected" and attributes["outcome"] != "error" and attributes["outcome"] != "cancelled"'
+        - 'attributes["error_class"] != "none" and attributes["error_class"] != "client_error" and attributes["error_class"] != "server_error" and attributes["error_class"] != "transport" and attributes["error_class"] != "timeout" and attributes["error_class"] != "worker" and attributes["error_class"] != "cancelled" and attributes["error_class"] != "protocol" and attributes["error_class"] != "other"'
+        - 'not IsDouble(attributes["duration_ms"]) and not IsInt(attributes["duration_ms"])'
+        - 'attributes["duration_ms"] != attributes["duration_ms"] or attributes["duration_ms"] < 0 or attributes["duration_ms"] > 86400000'
+        - 'attributes["first_token_ms"] != nil and not IsDouble(attributes["first_token_ms"]) and not IsInt(attributes["first_token_ms"])'
+        - 'attributes["first_token_ms"] != nil and (attributes["first_token_ms"] != attributes["first_token_ms"] or attributes["first_token_ms"] < 0 or attributes["first_token_ms"] > attributes["duration_ms"])'
+  filter/gateway_lifecycle_logs:
+    error_mode: propagate
+    logs:
+      log_record:
+        - 'attributes["phase"] != "request" and attributes["phase"] != "response_body" and attributes["phase"] != "generation_stream"'
+  filter/application_lifecycle_logs:
+    error_mode: propagate
+    logs:
+      log_record:
+        - 'not (resource.attributes["service.name"] == "sie-worker" and attributes["phase"] == "worker_generation") and not (resource.attributes["service.name"] == "sie-dispatcher" and attributes["phase"] == "dispatch_attempt")'
+  transform/lifecycle_logs:
+    error_mode: propagate
+    log_statements:
+      - context: resource
+        statements:
+          - set(cache["service.name"], attributes["service.name"])
+          - set(cache["service.instance.id"], attributes["service.instance.id"])
+          - set(cache["deployment.environment"], attributes["deployment.environment"])
+          - set(cache["cloud.region"], attributes["cloud.region"])
+          - set(cache["service.version"], attributes["service.version"])
+          - keep_keys(attributes, [])
+          - set(attributes["service.name"], cache["service.name"]) where cache["service.name"] != nil
+          - set(attributes["service.instance.id"], cache["service.instance.id"]) where cache["service.instance.id"] != nil
+          - set(attributes["deployment.environment"], cache["deployment.environment"]) where cache["deployment.environment"] != nil
+          - set(attributes["cloud.region"], cache["cloud.region"]) where cache["cloud.region"] != nil
+          - set(attributes["service.version"], cache["service.version"]) where cache["service.version"] != nil
+          - set(schema_url, "")
+      - context: scope
+        statements:
+          - keep_keys(attributes, [])
+          - set(name, "")
+          - set(version, "")
+          - set(schema_url, "")
+      - context: log
+        statements:
+          - set(cache["event.name"], attributes["event.name"])
+          - set(cache["event.schema.version"], attributes["event.schema.version"])
+          - set(cache["phase"], attributes["phase"])
+          - set(cache["operation"], attributes["operation"])
+          - set(cache["outcome"], attributes["outcome"])
+          - set(cache["error_class"], attributes["error_class"])
+          - set(cache["duration_ms"], attributes["duration_ms"])
+          - set(cache["first_token_ms"], attributes["first_token_ms"])
+          - keep_keys(attributes, [])
+          - set(attributes["event.name"], cache["event.name"]) where cache["event.name"] != nil
+          - set(attributes["event.schema.version"], cache["event.schema.version"]) where cache["event.schema.version"] != nil
+          - set(attributes["phase"], cache["phase"]) where cache["phase"] != nil
+          - set(attributes["operation"], cache["operation"]) where cache["operation"] != nil
+          - set(attributes["outcome"], cache["outcome"]) where cache["outcome"] != nil
+          - set(attributes["error_class"], cache["error_class"]) where cache["error_class"] != nil
+          - set(attributes["duration_ms"], cache["duration_ms"]) where cache["duration_ms"] != nil
+          - set(attributes["first_token_ms"], cache["first_token_ms"]) where cache["first_token_ms"] != nil
+          - set(severity_text, "INFO")
+          - set(severity_number, SEVERITY_NUMBER_INFO)
+
 {{- end }}
 
 exporters:
@@ -671,6 +770,14 @@ service:
     logs:
       receivers: [otlp/gateway]
       processors: [memory_limiter, resource/gateway_identity, filter/contract_logs, transform/contract_logs, batch]
+      exporters: {{ toJson $logExporters }}
+    logs/lifecycle/gateway:
+      receivers: [otlp/gateway]
+      processors: [memory_limiter, resource/gateway_identity, filter/gateway_lifecycle_logs, filter/lifecycle_logs, transform/lifecycle_logs, batch]
+      exporters: {{ toJson $logExporters }}
+    logs/lifecycle/application:
+      receivers: [otlp/application]
+      processors: [memory_limiter, filter/application_lifecycle_logs, resource/application_identity, filter/lifecycle_logs, transform/lifecycle_logs, batch]
       exporters: {{ toJson $logExporters }}
   {{- end }}
 {{- end -}}
