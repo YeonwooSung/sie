@@ -330,19 +330,20 @@ render when it is empty or null.
 "true" when the chart generates the admin-token Secret: no
 config.auth.adminTokenSecretName, and config.auth.generateAdminToken is not
 false. An absent key counts as true, so `helm upgrade --reuse-values` from a
-release that predates the key keeps the default.
+release that predates the key keeps the default. An empty value also counts as
+true.
 */}}
 {{- define "sie-cluster.config.generatesAdminToken" -}}
 {{- $auth := .Values.config.auth | default dict -}}
-{{- if and (not $auth.adminTokenSecretName) (dig "generateAdminToken" true $auth) -}}
+{{- if and (not $auth.adminTokenSecretName) (ne (dig "generateAdminToken" true $auth | toString | trim | lower) "false") -}}
 true
 {{- end -}}
 {{- end }}
 
 {{/*
-Secret holding the sie-config admin token that sie-config, the gateway, and
-worker sidecars share: config.auth.adminTokenSecretName when set, otherwise the
-chart-generated Secret, otherwise empty (no token).
+Secret holding the sie-config admin (write) token, which only sie-config reads:
+config.auth.adminTokenSecretName when set, otherwise the chart-generated
+Secret, otherwise empty (no token).
 */}}
 {{- define "sie-cluster.config.adminTokenSecretName" -}}
 {{- if .Values.config.auth.adminTokenSecretName -}}
@@ -353,32 +354,177 @@ chart-generated Secret, otherwise empty (no token).
 {{- end }}
 
 {{/*
-Fail when an existing admin-token Secret has no value under the configured key,
-or a value shorter than 32 characters, instead of replacing the token that
-running pods hold. Args (dict): name (Secret), key (data key), data (base64
-value, empty when the key is missing).
+Data key of the read-token Secret (config.auth.readTokenSecretKey). An absent
+key, as after `helm upgrade --reuse-values` from a release that predates it,
+takes the default; an empty value fails the render.
 */}}
-{{- define "sie-cluster.config.validateReusedAdminToken" -}}
+{{- define "sie-cluster.config.readTokenSecretKey" -}}
+{{- $key := dig "readTokenSecretKey" "SIE_CONFIG_READ_TOKEN" (.Values.config.auth | default dict) | default "" | toString | trim -}}
+{{- if not $key -}}
+{{- fail "config.auth.readTokenSecretKey is empty. Set it to the Secret key that holds the sie-config read token (the chart default is SIE_CONFIG_READ_TOKEN)." -}}
+{{- end -}}
+{{- $key -}}
+{{- end }}
+
+{{- define "sie-cluster.config.generatedReadTokenSecretName" -}}
+{{- printf "%s-read-token" (include "sie-cluster.config.serviceName" .) -}}
+{{- end }}
+
+{{/*
+"true" when the chart generates the read-token Secret: sie-config has an admin
+token, config.auth.readTokenSecretName is empty, and
+config.auth.generateReadToken is not false. Absent keys take their defaults,
+so `helm upgrade --reuse-values` from a release that predates them generates
+the Secret. An empty generateReadToken also counts as true.
+*/}}
+{{- define "sie-cluster.config.generatesReadToken" -}}
+{{- $auth := .Values.config.auth | default dict -}}
+{{- if and (include "sie-cluster.config.adminTokenSecretName" .) (not (dig "readTokenSecretName" "" $auth)) (ne (dig "generateReadToken" true $auth | toString | trim | lower) "false") -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Secret holding the read-scoped sie-config token that sie-config accepts on
+reads and the gateway and worker sidecars present: config.auth.readTokenSecretName
+when set, otherwise the chart-generated Secret, otherwise empty (no token).
+*/}}
+{{- define "sie-cluster.config.readTokenSecretName" -}}
+{{- $name := dig "readTokenSecretName" "" (.Values.config.auth | default dict) -}}
+{{- if $name -}}
+{{- $name -}}
+{{- else if include "sie-cluster.config.generatesReadToken" . -}}
+{{- include "sie-cluster.config.generatedReadTokenSecretName" . -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Env entry SIE_CONFIG_SERVICE_TOKEN for a sie-config consumer (the gateway or a
+worker sidecar): the read token, or an empty value when the chart runs no
+sie-config or sie-config has no read token, so the consumer never falls back to
+presenting SIE_ADMIN_TOKEN.
+*/}}
+{{- define "sie-cluster.config.serviceTokenEnv" -}}
+{{- $secret := "" -}}
+{{- if .Values.config.enabled -}}
+{{- $secret = include "sie-cluster.config.readTokenSecretName" . -}}
+{{- end -}}
+- name: SIE_CONFIG_SERVICE_TOKEN
+{{- if $secret }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ $secret }}
+      key: {{ include "sie-cluster.config.readTokenSecretKey" . }}
+{{- else }}
+  value: ""
+{{- end }}
+{{- end }}
+
+{{/*
+Data key of the gateway's inbound admin-token Secret
+(gateway.auth.adminTokenSecretKey), with the same absent-key default and
+empty-value failure as the sie-config keys.
+*/}}
+{{- define "sie-cluster.gateway.adminTokenSecretKey" -}}
+{{- $key := dig "adminTokenSecretKey" "SIE_ADMIN_TOKEN" (.Values.gateway.auth | default dict) | default "" | toString | trim -}}
+{{- if not $key -}}
+{{- fail "gateway.auth.adminTokenSecretKey is empty. Set it to the Secret key that holds the gateway admin token (the chart default is SIE_ADMIN_TOKEN)." -}}
+{{- end -}}
+{{- $key -}}
+{{- end }}
+
+{{/*
+Chart-generated token Secret: a random 64-character token on first install,
+and the existing token on upgrade (read with lookup and validated rather than
+replaced). Kept on uninstall. Args (dict): root, name (Secret), key (data key),
+keySetting and nameSetting (the values paths named in validation errors).
+*/}}
+{{- define "sie-cluster.config.generatedTokenSecret" -}}
+{{- $token := randAlphaNum 64 | b64enc -}}
+{{- with lookup "v1" "Secret" (include "sie-cluster.namespace" $.root) $.name -}}
+{{- $existing := index (.data | default dict) $.key | default "" -}}
+{{- include "sie-cluster.config.validateReusedToken" (dict "name" $.name "key" $.key "data" $existing "keySetting" $.keySetting "nameSetting" $.nameSetting) -}}
+{{- $token = $existing -}}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .name }}
+  namespace: {{ include "sie-cluster.namespace" .root }}
+  labels:
+    {{- include "sie-cluster.config.labels" .root | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+type: Opaque
+data:
+  {{ .key | quote }}: {{ $token | quote }}
+{{- end }}
+
+{{/*
+Fail when an existing chart-generated token Secret has no value under the
+configured key, or a value shorter than 32 characters, instead of replacing the
+token that running pods hold. Args (dict): name (Secret), key (data key), data
+(base64 value, empty when the key is missing), keySetting and nameSetting (the
+values paths for the Secret key and an operator-managed Secret).
+*/}}
+{{- define "sie-cluster.config.validateReusedToken" -}}
 {{- if not .data -}}
-{{- fail (printf "Secret %s exists but has no %s key. If config.auth.adminTokenSecretKey was renamed, set it back to the key the Secret holds. If the Secret was created by hand, set config.auth.adminTokenSecretName to it so the chart uses it unchanged. Otherwise restore the key, or delete the Secret so the chart generates a new token, then restart sie-config, the gateway, and the workers." .name .key) -}}
+{{- fail (printf "Secret %s exists but has no %s key. If %s was renamed, set it back to the key the Secret holds. If the Secret was created by hand, set %s to it so the chart uses it unchanged. Otherwise restore the key, or delete the Secret so the chart generates a new token, then restart sie-config, the gateway, and the workers." .name .key .keySetting .nameSetting) -}}
 {{- else if lt (len (b64dec .data)) 32 -}}
 {{- fail (printf "Secret %s holds a %s value shorter than 32 characters. Replace it with a random value of at least 32 characters, or delete the Secret so the chart generates a new token, then restart sie-config, the gateway, and the workers." .name .key) -}}
 {{- end -}}
 {{- end }}
 
 {{/*
-Fail the render when sie-config would run without an admin token outside
-staging, development, or ci. In production ("prod" or "production") it would
-refuse every /v1/configs request, so the gateway and worker sidecars could never
-load the model catalog; any other value would leave the API unauthenticated.
+Fail the render when the sie-config tokens are not kept apart or sie-config
+would run without an admin token outside staging, development, or ci:
+- an admin token without a read token leaves the gateway and worker sidecars
+  without a credential;
+- a read token or gateway admin token that is the same Secret key as the
+  sie-config admin token hands the write credential to every gateway or worker
+  sidecar, and a gateway admin token that is the read token's Secret key lets
+  every worker sidecar call the gateway admin routes;
+- without an admin token, production ("prod" or "production") refuses every
+  write (and every read without a read token), and any other value leaves the
+  API unauthenticated.
 */}}
 {{- define "sie-cluster.config.validateAuth" -}}
-{{- if not (include "sie-cluster.config.adminTokenSecretName" .) -}}
+{{- $admin := include "sie-cluster.config.adminTokenSecretName" . -}}
+{{- $read := include "sie-cluster.config.readTokenSecretName" . -}}
+{{- if and $admin (not $read) -}}
+{{- fail "sie-config has an admin token but no read token (config.auth.generateReadToken=false and config.auth.readTokenSecretName is empty), so the gateway and worker sidecars would have no credential to load the model catalog. Set config.auth.readTokenSecretName to an existing Secret, or set config.auth.generateReadToken=true so the chart generates one." -}}
+{{- end -}}
+{{- $adminRef := "" -}}
+{{- if $admin -}}
+{{- $adminRef = printf "%s/%s" $admin (include "sie-cluster.config.adminTokenSecretKey" .) -}}
+{{- end -}}
+{{- $readRef := "" -}}
+{{- if $read -}}
+{{- $readRef = printf "%s/%s" $read (include "sie-cluster.config.readTokenSecretKey" .) -}}
+{{- end -}}
+{{- if and $adminRef (eq $readRef $adminRef) -}}
+{{- fail (printf "config.auth.readTokenSecretName and readTokenSecretKey point at the sie-config admin token (%s), which would give every gateway and worker sidecar write access to the model catalog. Store the read token in a different Secret or key." $adminRef) -}}
+{{- end -}}
+{{- with dig "adminTokenSecretName" "" (.Values.gateway.auth | default dict) -}}
+{{- $gatewayRef := printf "%s/%s" . (include "sie-cluster.gateway.adminTokenSecretKey" $) -}}
+{{- if and $adminRef (eq $gatewayRef $adminRef) -}}
+{{- fail (printf "gateway.auth.adminTokenSecretName and adminTokenSecretKey point at the sie-config admin token (%s), which would give every gateway pod write access to the model catalog. Create a separate Secret for the gateway admin token." $gatewayRef) -}}
+{{- end -}}
+{{- if and $readRef (eq $gatewayRef $readRef) -}}
+{{- fail (printf "gateway.auth.adminTokenSecretName and adminTokenSecretKey point at the sie-config read token (%s), which every worker sidecar holds, so any worker sidecar could call the gateway admin routes. Create a separate Secret for the gateway admin token." $gatewayRef) -}}
+{{- end -}}
+{{- end -}}
+{{- if not $admin -}}
 {{- $env := include "sie-cluster.config.deploymentEnv" . | trim | lower -}}
-{{- if has $env (list "prod" "production") -}}
-{{- fail (printf "sie-config would run with telemetry.deploymentEnv=%q and no admin token (config.auth.generateAdminToken=false and config.auth.adminTokenSecretName is empty), so it would refuse every /v1/configs request and the gateway could not load the model catalog. Set config.auth.adminTokenSecretName to an existing Secret, or set config.auth.generateAdminToken=true so the chart generates one." $env) -}}
-{{- else if not (has $env (list "staging" "development" "ci")) -}}
-{{- fail (printf "sie-config would run with telemetry.deploymentEnv=%q and no admin token (config.auth.generateAdminToken=false and config.auth.adminTokenSecretName is empty), so it would serve /v1/configs without authentication. Running without a token is supported only for telemetry.deploymentEnv staging, development, or ci. Otherwise set config.auth.adminTokenSecretName to an existing Secret, or set config.auth.generateAdminToken=true so the chart generates one." $env) -}}
+{{- $production := has $env (list "prod" "production") -}}
+{{- if or $production (not (has $env (list "staging" "development" "ci"))) -}}
+{{- $effect := "serve /v1/configs without authentication" -}}
+{{- if $read -}}
+{{- $effect = "refuse every config write and serve only reads that present the read token" -}}
+{{- else if $production -}}
+{{- $effect = "refuse every /v1/configs request and the gateway could not load the model catalog" -}}
+{{- end -}}
+{{- fail (printf "sie-config would run with telemetry.deploymentEnv=%q and no admin token (config.auth.generateAdminToken=false and config.auth.adminTokenSecretName is empty), so it would %s. Running without an admin token is supported only for telemetry.deploymentEnv staging, development, or ci. Otherwise set config.auth.adminTokenSecretName to an existing Secret, or set config.auth.generateAdminToken=true so the chart generates one." $env $effect) -}}
 {{- end -}}
 {{- end -}}
 {{- end }}
