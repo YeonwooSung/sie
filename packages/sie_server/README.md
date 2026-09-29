@@ -167,9 +167,11 @@ profile, or send `options={"cuda_graphs": "off"}` with a request.
 Graphs apply on CUDA to the DeBERTa-based GLiClass models: the v1.0 models,
 `gliclass-base-v3.0` and `gliclass-large-v3.0`, the base and large instruct
 models, the Opir multitask models and `gliclass-multilang-mini`. The
-ModernBERT-based models (the edge models, `gliclass-multilang-edge` and the
-Opir edge models), CPU and MPS run eagerly with any value, and the load logs a
-warning.
+ModernBERT-based models (the edge models, `gliclass-multilang-edge`, the Opir
+edge models and `gliclass-modern-{base,large}-v3.0`), CPU and MPS run without
+graphs with any value, and the load logs a warning. On CUDA, the
+ModernBERT-based models can run their encoder on the flash-attention path
+below instead.
 
 **Shapes.** A graph holds at most 2,048 tokens (batch size times padded
 length), or 1,024 for encoders wider than 768 such as DeBERTa-v3-large.
@@ -233,6 +235,116 @@ as it would in an eager forward. Each model counts the forwards it
 replays, records, and runs eagerly (by reason: past the token bound, recording
 paused, budget full, and so on), and logs the counts every ten minutes while it
 serves requests.
+
+### GLiClass ModernBERT flash attention
+
+The GLiClass models built on ModernBERT or mmBERT (`gliclass-edge-v3.0`,
+`gliclass-instruct-edge-v1.0`, `gliclass-multilang-edge`, `opir-edge-v1.0`,
+`opir-edge-multilang-v1.0`, `gliclass-modern-base-v3.0` and
+`gliclass-modern-large-v3.0`) can run their encoder through the
+flash-attention layer stack that SIE's ModernBERT embedding, late-interaction,
+cross-encoder and Laya adapters share. The rows of a forward are packed into
+one token stream without padding, each row attends only to itself through
+`flash_attn_varlen_func`, and the RoPE tables are built once, at load. The
+gliclass scoring head (label-token features, pooling, projections and scorer)
+runs unchanged on the encoder output. Label groups, instructions, examples,
+overflow policies, usage and per-item errors behave as before. It is an
+operator setting:
+
+```yaml
+profiles:
+  default:
+    adapter_options:
+      loadtime:
+        modernbert_flash: true
+```
+
+`modernbert_flash: single-label` limits it to single-label requests; a
+request with `"classification_type": "multi-label"` then runs the gliclass
+forward. It applies to float16 and bfloat16 weights on CUDA GPUs with flash-attn
+(Ampere or newer). On CPU, MPS, older GPUs or without flash-attn, the model
+runs the gliclass forward as before, and the load logs why. DeBERTa-based
+models ignore the setting. If the flash path fails with an error other than
+running out of memory, the gliclass forward answers that request, and the
+model logs the error and stays on the gliclass forward until it is reloaded.
+The shipped profiles enable it where the scores
+met the margin rule below: for every request on `gliclass-modern-base-v3.0`,
+and for single-label requests on `gliclass-multilang-edge` and
+`gliclass-modern-large-v3.0`. The other four models keep the gliclass forward.
+
+On a GPU with flash-attn, the gliclass forward already runs the Hugging Face
+ModernBERT flash-attention path. That path unpads and repads every batch,
+rotates queries and keys with one fused kernel per layer, and runs its MLPs
+through `torch.compile`. Classification forwards are small, so the host
+launching kernels, not the GPU, bounds most of them, and the flash path needs
+less host time per forward. On an L4, a one-item `gliclass-edge-v3.0` forward
+keeps the GPU busy for 2.4 ms of its 12.7 ms on the gliclass forward, and for
+0.85 ms of 8.8 ms on the flash path. The flash path runs the rotation and the
+MLP activation as several separate kernels, though, so larger forwards, which
+the GPU bounds, are faster on the gliclass forward. A forward with more packed
+tokens than a bound therefore runs the gliclass forward: 4,096 tokens for
+encoders up to 384 wide, 2,048 up to 768, and 1,024 wider. On an L4,
+`gliclass-modern-large-v3.0` is 1.13x faster on the flash path at 1,024
+packed tokens and 0.90x at 1,289; `gliclass-modern-base-v3.0` is 1.27x at
+2,048 and 0.96x at 2,560.
+
+Latency is the median of 400 one-item requests on the CVE descriptions from
+`examples/typed-decisions`: one question with eight labels, or three questions
+as separate label groups. Each throughput request holds 64 items, one in eight
+of them a long document, and one question. Both paths ran in one process on an
+L4, from the gliclass forward to the flash path:
+
+| Model | One item, one question | One item, three separate groups | 64 items per request |
+|--|--|--|--|
+| `gliclass-edge-v3.0` | 13.6 -> 11.1 ms | 15.1 -> 12.6 ms | 351 -> 397 items/s |
+| `gliclass-instruct-edge-v1.0` | 14.2 -> 11.9 ms | 15.4 -> 13.1 ms | 334 -> 376 items/s |
+| `gliclass-multilang-edge` | 25.8 -> 20.6 ms | 26.8 -> 21.6 ms | 235 -> 279 items/s |
+| `opir-edge-v1.0` | 13.8 -> 11.3 ms | 14.9 -> 12.4 ms | 287 -> 313 items/s |
+| `opir-edge-multilang-v1.0` | 28.4 -> 22.6 ms | 29.7 -> 24.0 ms | 207 -> 241 items/s |
+| `gliclass-modern-base-v3.0` | 25.3 -> 19.9 ms | 26.7 -> 21.3 ms | 229 -> 253 items/s |
+| `gliclass-modern-large-v3.0` | 32.3 -> 25.1 ms | 34.2 -> 27.1 ms | 173 -> 173 items/s |
+
+**Scores.** The two paths round float16 sums differently. We compared them on
+the 384 CVE descriptions from `examples/typed-decisions`, three questions
+each: asked one at a time, with an instruction, with a few-shot example, as
+separate and as joint groups, and in requests of eight, plus 65 long documents
+under `truncate_text`. That is 7,497 answers per model. A shipped profile
+enables the flash path only when the model meets the margin rule against the
+gliclass forward: (i) no probability moves by more than 0.02, and (ii) every
+answer whose top label changes had a top-two margin, on the gliclass forward,
+smaller than the gliclass forward's own batching noise. The batching noise is
+the largest probability change the gliclass forward shows between an item sent
+alone and the same item in a request of eight with the same options, over the
+same kinds of requests.
+
+| Model | Largest probability change | Top label changed | Largest margin of a changed answer | Batching noise | Shipped profile |
+|--|--|--|--|--|--|
+| `gliclass-multilang-edge` | 0.015 | 18 | 0.0046 | 0.016 | on (single-label) |
+| `gliclass-modern-base-v3.0` | 0.010 | 22 | 0.0029 | 0.0061 | on |
+| `gliclass-modern-large-v3.0` | 0.015 | 4 | 0.0039 | 0.014 | on (single-label) |
+| `gliclass-edge-v3.0` | 0.016 | 24 | 0.0098 | 0.0066 | off (2 answers over the noise) |
+| `gliclass-instruct-edge-v1.0` | 0.012 | 5 | 0.0077 | 0.0062 | off (1 answer over the noise) |
+| `opir-edge-v1.0` | 0.018 | 12 | 0.019 | 0.011 | off |
+| `opir-edge-multilang-v1.0` | 0.037 | 30 | 0.028 | 0.032 | off |
+
+Multi-label scores (independent sigmoids) were checked the same way, with the
+rule read for the 0.5 threshold at which a multi-label group selects its
+labels: (i) no score moves by more than 0.02, and (ii) every score that
+crosses 0.5 was closer to 0.5 than the gliclass forward's own batching noise.
+Each request kind was sent one item at a time and eight at a time, 59,220
+scores per model:
+
+| Model | Largest score change | Scores crossing 0.5 (largest distance from 0.5) | Batching noise | Multi-label |
+|--|--|--|--|--|
+| `gliclass-modern-base-v3.0` | 0.0088 | 18 (0.0020) | 0.0059 | flash |
+| `gliclass-modern-large-v3.0` | 0.024 (joint groups) | 23 (0.0044) | 0.039 | gliclass forward |
+| `gliclass-multilang-edge` | 0.039 (few-shot examples) | 18 (0.0073) | 0.032 | gliclass forward |
+
+Usage and per-item errors were identical in every answer. Against the same
+checkpoints in float32, the flash path is as accurate as the gliclass forward:
+over the seven models, the gliclass forward's top label differs from float32
+in 128 answers, the flash path's in 126. To run a model on the other path, set
+`modernbert_flash` in its profile.
 
 ### GLiNER2.5-Decide usage and limits
 
