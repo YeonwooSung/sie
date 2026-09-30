@@ -755,7 +755,8 @@ fail-closed isolation behavior.
 `values-ha.yaml` is the tested composition of the durability knobs below with
 a replicated broker and a second gateway: two gateway replicas, a three-member
 NATS cluster with a JetStream file store per member, and file-backed work-queue
-streams replicated across all three. Layer it under a provider overlay:
+streams replicated across all three. It also enables the
+[worker NetworkPolicy](#worker-networkpolicy). Layer it under a provider overlay:
 
 ```bash
 helm install sie deploy/helm/sie-cluster \
@@ -1118,24 +1119,171 @@ contain the generated tokens.
 
 ## Ingress
 
-Enable the Ingress with `ingress.enabled=true` and route traffic to the gateway by
-hostname. Use the list-valued `ingress.hosts` to front the gateway with one or more
-hostnames — each entry becomes an Ingress rule (and, when TLS is enabled, a SAN on
-the cert):
+The Ingress is off by default, including in the AWS, GKE, AKS, and ACK
+overlays. Install an ingress controller first, then enable it with
+`ingress.enabled=true`, gateway auth, and TLS, and route traffic to the gateway
+by hostname. Use the list-valued `ingress.hosts` to front the gateway with one
+or more hostnames — each entry becomes an Ingress rule (and, when TLS is
+enabled, a SAN on the cert):
 
 ```yaml
+gateway:
+  auth:
+    mode: static
+    tokenSecretName: sie-gateway-auth   # Secret with comma-separated tokens
 ingress:
   enabled: true
   className: nginx
   hosts:
     - sie.example.com
     - api.example.com
+  tlsConfig:
+    enabled: true
 ```
+
+With the default `byo` TLS mode, create the `kubernetes.io/tls` Secret named by
+`ingress.tlsConfig.secretName` (default `sie-tls`) before installing, or use the
+`cert-manager` or `self-signed` mode described in [TLS / HTTPS](#tls--https).
 
 The singular `ingress.host` is the backward-compatible single-host shorthand; it is
 ignored whenever `ingress.hosts` is non-empty. With neither set the chart renders a
 host-less catch-all Ingress. All hosts share the single `ingress.tlsConfig.secretName`
 (one multi-SAN certificate).
+
+### Authentication and TLS requirements
+
+The gateway authenticates nothing by default (`gateway.auth.mode: none`). The
+chart refuses to render a gateway Ingress unless something authenticates its
+requests, because an Ingress publishes the inference API and the pool API,
+which keeps GPU workers warm, to anyone who can reach the ingress controller.
+A hostname or a certificate is not access control: hostnames are public DNS and
+certificates appear in Certificate Transparency logs. One of the following must
+hold:
+
+- the gateway requires a token: `gateway.auth.mode=static` with
+  `gateway.auth.tokenSecretName` naming a Secret of comma-separated tokens.
+  SDK clients pass one as `api_key`/`apiKey`, or read it from `SIE_API_KEY`
+  when their base URL comes from `SIE_BASE_URL`;
+- the oauth2-proxy edge is enabled (`auth.enabled=true`). It works through the
+  `nginx.ingress.kubernetes.io/auth-*` annotations, which only the ingress-nginx
+  controller honours; the NGINX Inc controller (`nginx.org/ingress-controller`)
+  ignores them even when its class is also named `nginx`. With cluster access
+  (`helm install`/`upgrade`), the chart looks up the IngressClass named by
+  `ingress.className` and requires its `spec.controller` to be listed in
+  `auth.ingress.acceptedControllers` (default `k8s.io/ingress-nginx`; add the
+  controller string of a second ingress-nginx installation, for example
+  `k8s.io/internal-ingress-nginx`). When `ingress.className` is empty, the API
+  server assigns one of the default IngressClasses, so every class marked as
+  default must use an accepted controller. An offline render
+  (`helm template`, including GitOps tools that render that way) cannot see
+  IngressClasses, so it accepts only `ingress.className=nginx` and cannot tell
+  the two controllers apart; use gateway token auth there if the class name
+  differs. The default `auth.oauth2Proxy.emailDomain: "*"` admits any account
+  the configured OIDC issuer authenticates; narrow it for a shared issuer;
+- `ingress.allowUnauthenticated=true` explicitly accepts an unauthenticated
+  Ingress, for example behind a private ingress controller.
+
+The Ingress also needs TLS, so tokens and session cookies do not cross the
+network in cleartext: `ingress.tlsConfig.enabled=true` with at least one host
+(the Ingress carries TLS only for named hosts, so an IP-only self-signed
+certificate from `selfSigned.leaf.ipAddresses` is not supported for the gateway
+Ingress), `ingress.tlsConfig.mode=disabled` as an explicit statement that TLS
+terminates upstream of the Ingress, or the explicit `ingress.allowPlaintext=true`.
+The MCP edge Ingress (`mcpEdge.ingress`) carries connector secrets and OAuth
+tokens and follows the same TLS rule, with `mcpEdge.ingress.allowPlaintext=true`
+as its explicit opt-in. Its certificate lives in its own Secret,
+`<release fullname>-mcp-tls`: `cert-manager` mode issues it, `byo` mode expects
+you to create it, and `self-signed` mode does not issue it, so the chart refuses
+`self-signed` with the MCP edge Ingress.
+
+Both opt-ins accept only a YAML boolean; a quoted `"false"` fails the render.
+`gateway.auth.mode` must be `none`, `static`, or `token` exactly as the gateway
+reads it, and token auth without `gateway.auth.tokenSecretName` (or a
+`SIE_AUTH_TOKEN(S)` entry in `gateway.extraEnv`) fails the render because the
+gateway would refuse every request. `gateway.auth.tokenSecretName` with auth
+mode `none` fails for the same reason. A `gateway.extraEnv` entry that overrides
+`SIE_AUTH_MODE` takes precedence over `gateway.auth.mode`.
+
+The same authentication requirement applies to `gateway.service.type:
+LoadBalancer` or `NodePort`, which are reachable from outside the cluster on
+most managed platforms; `gateway.service.allowUnauthenticated=true` is the
+explicit opt-in there. Because the gateway itself serves plain HTTP, those
+Service types also need `gateway.service.allowPlaintext=true`: configure TLS
+termination through your provider's load-balancer annotations in
+`gateway.service.annotations` where available, or prefer an Ingress with TLS. `config.service.type` must stay `ClusterIP`: sie-config
+is the configuration write authority and accepts unauthenticated writes unless
+an admin token is configured.
+
+With gateway token auth, pool create, renew, and delete also require the
+gateway admin token (see [Gateway admin token](#gateway-admin-token)).
+Independently of auth, the gateway bounds API-created pools:
+
+- the warm floor (`minimum_worker_count`, which applies to each of the pool's
+  machine profiles) and the `gpus` requirement may each add up to at most 4
+  workers per pool by default, and a pool's active lease keeps at most its
+  requirement warm;
+- the lease TTL is capped at 3600 s by default;
+- live API-created pools are capped at 64 by default. Each gateway replica
+  checks the pools it knows, including ones replicated from other replicas,
+  so concurrent creates on different replicas can briefly exceed the cap; it
+  is not a strict cluster-wide limit.
+
+Tune them with `SIE_GATEWAY_POOL_MAX_MINIMUM_WORKER_COUNT`,
+`SIE_GATEWAY_POOL_MAX_TTL_S`, and `SIE_GATEWAY_MAX_POOLS` in `gateway.extraEnv`.
+
+> **Upgrade note (breaking):** `values-aws.yaml`, `values-gke.yaml`, and
+> `values-aks.yaml` used to enable a host-less, TLS-less Ingress in front of an
+> unauthenticated gateway. Upgrading with those overlays now removes that
+> Ingress, and the install notes warn when that happens. To keep external
+> access, set `ingress.enabled=true` with gateway auth and TLS as above. To keep
+> the previous unauthenticated plain-HTTP catch-all Ingress unchanged, set both
+> `ingress.allowUnauthenticated=true` and `ingress.allowPlaintext=true`. An
+> upgrade with `--reuse-values` keeps `ingress.enabled=true` and fails the
+> render until one of these is chosen. An existing Ingress with gateway auth
+> but no TLS needs TLS or `ingress.allowPlaintext=true`.
+>
+> API-created pools stored before the upgrade keep working but are held to
+> the new per-pool budget: a pool whose `gpus` requirements add up to more than
+> `SIE_GATEWAY_POOL_MAX_MINIMUM_WORKER_COUNT` is allotted the budget in
+> machine-profile name order, becomes Active once the allotted workers are
+> available, and keeps only those warm; a warm floor that no longer fits is
+> spread over its lanes (at least one worker each on as many lanes as the budget
+> allows). Recreate such a pool within the budget, or raise the budget.
+
+### Worker NetworkPolicy
+
+Worker pods serve an HTTP API without authentication of their own; the gateway
+is the only in-chart caller. `workers.networkPolicy.enabled=true` renders an
+ingress `NetworkPolicy` whose only default rule admits this release's gateway
+pods to every worker HTTP port. Kubelet probes and traffic between containers
+of the same pod are unaffected. It requires a CNI that enforces NetworkPolicy.
+NetworkPolicies are additive: if another policy selects the worker pods and
+admits more sources, those sources keep access, so it restricts worker ingress
+only when no other policy grants broader access. Check for overlapping policies
+in the namespace. It is off by default and on in `values-ha.yaml`. Add
+`workers.networkPolicy.extraIngress` rules for any caller outside the chart that
+must reach workers directly, and list the worker ports (`workers.common.port`,
+plus one port per additional child container on multi-GPU pools) so the rule
+does not open every port on the worker pods. The chart rejects rules that admit
+every source (an empty peer, an unscoped selector, or an `ipBlock` with prefix
+length `/0`) or nearly every port (a port entry without `port`, or a range
+wider than 60000 ports); disable the policy instead to open the worker API to
+everything. These checks catch mistakes, not a determined operator: two `/1`
+halves still admit every address.
+
+```yaml
+workers:
+  networkPolicy:
+    enabled: true
+    extraIngress:
+      - from:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: benchmarks
+        ports:
+          - port: 8080
+            protocol: TCP
+```
 
 ## TLS / HTTPS
 

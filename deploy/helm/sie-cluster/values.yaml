@@ -266,9 +266,20 @@ gateway:
 
   # -- Service configuration
   service:
+    # -- LoadBalancer or NodePort requires gateway auth (auth.mode=static) or
+    # allowUnauthenticated=true, because those Services are reachable from
+    # outside the cluster on most managed platforms.
     type: ClusterIP
     port: 8080
     annotations: {}
+    # -- Allow a LoadBalancer or NodePort gateway Service without gateway auth
+    # (a boolean).
+    allowUnauthenticated: false
+    # -- Acknowledge that a LoadBalancer or NodePort gateway Service serves
+    # plain HTTP (a boolean). Required for those types; configure TLS
+    # termination through provider annotations above when the load balancer
+    # supports it, or prefer an Ingress with TLS.
+    allowPlaintext: false
 
   # -- Block the gateway pod on sie-config readiness before it starts the
   # cold-start bootstrap. Prevents the rolling-upgrade race where the
@@ -841,6 +852,23 @@ workers:
           cpu: "2"
           memory: "2Gi"
 
+  # -- Ingress NetworkPolicy for worker pods. When enabled, this policy admits
+  # only this release's gateway pods to the worker HTTP ports (the worker API
+  # has no authentication of its own); kubelet probes and in-pod sidecar
+  # traffic are unaffected. Requires a CNI that enforces NetworkPolicy.
+  # NetworkPolicies are additive: any other policy that selects worker pods
+  # and admits more sources widens access, so check for overlapping policies.
+  # Disabled by default; values-ha.yaml enables it.
+  networkPolicy:
+    enabled: false
+    # -- Additional NetworkPolicy ingress rules for callers outside this chart
+    # that must reach workers directly. Each entry needs a non-empty `from`
+    # (scoped selectors, or an ipBlock with a prefix length above /0) and
+    # `ports` (each with a port, and no range wider than 60000 ports). These
+    # checks catch mistakes, not every broad rule. Disable the policy instead
+    # to open the worker API to everything.
+    extraIngress: []
+
   # -- Worker pools (one StatefulSet per enabled queuePool/machineProfile/bundle lane)
   # Each map entry creates a WorkerGroup family: one StatefulSet + one
   # pre-pull DaemonSet per enabled bundle.
@@ -1145,6 +1173,18 @@ ingress:
   enabled: false
   className: nginx
   annotations: {}
+  # -- Allow the gateway Ingress while nothing authenticates requests (gateway
+  # auth mode none and auth.enabled=false). The chart refuses that render by
+  # default, whatever the hosts and TLS, because it publishes the inference API
+  # and the pool API, which keeps GPU workers warm, to anyone who can reach the
+  # ingress controller. Set true (a boolean) only when the controller is
+  # private or another layer in front of it authenticates every request.
+  allowUnauthenticated: false
+  # -- Allow the gateway Ingress without TLS. The chart refuses an Ingress that
+  # carries no TLS (tlsConfig.enabled with at least one host) unless
+  # tlsConfig.mode=disabled states that TLS terminates upstream. Set true (a
+  # boolean) to serve plain HTTP, which sends tokens and cookies in cleartext.
+  allowPlaintext: false
   # -- Hostnames served by the ingress. Each entry becomes an ingress rule and,
   # when tls.enabled, a SAN on the TLS cert (all hosts share tls.secretName).
   # Empty => host-less catch-all ingress.
@@ -1264,6 +1304,13 @@ auth:
   ingress:
     authResponseHeaders:
       - Authorization
+    # -- IngressClass spec.controller values whose controller honours the
+    # nginx.ingress.kubernetes.io/auth-* annotations the edge relies on. Add a
+    # second ingress-nginx controller's own controller string (for example
+    # k8s.io/internal-ingress-nginx) here. The NGINX Inc controller
+    # (nginx.org/ingress-controller) ignores these annotations; never list it.
+    acceptedControllers:
+      - k8s.io/ingress-nginx
 
 # -- Service account configuration
 # NAMING CONTRACT: The KSA name below ("sie-server") MUST match the name used in
@@ -2176,6 +2223,11 @@ mcpEdge:
     # gateway ingress (/ -> gateway). Reuses the chart's nginx + cert-manager.
     enabled: false
     host: ""
+    # -- Serve the MCP edge Ingress without TLS (a boolean). The chart refuses
+    # it by default because it carries connector secrets and OAuth tokens;
+    # ingress.tlsConfig.enabled, or mode=disabled when TLS terminates
+    # upstream, satisfies the check.
+    allowPlaintext: false
   resources:
     requests:
       cpu: "100m"
