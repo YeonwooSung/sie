@@ -258,6 +258,7 @@ struct GenerateDeliveryLogContext {
     work_item_id: String,
     request_id: String,
     model_id: String,
+    reply_subject: String,
     delivery: DeliveryContext,
 }
 
@@ -362,6 +363,22 @@ fn caller_item_id_from_value(value: &MsgValue) -> Option<String> {
 /// True if `reply_subject` is acceptable for use on a `WorkItem`.
 /// Empty is allowed (fire-and-forget). Non-empty subjects must start
 /// with `_INBOX.` so malicious producers can't redirect results.
+/// The first `Nats-` header on a work delivery other than `Nats-Msg-Id`.
+///
+/// The gateway publishes work with at most `Nats-Msg-Id`. The NATS server adds
+/// other `Nats-` headers when it copies stored messages into a work stream on
+/// a user's behalf, past that user's publish permissions: a stream republish
+/// adds `Nats-Stream`, and a stream source adds `Nats-Stream-Source`.
+pub fn unexpected_work_header(headers: Option<&async_nats::HeaderMap>) -> Option<String> {
+    headers?.iter().find_map(|(name, _)| {
+        let name: &str = name.as_ref();
+        let nats_header = name
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("nats-"));
+        (nats_header && !name.eq_ignore_ascii_case("Nats-Msg-Id")).then(|| name.to_string())
+    })
+}
+
 pub(crate) fn reply_subject_is_safe(reply_subject: &str) -> bool {
     reply_subject.is_empty() || reply_subject.starts_with(INBOX_PREFIX)
 }
@@ -1207,6 +1224,22 @@ impl Dispatcher {
             self.runtime_state
                 .telemetry
                 .nats_received(msg.info().ok().map(|info| info.delivered as u64));
+            if let Some(header) = unexpected_work_header(msg.headers.as_ref()) {
+                warn!(
+                    subject = %msg.subject,
+                    header = %header,
+                    "rejecting work the NATS server copied from another stream — ACKing to drop",
+                );
+                if let Err(e) = ack(
+                    &Delivery::Nats(msg, admission_permit, None),
+                    &self.runtime_state.telemetry,
+                )
+                .await
+                {
+                    warn!(error = %e, "ack failed on drop");
+                }
+                continue;
+            }
             // Source of truth for routing is the NATS subject (JetStream
             // already used it to dispatch to this consumer). If the subject
             // doesn't yield a model_id, we can't trust the payload either,
@@ -1931,6 +1964,7 @@ impl Dispatcher {
             work_item_id: wi.work_item_id.clone(),
             request_id: wi.request_id.clone(),
             model_id: model_id.clone(),
+            reply_subject: wi.reply_subject.clone(),
             delivery,
         });
         let executed_bundle_config_hash: Arc<str> = Arc::from(wi.bundle_config_hash.clone());
@@ -4329,6 +4363,11 @@ async fn handle_generate_event(
 ) -> Result<(), DispatchError> {
     match event.kind.as_str() {
         "publish" => {
+            if event.reply_subject != delivery_log.reply_subject {
+                return Err(DispatchError::Ipc(IpcError::Server(
+                    "generation publish reply_subject mismatch".to_string(),
+                )));
+            }
             let payload =
                 stamp_generate_execution_hash(event.payload, executed_bundle_config_hash)?;
             publisher.publish_raw(&event.reply_subject, payload).await?;
@@ -6386,6 +6425,64 @@ mod tests {
     /// Far longer than any readiness deadline the tests use.
     const STALLED_PROBE: Duration = Duration::from_secs(1_000_000);
 
+    #[tokio::test]
+    async fn generation_publish_to_a_subject_other_than_the_work_item_reply_is_refused() {
+        let client = async_nats::ConnectOptions::new()
+            .retry_on_initial_connect()
+            .connect("nats://127.0.0.1:1")
+            .await
+            .expect("an offline client needs no server");
+        let telemetry = crate::observability::metrics::SidecarTelemetry::default();
+        let publisher = Arc::new(WorkPublisher::new(
+            client.clone(),
+            "worker-test",
+            telemetry.clone(),
+        ));
+        let message = Message {
+            message: async_nats::Message {
+                subject: "sie.work.test".into(),
+                reply: None,
+                payload: Default::default(),
+                headers: None,
+                status: None,
+                description: None,
+                length: 0,
+            },
+            context: async_nats::jetstream::new(client),
+        };
+        let delivery = DeliveryContext::from_message(&message);
+        let delivery_log = Arc::new(GenerateDeliveryLogContext {
+            work_item_id: "wi-1".to_string(),
+            request_id: "req-1".to_string(),
+            model_id: "model".to_string(),
+            reply_subject: "_INBOX.router.req-1".to_string(),
+            delivery,
+        });
+        for subject in ["$JS.API.STREAM.CREATE.X", "sie.config.models._all", ""] {
+            let result = handle_generate_event(
+                GenerateEvent {
+                    kind: "publish".to_string(),
+                    reply_subject: subject.to_string(),
+                    payload: Vec::new(),
+                    delay_ms: None,
+                    error: None,
+                },
+                Arc::clone(&publisher),
+                telemetry.clone(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(QueuedMessage::new(message.clone(), None)),
+                Arc::clone(&delivery_log),
+                "",
+            )
+            .await;
+            let error = result.expect_err(subject).to_string();
+            assert!(
+                error.contains("reply_subject mismatch"),
+                "{subject}: {error}"
+            );
+        }
+    }
+
     /// A NATS delivery whose ACK, NAK and progress calls fail: it has no
     /// reply subject and its client never reaches a server.
     async fn unacknowledgeable_nats_delivery() -> Delivery {
@@ -7065,6 +7162,24 @@ mod tests {
             unknown_bundle_config_hash([&served, &unsupported], Some(&state)),
             Some(("hash-1", 1))
         );
+    }
+
+    #[test]
+    fn unexpected_work_header_allows_only_the_gateway_message_id() {
+        assert_eq!(unexpected_work_header(None), None);
+        let mut gateway = async_nats::HeaderMap::new();
+        gateway.insert("Nats-Msg-Id", "req-1");
+        gateway.insert("traceparent", "00-abc-def-01");
+        assert_eq!(unexpected_work_header(Some(&gateway)), None);
+        for name in ["Nats-Stream", "Nats-Stream-Source", "nats-subject"] {
+            let mut copied = async_nats::HeaderMap::new();
+            copied.insert(name, "x");
+            assert_eq!(
+                unexpected_work_header(Some(&copied)).as_deref(),
+                Some(name),
+                "{name}"
+            );
+        }
     }
 
     #[test]

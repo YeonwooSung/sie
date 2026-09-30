@@ -764,6 +764,9 @@ helm install sie deploy/helm/sie-cluster \
   -f deploy/helm/sie-cluster/values-ha.yaml
 ```
 
+The NATS members authenticate their routes to each other as `sie-route` (see
+"NATS authentication").
+
 It does not make `sie-config` redundant; that service stays at one replica by
 template design until the chart provides leader election. And because a live
 stream's storage type cannot be changed, apply it to a fresh install or convert
@@ -858,6 +861,160 @@ raised above it, workers ignore every deadline and log a rate-limited warning.
 The comparison spans the gateway and worker clocks, so keep the nodes
 synchronised (for example with NTP). Watch
 `sie_worker_work_item_deadline_exceeded_total` before enabling enforcement.
+
+### NATS authentication
+
+sie-config, the gateway, and the worker sidecars connect to NATS as separate
+users. The bundled server refuses anonymous connections and limits each user
+to the subjects that component uses:
+
+| User | Publish | Subscribe |
+| --- | --- | --- |
+| `sie-config` | `sie.config.models.>` | nothing |
+| `sie-gateway` | `sie.work.>`, `sie.dlq.>`, `cancel.>`, `work_cancel.>`, `batch_cancel.>`, `$JS.API.STREAM.INFO.*`, `$JS.API.STREAM.CREATE.*`, `$JS.API.STREAM.UPDATE.*`, `$JS.API.CONSUMER.INFO.*.*` | `sie.config.models._all`, `sie.health.>`, `_INBOX.>`, `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.>` |
+| `sie-worker` | `_INBOX.>` (results), `sie.health.>`, `$JS.ACK.>`, `$JS.API.STREAM.INFO.*`, `$JS.API.STREAM.CREATE.*`, `$JS.API.STREAM.UPDATE.*`, `$JS.API.CONSUMER.LIST.*`, `$JS.API.CONSUMER.INFO.*.*`, `$JS.API.CONSUMER.CREATE.*.>`, `$JS.API.CONSUMER.DELETE.*.*`, `$JS.API.CONSUMER.MSG.NEXT.*.*` | `sie.config.models.*`, `cancel.>`, `work_cancel.>`, `batch_cancel.>`, `_INBOX_WORKER.>` |
+| `sie-route` | Routes between NATS members, when `nats.config.cluster.enabled=true` | |
+
+- Only `sie-config` can publish on `sie.config.models.>`, and only the
+  gateway can publish work and cancel signals.
+- A user that may manage JetStream streams or consumers can make the server
+  itself deliver stored messages to any subject: through a stream's republish
+  setting, a consumer's delivery subject, or the reply subject of a pull or
+  direct-get request. Subject permissions do not apply to those deliveries.
+  Each of them carries a reply subject or a `Nats-` header, and sie-config and
+  the gateway send neither on these subjects. The gateway and the worker
+  sidecars therefore drop config notifications and cancel signals that carry
+  either, and the gateway drops max-deliveries advisories that do.
+- The worker sidecars drop work that carries a `Nats-` header other than
+  `Nats-Msg-Id`, which the gateway sets for deduplication. This rejects work
+  that a stream republish or a stream source copied into a work stream.
+- The worker sidecar receives its own JetStream replies and pull deliveries
+  under the inbox prefix `_INBOX_WORKER`. The worker user can publish results
+  to the gateway's `_INBOX` subjects but cannot subscribe to them.
+- In a worker pod, only the sidecar container gets the worker credentials. The
+  container that runs model code has none.
+- Only gateway pods mount a Kubernetes API token. Worker, sie-config, and
+  mcp-edge pods set `automountServiceAccountToken: false`, and none of them
+  calls the Kubernetes API. They keep the `sie-server` ServiceAccount, so
+  cloud workload identity (EKS IRSA and Pod Identity, GKE and AKS workload
+  identity, ACK RRSA), which projects its own token, keeps working. The
+  gateway's pool Role covers every ConfigMap in the namespace, including the
+  NATS server configuration `<release>-nats-config`, because pool ConfigMaps
+  are named at runtime. The gateway pod can therefore change the NATS users,
+  and is trusted with the bus.
+- The NATS monitoring port (8222) stays unauthenticated. It shows connection
+  and subscription metadata, including user names, but no message contents
+  or passwords. The chart ships no NetworkPolicy for the NATS pods, so
+  restrict that port with one where that matters. The client (4222) and
+  cluster route (6222) ports require credentials.
+- `workers.networkPolicy` restricts only ingress to the worker pods. The
+  worker sidecars open their NATS connections outward, so the policy does not
+  affect NATS.
+- The chart does not configure TLS on NATS. Passwords and messages cross the
+  pod network in plaintext.
+- nats-box and the NATS `helm test` pod are disabled, because they would
+  connect without credentials.
+
+**What the worker user can still do.** All workers share the `sie-worker`
+user, because the subject names do not separate one worker from another. It
+keeps JetStream stream and consumer management, because the sidecars create
+their own direct-dispatch streams and repair the pool streams' settings. The
+server does not check a stream's subjects against the creating user's
+subscribe permissions. Anyone who holds the worker credentials, such as a
+compromised sidecar process, can therefore:
+
+- read gateway results and JetStream API replies, by creating a stream that
+  captures `_INBOX.>` and reading it through a consumer. A stream created with
+  `no_ack` can capture `$JS.API.>` and `$JS.ACK.>` the same way.
+- read, settle, and redeliver work queued for any pool, and create, change,
+  or delete any pool's durable consumers.
+- change any stream's configuration. Lowering `max_msgs` drops queued work,
+  and sealing a stream makes it refuse new work until the stream is deleted,
+  which no user in the matrix above may do.
+- add work to any pool without a `Nats-` header, through a subject transform
+  on the pool stream. The header check above does not catch this.
+- send heartbeats in the name of other workers.
+
+Removing these rights needs streams that only the gateway manages, or a
+separate NATS account per worker. Both are planned follow-ups.
+
+**Recovering a sealed or damaged stream.** With the default memory storage,
+restart NATS (`kubectl rollout restart statefulset/<release>-nats`). The
+gateway and the workers create the streams again, and queued work is lost.
+With file storage no user in the matrix may delete a stream. Upgrade once with
+`--set nats.auth.allowAnonymous=true --set nats.natsBox.enabled=true`, run
+`nats stream rm <stream> -f` in the nats-box pod, and upgrade again with
+`--set nats.auth.allowAnonymous=false --set nats.natsBox.enabled=false`.
+
+**Passwords.** The chart generates one Secret per user,
+`<release>-nats-auth-config`, `-gateway`, and `-worker`, plus `-route` when the
+NATS cluster is enabled. Each holds a random 48-character `password` of
+letters and digits that starts with a letter. On upgrade the chart reads the
+existing Secret with `lookup` and keeps its password. The render fails if a
+kept Secret has no `password` key, or a password shorter than 32 characters,
+with characters other than letters and digits, or starting with a digit. The
+Secrets carry `helm.sh/resource-policy: keep`. The NATS server reads the
+passwords from its environment, and each client container gets
+`SIE_NATS_USER` and `SIE_NATS_PASSWORD`.
+
+To manage a password yourself, set `nats.auth.existingSecrets.<config|gateway|worker|route>`
+to a Secret with a `password` key. For the bundled server it must be letters
+and digits and start with a letter: the server parses it as a configuration
+value, where a leading digit reads as a number, and embeds it in route URLs.
+
+Renderers without cluster access, such as `helm template` and many GitOps
+controllers, cannot read the existing Secrets and generate new passwords on
+every render. Use `existingSecrets` with them, or on Argo CD set
+`ignoreDifferences` on the Secrets' `/data` together with the
+`RespectIgnoreDifferences=true` sync option. Do not commit `helm template`
+output, which contains the passwords.
+
+**Rotating a password.** Delete the generated Secret (or change your own) and
+run `helm upgrade`. Then restart the NATS StatefulSet, which reads passwords
+only at start, and the workloads that use that user. They cannot connect until
+both sides have the new password. Helm keeps every rendered Secret in its
+release history, so a `helm rollback` to an earlier revision brings back the
+earlier password, and anyone who can read Secrets in the namespace can read the
+history.
+
+**Upgrading an existing release.** Authentication is on by default, so the
+upgrade changes the NATS server, sie-config, the gateway, and the workers
+together:
+
+- The NATS pod restarts. With the default memory-backed work queues, queued
+  and in-flight work is lost, as on any NATS restart (see "Work-queue
+  durability").
+- A gateway, sie-config, or worker pod that has not been replaced yet has no
+  credentials, and the server refuses it. Requests can fail with `503`, and
+  workers that have not restarted take no work until they do.
+
+To avoid that gap, upgrade in two steps. First upgrade with
+`--set nats.auth.allowAnonymous=true`: the server then also accepts anonymous
+connections, with unrestricted permissions. Once every pod has restarted,
+upgrade again with `--set nats.auth.allowAnonymous=false`. Set it explicitly:
+`--reuse-values` and `--reset-then-reuse-values` both keep the value from the
+first step. The second step only changes the NATS configuration, which the
+server reloads without restarting. `helm status` prints a warning while
+anonymous access is on.
+
+`helm upgrade --reuse-values` reuses the old release's NATS sub-chart values,
+which lack the chart's server wiring, so the render fails. Upgrade with
+`--reset-then-reuse-values` (Helm 3.14 or later) or pass your values with `-f`.
+The wiring lives in the `sieNatsAuth` keys under `nats.config.merge`,
+`nats.config.cluster.merge`, and `nats.container.env`. Keep them when you add
+your own settings next to them.
+
+**Opting out.** `nats.auth.enabled=false` renders NATS without users and
+connects the clients without credentials, as before. Use it only where the
+network already keeps other workloads away from NATS.
+
+**External NATS** (`nats.install=false`). The chart cannot configure your
+server. With `nats.auth.enabled=true`, set `nats.auth.existingSecrets.config`,
+`.gateway`, and `.worker`, and create the users `sie-config`, `sie-gateway`,
+and `sie-worker` with the permissions above. If your server needs no
+credentials, set `nats.auth.enabled=false`. The clients read credentials only
+from `SIE_NATS_USER` and `SIE_NATS_PASSWORD`. They remove any credentials in
+`nats.url` before connecting.
 
 ### Upgrading from the legacy single-bundle pool schema
 
