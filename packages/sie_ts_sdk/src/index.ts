@@ -82,6 +82,7 @@ export type {
   ModelDims,
   ModelInfo,
   ModelLoadError,
+  ModelRouting,
   ModelState,
   PendingGeneration,
   PendingGenerationGroup,
