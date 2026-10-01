@@ -15,8 +15,11 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 import httpx
@@ -24,9 +27,14 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from yaml.constructor import ConstructorError
 
-UPSTREAMS_FILE_ENV = "SIE_UPSTREAMS_FILE"
+from sie_server.config.model import UPSTREAM_NAME_PATTERN, is_remote_adapter_path
 
-_UPSTREAM_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+if TYPE_CHECKING:
+    from sie_server.config.model import ModelConfig
+
+UPSTREAMS_FILE_ENV = "SIE_UPSTREAMS_FILE"
+REMOTE_SERVING_ENV = "SIE_REMOTE_SERVING"
+
 _ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _VISIBLE_ASCII = re.compile(r"^[\x21-\x7e]+$")
 _DEFAULT_PORTS = {"http": 80, "https": 443}
@@ -61,6 +69,10 @@ class _UniqueKeyLoader(yaml.SafeLoader):
 
 class UpstreamCredentialError(RuntimeError):
     """The environment variable holding an upstream's credential is not set."""
+
+
+class RemoteServingDisabledError(RuntimeError):
+    """Remote serving is switched off for this server."""
 
 
 def _is_loopback(host: str) -> bool:
@@ -189,7 +201,7 @@ class UpstreamsFile(BaseModel):
     @classmethod
     def _names(cls, value: dict[str, Upstream]) -> dict[str, Upstream]:
         for name in value:
-            if not _UPSTREAM_NAME.fullmatch(name):
+            if not UPSTREAM_NAME_PATTERN.fullmatch(name):
                 raise UpstreamConfigError(
                     "upstream names are lowercase letters, digits and hyphens, at most 63 characters"
                 )
@@ -219,3 +231,61 @@ def load_upstreams(path: str | Path) -> dict[str, Upstream]:
         )
         raise UpstreamConfigError(f"upstreams file {path} is invalid: {problems}") from None
     return dict(parsed.upstreams)
+
+
+class _InstalledUpstreams:
+    """The upstreams this process loaded at startup, and the switch over all of them.
+
+    The model registry and the remote adapters read them here, because the
+    upstreams are server configuration and neither receives the app state.
+    """
+
+    def __init__(self) -> None:
+        self.upstreams: Mapping[str, Upstream] = MappingProxyType({})
+        self.remote_serving = True
+
+
+_INSTALLED = _InstalledUpstreams()
+
+
+def remote_serving_from_env(raw: str | None) -> bool:
+    """Parse ``SIE_REMOTE_SERVING``. Unset means on; anything unrecognised means off."""
+    return raw is None or raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def install_upstreams(upstreams: Mapping[str, Upstream], *, remote_serving: bool = True) -> None:
+    """Install the startup upstreams. ``remote_serving=False`` refuses every remote profile."""
+    _INSTALLED.upstreams = MappingProxyType(dict(upstreams))
+    _INSTALLED.remote_serving = remote_serving
+
+
+def installed_upstreams() -> Mapping[str, Upstream]:
+    return _INSTALLED.upstreams
+
+
+def upstream_for_serving(name: str) -> Upstream:
+    """The upstream a remote profile may call now. Raises when serving is refused."""
+    if not _INSTALLED.remote_serving:
+        raise RemoteServingDisabledError(f"remote serving is switched off ({REMOTE_SERVING_ENV})")
+    upstream = _INSTALLED.upstreams.get(name)
+    if upstream is None:
+        raise UpstreamConfigError(f"upstream {name!r} is not defined in the startup configuration")
+    return upstream
+
+
+def validate_profile_upstreams(config: ModelConfig) -> None:
+    """Reject a model whose remote profile names an upstream this server does not define.
+
+    With remote serving off, every remote profile is refused at load anyway,
+    so the names are not checked and a stale model does not stop the server.
+    """
+    if not _INSTALLED.remote_serving:
+        return
+    for profile_name in config.profiles:
+        resolved = config.resolve_profile(profile_name)
+        if not is_remote_adapter_path(resolved.adapter_path):
+            continue
+        upstream = resolved.loadtime.get("upstream")
+        if upstream not in _INSTALLED.upstreams:
+            msg = f"Profile '{profile_name}' of '{config.sie_id}' names an undefined upstream {upstream!r}"
+            raise ValueError(msg)
