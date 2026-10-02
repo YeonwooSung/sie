@@ -1800,6 +1800,10 @@ def test_the_mcp_ingress_certificate_cannot_be_sent_upstream(tmp_path: Path) -> 
             "no remote worker image is published",
         ),
         (
+            remote_lane(engine="candle"),
+            "the remote adapters run only in the pytorch worker",
+        ),
+        (
             remote_lane(resources={"limits": {"nvidia.com/gpu": "1"}}),
             "workers.pools.remote.resources.limits: a remote lane runs no model on an accelerator",
         ),
