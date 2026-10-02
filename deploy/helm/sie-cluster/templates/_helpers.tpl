@@ -1311,6 +1311,423 @@ consume the same queuePool/machineProfile/bundle tuple.
 {{- end }}
 
 {{/*
+"true" when an enabled worker lane serves the `remote` bundle. Remote lanes are
+the only workers that receive the upstreams file and upstream credentials.
+*/}}
+{{- define "sie-cluster.worker.remoteLaneEnabled" -}}
+{{- $enabled := false -}}
+{{- range $poolName, $pool := .Values.workers.pools -}}
+{{- if $pool.enabled -}}
+{{- range $bundleName, $bundleCfg := $pool.bundles -}}
+{{- if and (eq $bundleName "remote") (dig "enabled" true $bundleCfg) -}}
+{{- $enabled = true -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if $enabled }}true{{ end -}}
+{{- end }}
+
+{{/*
+"true" when remote lanes receive the upstreams file and credentials: a remote
+lane is enabled and workers.remote.serving is not false.
+*/}}
+{{- define "sie-cluster.upstreams.delivered" -}}
+{{- if and (eq (include "sie-cluster.worker.remoteLaneEnabled" .) "true") (dig "remote" "serving" true .Values.workers) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+The upstreams file is a Secret, not a ConfigMap: it says where each credential
+is sent, and the gateway's Role may write every ConfigMap in the namespace.
+*/}}
+{{- define "sie-cluster.upstreams.secretName" -}}
+{{- printf "%s-upstreams" (include "sie-cluster.fullname" .) -}}
+{{- end }}
+
+{{- define "sie-cluster.worker.remoteServiceAccountName" -}}
+{{- printf "%s-worker-remote" (include "sie-cluster.fullname" .) -}}
+{{- end }}
+
+{{/*
+Environment variable that carries one upstream's credential on remote lanes.
+Upstream names hold no underscore, so the mapping is one to one.
+*/}}
+{{- define "sie-cluster.upstream.keyEnvName" -}}
+{{- printf "SIE_UPSTREAM_KEY_%s" (. | replace "-" "_" | upper) -}}
+{{- end }}
+
+{{/*
+The server's upstreams file, rendered from `upstreams`. Each credential is
+referenced by the name of the environment variable that remote lanes fill from
+the upstream's Secret.
+*/}}
+{{- define "sie-cluster.upstreams.file" -}}
+{{- $rendered := dict -}}
+{{- range $name, $upstream := (default dict .Values.upstreams) -}}
+{{- $rateCap := dict "requests_per_minute" (int64 $upstream.rate_cap.requests_per_minute) "max_concurrency" (int64 $upstream.rate_cap.max_concurrency) -}}
+{{- $entry := dict "kind" $upstream.kind "base_url" $upstream.base_url "rate_cap" $rateCap -}}
+{{- if $upstream.proxy_url -}}
+{{- $_ := set $entry "proxy_url" $upstream.proxy_url -}}
+{{- end -}}
+{{- range $field := list "endpoints" "set_params" "strip_params" -}}
+{{- with index $upstream $field -}}
+{{- $_ := set $entry $field . -}}
+{{- end -}}
+{{- end -}}
+{{- if $upstream.api_key_secret -}}
+{{- $_ := set $entry "api_key_secret" (include "sie-cluster.upstream.keyEnvName" $name) -}}
+{{- end -}}
+{{- $_ := set $rendered $name $entry -}}
+{{- end -}}
+{{- dict "upstreams" $rendered | toYaml -}}
+{{- end }}
+
+{{/*
+Nesting depth of a value: 0 for a scalar, one more than its deepest member for
+a map or a list.
+*/}}
+{{- define "sie-cluster.upstreams.jsonDepth" -}}
+{{- if or (kindIs "map" .) (kindIs "slice" .) -}}
+{{- $deepest := 0 -}}
+{{- range $_, $member := . -}}
+{{- $depth := include "sie-cluster.upstreams.jsonDepth" $member | atoi -}}
+{{- if gt $depth $deepest -}}
+{{- $deepest = $depth -}}
+{{- end -}}
+{{- end -}}
+{{- add1 $deepest -}}
+{{- else -}}
+0
+{{- end -}}
+{{- end }}
+
+{{/*
+Check one upstream URL the way the server does. Messages never repeat the
+value, because a rejected URL can carry a credential.
+
+Args (dict): url, field, requireTls.
+*/}}
+{{- define "sie-cluster.upstreams.validateUrl" -}}
+{{- $url := .url -}}
+{{- if not (kindIs "string" $url) -}}
+{{- fail (printf "%s must be a URL string" .field) -}}
+{{- end -}}
+{{- if not (regexMatch "^[\\x21-\\x7e]+$" $url) -}}
+{{- fail (printf "%s must be printable ASCII without spaces" .field) -}}
+{{- end -}}
+{{- if or (contains "?" $url) (contains "#" $url) -}}
+{{- fail (printf "%s must not carry a query or a fragment" .field) -}}
+{{- end -}}
+{{- if not (regexMatch "^https?://[^/@]*(/.*)?$" $url) -}}
+{{- fail (printf "%s must be an http or https URL that names a host and carries no credentials" .field) -}}
+{{- end -}}
+{{- $authority := regexReplaceAll "^https?://([^/]*).*$" $url "${1}" -}}
+{{- if contains "%" $authority -}}
+{{- fail (printf "%s must not percent-encode the host" .field) -}}
+{{- end -}}
+{{- $host := "" -}}
+{{- $port := "" -}}
+{{- if regexMatch "^\\[[0-9A-Fa-f:.]*\\](:[0-9]*)?$" $authority -}}
+{{- $host = regexReplaceAll "^\\[([^\\]]*)\\].*$" $authority "${1}" -}}
+{{- $port = regexReplaceAll "^\\[[^\\]]*\\]:?" $authority "" -}}
+{{- else if regexMatch "^[^:\\[\\]]*(:[0-9]*)?$" $authority -}}
+{{- $host = regexReplaceAll ":.*$" $authority "" -}}
+{{- $port = regexReplaceAll "^[^:]*:?" $authority "" -}}
+{{- else -}}
+{{- fail (printf "%s is not a valid URL" .field) -}}
+{{- end -}}
+{{- if not $host -}}
+{{- fail (printf "%s must name a host" .field) -}}
+{{- end -}}
+{{- $significantPort := regexReplaceAll "^0+" $port "" -}}
+{{- if and $port (or (not $significantPort) (gt (len $significantPort) 5) (gt (atoi (default "0" $significantPort)) 65535)) -}}
+{{- fail (printf "%s is not a valid URL: a port is 1 to 65535" .field) -}}
+{{- end -}}
+{{- $octet := "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])" -}}
+{{- if and (regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" $host) (not (regexMatch (printf "^%s\\.%s\\.%s\\.%s$" $octet $octet $octet $octet) $host)) -}}
+{{- fail (printf "%s is not a valid URL" .field) -}}
+{{- end -}}
+{{- $loopback := or (eq (lower $host) "localhost") (eq $host "::1") (regexMatch (printf "^127\\.%s\\.%s\\.%s$" $octet $octet $octet) $host) -}}
+{{- if and .requireTls (hasPrefix "http://" $url) (not $loopback) -}}
+{{- fail (printf "%s must use https outside loopback" .field) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Check the fields of an upstream of kind openai the way the server does: the
+endpoints it offers, and the request fields set or stripped on every call.
+Names that fail the pattern are not repeated. Args (dict): upstream, path.
+*/}}
+{{- define "sie-cluster.upstreams.validateOpenaiFields" -}}
+{{- $upstream := .upstream -}}
+{{- $path := .path -}}
+{{- $reserved := list "documents" "encoding_format" "input" "messages" "model" "n" "prompt" "query" "stream" "stream_options" "top_n" -}}
+{{- $namePattern := "^[A-Za-z_][A-Za-z0-9_]{0,63}$" -}}
+{{- if eq $upstream.kind "sie" -}}
+{{- range $field := list "endpoints" "set_params" "strip_params" -}}
+{{- if index $upstream $field -}}
+{{- fail (printf "%s: kind sie takes no %s" $path $field) -}}
+{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- $endpoints := $upstream.endpoints -}}
+{{- if not (and (kindIs "slice" $endpoints) $endpoints) -}}
+{{- fail (printf "%s.endpoints: kind openai must declare the endpoints it offers, from completions, chat, embeddings and rerank" $path) -}}
+{{- end -}}
+{{- range $index, $endpoint := $endpoints -}}
+{{- if not (has $endpoint (list "completions" "chat" "embeddings" "rerank")) -}}
+{{- fail (printf "%s.endpoints[%d] must be completions, chat, embeddings or rerank" $path $index) -}}
+{{- end -}}
+{{- end -}}
+{{- if ne (len (uniq $endpoints)) (len $endpoints) -}}
+{{- fail (printf "%s.endpoints lists the same entry more than once" $path) -}}
+{{- end -}}
+{{- end -}}
+{{- $setParams := $upstream.set_params -}}
+{{- if not (kindIs "invalid" $setParams) -}}
+{{- if not (kindIs "map" $setParams) -}}
+{{- fail (printf "%s.set_params must map request fields to values" $path) -}}
+{{- end -}}
+{{- if gt (len $setParams) 32 -}}
+{{- fail (printf "%s.set_params sets at most 32 fields" $path) -}}
+{{- end -}}
+{{- $position := 0 -}}
+{{- range $name, $value := $setParams -}}
+{{- $position = add1 $position -}}
+{{- if not (regexMatch $namePattern $name) -}}
+{{- fail (printf "%s.set_params: field %d, counting in name order, is not a field name; use letters, digits and underscores, at most 64 characters, not starting with a digit" $path $position) -}}
+{{- end -}}
+{{- if has $name $reserved -}}
+{{- fail (printf "%s.set_params cannot set %q, which the server sends itself" $path $name) -}}
+{{- end -}}
+{{- if gt (include "sie-cluster.upstreams.jsonDepth" $value | atoi) 8 -}}
+{{- fail (printf "%s.set_params: field %d, counting in name order, nests deeper than 8 levels" $path $position) -}}
+{{- end -}}
+{{- end -}}
+{{- if gt (len (toJson $setParams)) 16384 -}}
+{{- fail (printf "%s.set_params is larger than 16384 bytes as JSON" $path) -}}
+{{- end -}}
+{{- end -}}
+{{- $stripParams := $upstream.strip_params -}}
+{{- if not (kindIs "invalid" $stripParams) -}}
+{{- if not (kindIs "slice" $stripParams) -}}
+{{- fail (printf "%s.strip_params must list request field names" $path) -}}
+{{- end -}}
+{{- if gt (len $stripParams) 32 -}}
+{{- fail (printf "%s.strip_params strips at most 32 fields" $path) -}}
+{{- end -}}
+{{- range $index, $name := $stripParams -}}
+{{- if not (and (kindIs "string" $name) (regexMatch $namePattern $name)) -}}
+{{- fail (printf "%s.strip_params[%d] is not a field name; use letters, digits and underscores, at most 64 characters, not starting with a digit" $path $index) -}}
+{{- end -}}
+{{- if has $name $reserved -}}
+{{- fail (printf "%s.strip_params cannot strip %q, which the server sends itself" $path $name) -}}
+{{- end -}}
+{{- if and (kindIs "map" $setParams) (hasKey $setParams $name) -}}
+{{- fail (printf "%s: set_params and strip_params both name %q" $path $name) -}}
+{{- end -}}
+{{- end -}}
+{{- if ne (len (uniq $stripParams)) (len $stripParams) -}}
+{{- fail (printf "%s.strip_params lists the same entry more than once" $path) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Validate `upstreams` against the server's upstreams file format, keep each
+upstream's Secret out of every container other than the remote lanes' workers,
+and require a NetworkPolicy in front of the remote lanes. Messages name a
+position instead of repeating a map key that failed validation, because a
+credential pasted as a key would otherwise be printed.
+*/}}
+{{- define "sie-cluster.upstreams.validate" -}}
+{{- $root := . -}}
+{{- $upstreams := default dict $root.Values.upstreams -}}
+{{- if not (kindIs "map" $upstreams) -}}
+{{- fail "upstreams must map upstream names to definitions" -}}
+{{- end -}}
+{{- $serving := dig "remote" "serving" true $root.Values.workers -}}
+{{- if not (kindIs "bool" $serving) -}}
+{{- fail "workers.remote.serving must be a boolean" -}}
+{{- end -}}
+{{- $chartSecretKeys := list -}}
+{{- $hfCache := $root.Values.workers.common.hfCache | default dict -}}
+{{- with $hfCache.tokenSecret -}}
+{{- $chartSecretKeys = append $chartSecretKeys (dict "owner" "workers.common.hfCache.tokenSecret" "ref" (printf "%s/%s" . $hfCache.tokenSecretKey)) -}}
+{{- end -}}
+{{- $gatewayAuth := $root.Values.gateway.auth | default dict -}}
+{{- with $gatewayAuth.tokenSecretName -}}
+{{- $chartSecretKeys = append $chartSecretKeys (dict "owner" "gateway.auth.tokenSecretName" "ref" (printf "%s/%s" . $gatewayAuth.tokenSecretKey)) -}}
+{{- end -}}
+{{- with $gatewayAuth.adminTokenSecretName -}}
+{{- $chartSecretKeys = append $chartSecretKeys (dict "owner" "gateway.auth.adminTokenSecretName" "ref" (printf "%s/%s" . (include "sie-cluster.gateway.adminTokenSecretKey" $root))) -}}
+{{- end -}}
+{{- with include "sie-cluster.config.readTokenSecretName" $root -}}
+{{- $chartSecretKeys = append $chartSecretKeys (dict "owner" "the sie-config read token" "ref" (printf "%s/%s" . (include "sie-cluster.config.readTokenSecretKey" $root))) -}}
+{{- end -}}
+{{- with include "sie-cluster.config.adminTokenSecretName" $root -}}
+{{- $chartSecretKeys = append $chartSecretKeys (dict "owner" "the sie-config admin token" "ref" (printf "%s/%s" . (include "sie-cluster.config.adminTokenSecretKey" $root))) -}}
+{{- end -}}
+{{- range $secretName := $root.Values.global.imagePullSecrets -}}
+{{- range $key := list ".dockerconfigjson" ".dockercfg" -}}
+{{- $chartSecretKeys = append $chartSecretKeys (dict "owner" "global.imagePullSecrets" "ref" (printf "%s/%s" $secretName $key)) -}}
+{{- end -}}
+{{- end -}}
+{{- $oauthSecret := $root.Values.auth.oauth2Proxy.secret -}}
+{{- with $oauthSecret.name -}}
+{{- $secretName := . -}}
+{{- range $keyField := list "clientIDKey" "clientSecretKey" "cookieSecretKey" -}}
+{{- $chartSecretKeys = append $chartSecretKeys (dict "owner" (printf "auth.oauth2Proxy.secret.%s" $keyField) "ref" (printf "%s/%s" $secretName (index $oauthSecret $keyField))) -}}
+{{- end -}}
+{{- end -}}
+{{- $betterStack := $root.Values.observability.otel.collector.betterStack -}}
+{{- with $betterStack.existingSecret -}}
+{{- $chartSecretKeys = append $chartSecretKeys (dict "owner" "observability.otel.collector.betterStack.existingSecret" "ref" (printf "%s/%s" . $betterStack.tokenKey)) -}}
+{{- end -}}
+{{- $mcp := $root.Values.mcpEdge -}}
+{{- if or $mcp.connectorSecrets $mcp.existingSecretName -}}
+{{- $chartSecretKeys = append $chartSecretKeys (dict "owner" "the MCP connector secrets" "ref" (printf "%s/connector-secrets" (include "sie-cluster.mcpEdge.secretName" $root))) -}}
+{{- end -}}
+{{- with $mcp.clusterApiKey.existingSecretName -}}
+{{- $chartSecretKeys = append $chartSecretKeys (dict "owner" "mcpEdge.clusterApiKey.existingSecretName" "ref" (printf "%s/%s" . $mcp.clusterApiKey.secretKey)) -}}
+{{- end -}}
+{{- $tls := include "sie-cluster.ingressTlsConfig" $root | fromYaml -}}
+{{- $tlsSecrets := list (dict "owner" "the ingress TLS certificate" "name" $tls.secretName) (dict "owner" "the MCP ingress TLS certificate" "name" (printf "%s-tls" (include "sie-cluster.mcpEdge.serviceName" $root))) -}}
+{{- $rootCA := dig "selfSigned" "rootCA" dict $tls -}}
+{{- $namespace := include "sie-cluster.namespace" $root -}}
+{{- if eq (default $namespace $rootCA.namespace) $namespace -}}
+{{- $tlsSecrets = append $tlsSecrets (dict "owner" "the ingress root CA" "name" $rootCA.secretName) -}}
+{{- end -}}
+{{- range $tlsSecret := $tlsSecrets -}}
+{{- if $tlsSecret.name -}}
+{{- range $key := list "tls.crt" "tls.key" -}}
+{{- $chartSecretKeys = append $chartSecretKeys (dict "owner" $tlsSecret.owner "ref" (printf "%s/%s" $tlsSecret.name $key)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if include "sie-cluster.nats.authEnabled" $root -}}
+{{- $components := include "sie-cluster.nats.authComponents" $root | fromJsonArray -}}
+{{- if dig "config" "cluster" "enabled" false $root.Values.nats -}}
+{{- $components = append $components "route" -}}
+{{- end -}}
+{{- range $component := $components -}}
+{{- $natsSecret := include "sie-cluster.nats.authSecretName" (dict "auth" $root.Values.nats.auth "release" $root.Release.Name "component" $component) -}}
+{{- $chartSecretKeys = append $chartSecretKeys (dict "owner" (printf "the NATS %s password" $component) "ref" (printf "%s/password" $natsSecret)) -}}
+{{- end -}}
+{{- end -}}
+{{- $upstreamsSecretName := include "sie-cluster.upstreams.secretName" $root -}}
+{{- $upstreamsFileRef := printf "%s/upstreams.yaml" $upstreamsSecretName -}}
+{{- if $upstreams -}}
+{{- range $chartSecretKey := $chartSecretKeys -}}
+{{- if eq $chartSecretKey.ref $upstreamsFileRef -}}
+{{- fail (printf "%s reads the upstreams file: only the worker container of a remote lane may hold upstream configuration" $chartSecretKey.owner) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $chartSecretKeys = append $chartSecretKeys (dict "owner" "the upstreams file" "ref" $upstreamsFileRef) -}}
+{{- $secretNames := list -}}
+{{- if $upstreams -}}
+{{- $secretNames = append $secretNames $upstreamsSecretName -}}
+{{- end -}}
+{{- $position := 0 -}}
+{{- range $name, $upstream := $upstreams -}}
+{{- $position = add1 $position -}}
+{{- if not (regexMatch "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$" $name) -}}
+{{- fail (printf "upstreams: entry %d, counting in name order, is not an upstream name; use lowercase letters, digits and hyphens, at most 63 characters, starting and ending with a letter or digit" $position) -}}
+{{- end -}}
+{{- if not (kindIs "map" $upstream) -}}
+{{- fail (printf "upstreams: entry %d, counting in name order, must be a map" $position) -}}
+{{- end -}}
+{{- $path := printf "upstreams.%s" $name -}}
+{{- $fieldPosition := 0 -}}
+{{- range $field, $_ := $upstream -}}
+{{- $fieldPosition = add1 $fieldPosition -}}
+{{- if not (has $field (list "kind" "base_url" "api_key_secret" "rate_cap" "proxy_url" "endpoints" "set_params" "strip_params")) -}}
+{{- fail (printf "%s: field %d, counting in name order, is not an upstream field; use kind, base_url, api_key_secret, rate_cap, proxy_url, endpoints, set_params and strip_params" $path $fieldPosition) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (has $upstream.kind (list "sie" "openai")) -}}
+{{- fail (printf "%s.kind must be sie or openai" $path) -}}
+{{- end -}}
+{{- include "sie-cluster.upstreams.validateOpenaiFields" (dict "upstream" $upstream "path" $path) -}}
+{{- include "sie-cluster.upstreams.validateUrl" (dict "url" $upstream.base_url "field" (printf "%s.base_url" $path) "requireTls" true) -}}
+{{- if not (kindIs "invalid" $upstream.proxy_url) -}}
+{{- include "sie-cluster.upstreams.validateUrl" (dict "url" $upstream.proxy_url "field" (printf "%s.proxy_url" $path) "requireTls" false) -}}
+{{- if not (hasPrefix "https://" $upstream.base_url) -}}
+{{- fail (printf "%s.proxy_url requires an https base_url" $path) -}}
+{{- end -}}
+{{- end -}}
+{{- $rateCap := $upstream.rate_cap -}}
+{{- if not (kindIs "map" $rateCap) -}}
+{{- fail (printf "%s.rate_cap is required: set requests_per_minute and max_concurrency" $path) -}}
+{{- end -}}
+{{- $fieldPosition = 0 -}}
+{{- range $field, $_ := $rateCap -}}
+{{- $fieldPosition = add1 $fieldPosition -}}
+{{- if not (has $field (list "requests_per_minute" "max_concurrency")) -}}
+{{- fail (printf "%s.rate_cap: field %d, counting in name order, is not a rate cap field; use requests_per_minute and max_concurrency" $path $fieldPosition) -}}
+{{- end -}}
+{{- end -}}
+{{- range $field := list "requests_per_minute" "max_concurrency" -}}
+{{- $limit := index $rateCap $field -}}
+{{- if not (and (or (kindIs "int" $limit) (kindIs "int64" $limit) (kindIs "float64" $limit)) (eq (float64 $limit) (floor (float64 $limit))) (gt (float64 $limit) 0.0)) -}}
+{{- fail (printf "%s.rate_cap.%s must be a positive integer" $path $field) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (kindIs "invalid" $upstream.api_key_secret) -}}
+{{- $secret := $upstream.api_key_secret -}}
+{{- if not (kindIs "map" $secret) -}}
+{{- fail (printf "%s.api_key_secret must name a Kubernetes Secret as {name, key}; a credential never goes in values" $path) -}}
+{{- end -}}
+{{- $fieldPosition = 0 -}}
+{{- range $field, $_ := $secret -}}
+{{- $fieldPosition = add1 $fieldPosition -}}
+{{- if not (has $field (list "name" "key")) -}}
+{{- fail (printf "%s.api_key_secret: field %d, counting in name order, is not a field; use name and key" $path $fieldPosition) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (and (kindIs "string" $secret.name) (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" (toString $secret.name)) (le (len (toString $secret.name)) 253)) -}}
+{{- fail (printf "%s.api_key_secret.name must be a Kubernetes Secret name" $path) -}}
+{{- end -}}
+{{- if not (and (kindIs "string" $secret.key) (regexMatch "^[-._a-zA-Z0-9]+$" (toString $secret.key)) (le (len (toString $secret.key)) 253)) -}}
+{{- fail (printf "%s.api_key_secret.key must be a Secret data key" $path) -}}
+{{- end -}}
+{{- $ref := printf "%s/%s" $secret.name $secret.key -}}
+{{- range $chartSecretKey := $chartSecretKeys -}}
+{{- if eq $chartSecretKey.ref $ref -}}
+{{- fail (printf "%s.api_key_secret and %s name the same Secret key (%s). An upstream credential must reach only the remote lanes' workers, and no other credential may be sent upstream: give the upstream its own Secret key." $path $chartSecretKey.owner $ref) -}}
+{{- end -}}
+{{- end -}}
+{{- $secretNames = append $secretNames $secret.name -}}
+{{- end -}}
+{{- end -}}
+{{- $sources := list (dict "path" "gateway.extraEnv" "entries" $root.Values.gateway.extraEnv) (dict "path" "workers.common.extraEnv" "entries" $root.Values.workers.common.extraEnv) (dict "path" "workers.common.workerSidecar.extraEnv" "entries" $root.Values.workers.common.workerSidecar.extraEnv) -}}
+{{- range $poolName, $pool := $root.Values.workers.pools -}}
+{{- range $bundleName, $bundleCfg := (default dict $pool.bundles) -}}
+{{- if ne $bundleName "remote" -}}
+{{- $sources = append $sources (dict "path" (printf "workers.pools.%s.bundles.%s.extraEnv" $poolName $bundleName) "entries" (dig "extraEnv" list (default dict $bundleCfg))) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- range $source := $sources -}}
+{{- range $entry := (default list $source.entries) -}}
+{{- $secretName := dig "valueFrom" "secretKeyRef" "name" "" $entry -}}
+{{- if and $secretName (has $secretName $secretNames) -}}
+{{- fail (printf "%s reads the upstream Secret %q: only the worker container of a remote lane may hold an upstream credential" $source.path $secretName) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and (eq (include "sie-cluster.worker.remoteLaneEnabled" $root) "true") (not (dig "networkPolicy" "enabled" false $root.Values.workers)) -}}
+{{- fail "a remote lane needs workers.networkPolicy.enabled=true. The worker API has no authentication of its own, so without a NetworkPolicy any pod in the cluster could call a remote lane directly and spend its upstream credentials." -}}
+{{- end -}}
+{{- if and (eq (include "sie-cluster.worker.remoteLaneEnabled" $root) "true") (dig "networkPolicy" "extraIngress" list $root.Values.workers) -}}
+{{- fail "workers.networkPolicy.extraIngress cannot be set while a remote lane is enabled: workers.networkPolicy also selects the remote lane, so every extraIngress source could call it directly and spend its upstream credentials." -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 MCP edge (Req 12) — the hosted MCP server fronting the cluster's document jobs.
 */}}
 {{- define "sie-cluster.mcpEdge.serviceName" -}}
