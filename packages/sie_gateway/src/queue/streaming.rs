@@ -203,6 +203,10 @@ pub struct UsageBlock {
     pub total_tokens: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<u32>,
+    /// Host-measured GPU time for a sealed custom-model request. This is
+    /// absent from catalog-worker terminals and older worker versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_second: Option<u64>,
     /// OpenAI-compatible prompt-token breakdown. Absent when the worker's
     /// engine does not report prefix-cache hits (and from older workers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -233,6 +237,8 @@ struct WorkerUsageBlock {
     #[serde(default)]
     images: Option<u32>,
     #[serde(default)]
+    gpu_second: Option<u64>,
+    #[serde(default)]
     prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
@@ -248,6 +254,7 @@ impl From<WorkerUsageBlock> for UsageBlock {
             completion_tokens: raw.completion_tokens,
             total_tokens: raw.total_tokens,
             images: raw.images,
+            gpu_second: raw.gpu_second,
             prompt_tokens_details,
         }
     }
@@ -1256,6 +1263,7 @@ mod tests {
             finish_reason: if done { Some("stop".to_string()) } else { None },
             usage: if done {
                 Some(UsageBlock {
+                    gpu_second: None,
                     images: None,
                     prompt_tokens_details: None,
                     prompt_tokens: 5,
@@ -1355,6 +1363,41 @@ mod tests {
         let legacy: ChunkEnvelope =
             rmp_serde::from_slice(&legacy_bytes).expect("legacy worker decodes");
         assert_eq!(legacy.error.unwrap().validated_retry_after_s(), None);
+    }
+
+    #[test]
+    fn test_terminal_usage_carries_optional_gpu_seconds() {
+        let decode = |gpu_second: Option<serde_json::Value>| {
+            let mut usage = serde_json::json!({
+                "prompt_tokens": 3,
+                "completion_tokens": 5,
+                "total_tokens": 8,
+            });
+            if let Some(value) = gpu_second {
+                usage["gpu_second"] = value;
+            }
+            let bytes = rmp_serde::to_vec_named(&usage).expect("encode usage block");
+            rmp_serde::from_slice::<UsageBlock>(&bytes)
+        };
+
+        let measured = decode(Some(serde_json::json!(7))).expect("measured GPU time decodes");
+        assert_eq!(measured.gpu_second, Some(7));
+        assert_eq!(serde_json::to_value(measured).unwrap()["gpu_second"], 7);
+
+        let legacy = decode(None).expect("older usage block decodes");
+        assert_eq!(legacy.gpu_second, None);
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("gpu_second")
+            .is_none());
+
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(true),
+        ] {
+            assert!(decode(Some(invalid)).is_err());
+        }
     }
 
     #[test]
@@ -1707,6 +1750,7 @@ mod tests {
         collector.last_output_at = Some(first + std::time::Duration::from_millis(400));
         collector.output_event_count = 2;
         collector.final_meta.as_mut().expect("terminal").usage = Some(UsageBlock {
+            gpu_second: None,
             images: None,
             prompt_tokens_details: None,
             prompt_tokens: 1,
