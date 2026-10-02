@@ -1412,7 +1412,7 @@ UPSTREAMS_FIXTURE = ROOT / "tools/ci/fixtures/helm-upstreams.yaml"
 UPSTREAMS_SECRET = "sie-sie-cluster-upstreams"
 REMOTE_WORKER = ("StatefulSet", "sie-sie-cluster-worker-remote-remote", "worker")
 REMOTE_SERVICE_ACCOUNT = "sie-sie-cluster-worker-remote"
-CREDENTIAL_CANARY = "sk-canary-2f7c9e04b1d3a685"
+CREDENTIAL_CANARY = "sk-canary-2f7c9e04b1d3a685"  # gitleaks:allow
 
 
 def upstreams_fixture() -> dict:
