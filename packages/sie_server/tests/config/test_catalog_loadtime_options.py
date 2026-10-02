@@ -20,6 +20,7 @@ from sie_server.core.loader import (
     reject_unknown_loadtime_options,
     resolve_adapter_class,
 )
+from sie_server.core.runtime_options import apply_generation_runtime_options
 
 _MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
 
@@ -58,6 +59,18 @@ def test_shipped_profile_loadtime_options_are_accepted(sie_id: str, config: Mode
         adapter_class,
         config.resolve_profile("default").loadtime,
         model_name=config.sie_id,
+    )
+
+
+@pytest.mark.parametrize(("sie_id", "config"), _CATALOG, ids=[sie_id for sie_id, _ in _CATALOG])
+def test_shipped_generation_runtime_defaults_are_accepted(sie_id: str, config: ModelConfig) -> None:
+    if config.tasks.generate is None:
+        pytest.skip(f"{sie_id} is not a generation model")
+
+    apply_generation_runtime_options(
+        config,
+        None,
+        {"prompt": "hi", "max_new_tokens": 1},
     )
 
 
