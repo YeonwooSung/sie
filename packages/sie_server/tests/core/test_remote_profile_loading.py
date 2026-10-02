@@ -118,6 +118,36 @@ async def test_a_remote_profile_loads_while_the_local_model_is_still_loading(tmp
         await registry.unload_all_async()
 
 
+async def test_load_now_does_not_wait_for_and_retry_a_failing_background_load(tmp_path: Path) -> None:
+    registry = registry_for(tmp_path, model_config("acme/hybrid"))
+    entered = threading.Event()
+    release = threading.Event()
+
+    def fail_load(*_args: Any, **_kwargs: Any) -> None:
+        entered.set()
+        assert release.wait(TIMEOUT_S)
+        raise RuntimeError("injected background load failure")
+
+    try:
+        with patch("sie_server.core.model_loader.load_adapter", side_effect=fail_load) as load:
+            assert await registry.start_load_async("acme/hybrid", device="cpu")
+            await wait_until(entered.is_set)
+
+            assert not await asyncio.wait_for(registry.load_now("acme/hybrid", device="cpu"), 0.5)
+
+            release.set()
+            await wait_until(lambda: not registry.is_loading("acme/hybrid"))
+            assert not await registry.load_now("acme/hybrid", device="cpu")
+            assert load.call_count == 1
+            failure = registry.get_failure("acme/hybrid")
+            assert failure is not None
+            assert failure.attempts == 1
+    finally:
+        release.set()
+        await wait_until(lambda: not registry.is_loading("acme/hybrid"))
+        await registry.unload_all_async()
+
+
 async def test_a_remote_profile_of_a_model_with_weights_downloads_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -333,3 +363,52 @@ async def test_remote_lifecycle_keeps_configured_device_accounting(device: str, 
                     assert registry._resolve_load_device("cuda") == "cuda:1"
         finally:
             await registry.unload_all_async()
+
+
+async def test_concurrent_inline_loads_do_not_retry_a_recorded_failure(tmp_path: Path) -> None:
+    registry = registry_for(tmp_path, model_config("acme/local"))
+    name = "acme/local:remote"
+    loader = AsyncMock(side_effect=RuntimeError("remote load failed"))
+
+    async def inline_load(started: asyncio.Event) -> bool:
+        started.set()
+        return await registry.load_now(name, "cpu")
+
+    with patch.object(registry._loader, "load_remote_async", loader):
+        try:
+            async with registry._get_config_update_lock():
+                first_started, second_started = asyncio.Event(), asyncio.Event()
+                first = asyncio.create_task(inline_load(first_started))
+                await first_started.wait()
+                second = asyncio.create_task(inline_load(second_started))
+                await second_started.wait()
+            assert await asyncio.wait_for(asyncio.gather(first, second), TIMEOUT_S) == [False, False]
+            assert loader.await_count == 1
+            assert registry.get_failure(name).attempts == 1
+            assert not registry.is_loading(name)
+        finally:
+            await registry.unload_all_async()
+
+
+async def test_cancelled_inline_load_clears_its_loading_claim(tmp_path: Path) -> None:
+    registry = registry_for(tmp_path, model_config("acme/local"))
+    name = "acme/local:remote"
+    started = asyncio.Event()
+
+    async def inline_load() -> bool:
+        started.set()
+        return await registry.load_now(name, "cpu")
+
+    try:
+        async with registry._get_config_update_lock():
+            task = asyncio.create_task(inline_load())
+            await started.wait()
+            assert registry.is_loading(name)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert not registry.is_loading(name)
+        assert registry.get_failure(name) is None
+        assert await registry.load_now(name, "cpu")
+    finally:
+        await registry.unload_all_async()
