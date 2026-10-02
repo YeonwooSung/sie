@@ -261,7 +261,7 @@ pub async fn build_sse_response(params: SseParams<'_>) -> Response {
         .map(|g| g.max_new_tokens)
         .unwrap_or(512);
     let timeout_config = crate::handlers::proxy::generation_timeout_config(
-        state,
+        state.model_registry.as_ref(),
         &dispatch_model,
         &work_params,
         max_new_tokens,
@@ -1815,6 +1815,7 @@ mod tests {
                 // whose usage is the count-so-far.
                 finish_reason: "cancelled".to_string(),
                 usage: Some(UsageBlock {
+                    gpu_second: None,
                     images: None,
                     prompt_tokens_details: None,
                     prompt_tokens: 5,
@@ -2112,6 +2113,7 @@ mod tests {
             let mut terminal = _terminal_chunk("error", None);
             terminal.seq = 42;
             terminal.usage = Some(UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 3,
@@ -2135,6 +2137,7 @@ mod tests {
             let mut terminal = _terminal_chunk("error", None);
             terminal.seq = 42;
             terminal.usage = Some(UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 3,
@@ -2824,6 +2827,7 @@ mod tests {
         let chunk = _terminal_chunk(
             "stop",
             Some(UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 10,
@@ -3243,6 +3247,7 @@ mod tests {
         collector.apply(_terminal_chunk(
             "stop",
             Some(UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 2,
@@ -3280,6 +3285,7 @@ mod tests {
         let terminal = _terminal_chunk(
             "stop",
             Some(UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 5,
@@ -3402,6 +3408,7 @@ mod tests {
         let terminal = _terminal_chunk(
             "stop",
             Some(UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 5,
@@ -3449,6 +3456,7 @@ mod tests {
         let terminal = _terminal_chunk(
             "stop",
             Some(UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 5,
@@ -3516,6 +3524,7 @@ mod tests {
         let terminal = _terminal_chunk(
             "stop",
             Some(UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 5,
@@ -3552,6 +3561,7 @@ mod tests {
         let terminal = _terminal_chunk(
             "stop",
             Some(UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 5,
@@ -3686,6 +3696,7 @@ mod tests {
         collector.apply(_terminal_chunk(
             "stop",
             Some(UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 1,

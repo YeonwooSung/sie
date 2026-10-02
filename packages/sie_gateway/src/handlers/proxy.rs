@@ -3820,7 +3820,12 @@ pub(crate) async fn run_streaming_generate(
         .as_ref()
         .map(|g| g.max_new_tokens)
         .unwrap_or(512);
-    let timeout_config = generation_timeout_config(state, dispatch_model, params, max_new_tokens);
+    let timeout_config = generation_timeout_config(
+        state.model_registry.as_ref(),
+        dispatch_model,
+        params,
+        max_new_tokens,
+    );
     let first_chunk_timeout = timeout_config.first_chunk;
     let inter_chunk_timeout = timeout_config.inter_chunk;
     let effective_overall = timeout_config.overall;
@@ -8857,8 +8862,10 @@ fn env_seconds_or(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+/// Effective deadlines for one generation request after applying the shared
+/// environment, request-option, model-profile, and fallback precedence.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct GenerationTimeoutConfig {
+pub struct GenerationTimeoutConfig {
     pub first_chunk: Duration,
     pub inter_chunk: Duration,
     pub overall: Duration,
@@ -8895,8 +8902,10 @@ static TIMEOUT_ENV_OVERRIDES: std::sync::LazyLock<TimeoutEnvOverrides> =
         }
     });
 
-pub(crate) fn generation_timeout_config(
-    state: &AppState,
+/// Resolve the generation timeout policy used by the HTTP stream driver.
+/// Alternate dispatchers use the same result to bound downstream execution.
+pub fn generation_timeout_config(
+    model_registry: &crate::state::model_registry::ModelRegistry,
     model: &str,
     params: &publisher::WorkParams,
     max_new_tokens: u32,
@@ -8909,8 +8918,7 @@ pub(crate) fn generation_timeout_config(
         .and_then(Value::as_str)
         .unwrap_or("default");
 
-    let runtime = state
-        .model_registry
+    let runtime = model_registry
         .get_model_info(model)
         .and_then(|entry| entry.profile_configs.get(profile_name).cloned())
         .and_then(|profile| profile.adapter_options)
@@ -15020,6 +15028,7 @@ mod tests {
                 text: "ok".to_string(),
                 finish_reason: "stop".to_string(),
                 usage: Some(crate::queue::streaming::UsageBlock {
+                    gpu_second: None,
                     images: None,
                     prompt_tokens_details: None,
                     prompt_tokens: 1,
@@ -18554,7 +18563,12 @@ mod tests {
                     Err(QueueParseError::PreBuilt(response)) => response,
                     Err(_) => panic!("options.{key}={seconds:e} must fail as a prebuilt 400"),
                     Ok(params) => {
-                        let config = generation_timeout_config(&state, "m", &params, 8);
+                        let config = generation_timeout_config(
+                            state.model_registry.as_ref(),
+                            "m",
+                            &params,
+                            8,
+                        );
                         panic!("options.{key}={seconds:e} was accepted as {config:?}");
                     }
                 };
@@ -18581,7 +18595,7 @@ mod tests {
             let Ok(params) = work_params_from_json(&body, "generate") else {
                 panic!("timeouts of {seconds:e} s fit a duration and must be accepted");
             };
-            let config = generation_timeout_config(&state, "m", &params, 8);
+            let config = generation_timeout_config(state.model_registry.as_ref(), "m", &params, 8);
             let start = tokio::time::Instant::now();
             for timeout in [config.first_chunk, config.inter_chunk, config.overall] {
                 assert!(start + timeout > start);
@@ -18626,8 +18640,12 @@ mod tests {
             })
             .unwrap();
 
-        let config =
-            generation_timeout_config(&state, "org/slow", &publisher::WorkParams::default(), 8);
+        let config = generation_timeout_config(
+            state.model_registry.as_ref(),
+            "org/slow",
+            &publisher::WorkParams::default(),
+            8,
+        );
         let start = tokio::time::Instant::now();
         for timeout in [config.first_chunk, config.inter_chunk, config.overall] {
             assert!(start + timeout > start);
@@ -18655,6 +18673,7 @@ mod tests {
             text: "Hello world!".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 5,
@@ -23459,6 +23478,7 @@ mod tests {
             text: String::new(),
             finish_reason: "stop".to_string(),
             usage: Some(UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 5,
@@ -23516,6 +23536,7 @@ mod tests {
             text: String::new(),
             finish_reason: "tool_calls".to_string(),
             usage: Some(UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 6,
@@ -23585,6 +23606,7 @@ mod tests {
             text: String::new(),
             finish_reason: "stop".to_string(),
             usage: Some(UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 3,
@@ -23969,6 +23991,7 @@ mod tests {
             text: "a continuation".to_string(),
             finish_reason: "length".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 4,
@@ -24594,6 +24617,7 @@ mod tests {
             text: "a joke".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 5,
@@ -24628,6 +24652,7 @@ mod tests {
     #[test]
     fn test_responses_usage_reports_cached_input_tokens() {
         let usage = crate::queue::streaming::UsageBlock {
+            gpu_second: None,
             images: None,
             prompt_tokens_details: Some(crate::queue::streaming::PromptTokensDetails {
                 cached_tokens: 4,
@@ -24676,6 +24701,7 @@ mod tests {
             text: "Hi there!".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 5,
@@ -24768,6 +24794,7 @@ mod tests {
             text: "Hi".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 1,
@@ -24807,6 +24834,7 @@ mod tests {
             text: "Hi".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 1,
@@ -24841,6 +24869,7 @@ mod tests {
             text: String::new(),
             finish_reason: "tool_calls".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 7,
@@ -25443,6 +25472,7 @@ mod tests {
             text: "Hi".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
                 prompt_tokens: 1,
