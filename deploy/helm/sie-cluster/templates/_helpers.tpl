@@ -1351,6 +1351,212 @@ is sent, and the gateway's Role may write every ConfigMap in the namespace.
 {{- end }}
 
 {{/*
+"true" when the remote lanes' own NetworkPolicy renders: a remote lane is
+enabled and workers.remote.networkPolicy.enabled is not false.
+*/}}
+{{- define "sie-cluster.worker.remoteNetworkPolicyEnabled" -}}
+{{- if and (eq (include "sie-cluster.worker.remoteLaneEnabled" .) "true") (dig "remote" "networkPolicy" "enabled" true .Values.workers) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Ranges the remote lanes never reach through allowedCidrs, as a JSON list: a
+fixed base that values cannot remove (private, carrier-grade NAT, link-local
+and metadata addresses, IPv6 unique-local, link-local and NAT64 prefixes),
+followed by workers.remote.networkPolicy.extraDeniedCidrs.
+*/}}
+{{- define "sie-cluster.worker.remoteDeniedCidrs" -}}
+{{- $denied := list "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "100.64.0.0/10" "169.254.0.0/16" "168.63.129.16/32" "fc00::/7" "fe80::/10" "64:ff9b::/96" "64:ff9b:1::/48" -}}
+{{- range $index, $cidr := (dig "remote" "networkPolicy" "extraDeniedCidrs" list .Values.workers) -}}
+{{- if not (and (kindIs "string" $cidr) (regexMatch "^[0-9A-Fa-f:.]+/[0-9]{1,3}$" $cidr)) -}}
+{{- fail (printf "workers.remote.networkPolicy.extraDeniedCidrs[%d] must be a CIDR" $index) -}}
+{{- end -}}
+{{- $validator := ternary "sie-cluster.cidr.ipv6" "sie-cluster.cidr.ipv4" (contains ":" $cidr) -}}
+{{- $_ := include $validator (dict "cidr" $cidr "field" (printf "workers.remote.networkPolicy.extraDeniedCidrs[%d]" $index)) -}}
+{{- $denied = append $denied $cidr -}}
+{{- end -}}
+{{- toJson $denied -}}
+{{- end }}
+
+{{/*
+An IPv4 CIDR as JSON {"ip": <address as an integer>, "prefix": <length>}.
+Args (dict): cidr, field.
+*/}}
+{{- define "sie-cluster.cidr.ipv4" -}}
+{{- $octet := "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])" -}}
+{{- if not (regexMatch (printf "^%s\\.%s\\.%s\\.%s/(3[0-2]|[12]?[0-9])$" $octet $octet $octet $octet) .cidr) -}}
+{{- fail (printf "%s must be an IPv4 CIDR" .field) -}}
+{{- end -}}
+{{- $parts := regexSplit "[./]" .cidr -1 -}}
+{{- $ip := add (mul (atoi (index $parts 0)) 16777216) (mul (atoi (index $parts 1)) 65536) (mul (atoi (index $parts 2)) 256) (atoi (index $parts 3)) -}}
+{{- $prefix := atoi (index $parts 4) -}}
+{{- $scale := 1 -}}
+{{- range until (int (sub 32 $prefix)) -}}
+{{- $scale = mul $scale 2 -}}
+{{- end -}}
+{{- if ne (mod $ip $scale) 0 -}}
+{{- fail (printf "%s must be an IPv4 CIDR with a network address" .field) -}}
+{{- end -}}
+{{- dict "ip" $ip "prefix" $prefix | toJson -}}
+{{- end }}
+
+{{/*
+Validate an IPv6 CIDR and return its prefix as JSON. IPv4 tails occupy two
+hextets; :: must compress at least one. Args (dict): cidr, field.
+*/}}
+{{- define "sie-cluster.cidr.ipv6" -}}
+{{- $field := .field -}}
+{{- if not (and (kindIs "string" .cidr) (regexMatch "^[0-9A-Fa-f:.]+/(12[0-8]|1[01][0-9]|[1-9]?[0-9])$" .cidr)) -}}
+{{- fail (printf "%s must be an IPv6 CIDR" $field) -}}
+{{- end -}}
+{{- $cidrParts := splitList "/" .cidr -}}
+{{- $address := first $cidrParts -}}
+{{- if contains "." $address -}}
+{{- $tail := last (splitList ":" $address) -}}
+{{- $v4 := include "sie-cluster.cidr.ipv4" (dict "cidr" (printf "%s/32" $tail) "field" $field) | fromJson -}}
+{{- $address = printf "%s%x:%x" (trimSuffix $tail $address) (int (div (int64 $v4.ip) 65536)) (int (mod (int64 $v4.ip) 65536)) -}}
+{{- end -}}
+{{- $parts := splitList "::" $address -}}
+{{- $groups := list -}}
+{{- range $part := $parts -}}
+{{- if $part -}}
+{{- $groups = concat $groups (splitList ":" $part) -}}
+{{- end -}}
+{{- end -}}
+{{- range $group := $groups -}}
+{{- if not (regexMatch "^[0-9A-Fa-f]{1,4}$" $group) -}}
+{{- fail (printf "%s must be an IPv6 CIDR" $field) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (or (and (eq (len $parts) 1) (eq (len $groups) 8)) (and (eq (len $parts) 2) (lt (len $groups) 8))) -}}
+{{- fail (printf "%s must be an IPv6 CIDR" $field) -}}
+{{- end -}}
+{{- if eq (len $parts) 2 -}}
+{{- $expanded := regexFindAll "[0-9A-Fa-f]+" (first $parts) -1 -}}
+{{- range until (int (sub 8 (len $groups))) -}}
+{{- $expanded = append $expanded "0" -}}
+{{- end -}}
+{{- $groups = concat $expanded (regexFindAll "[0-9A-Fa-f]+" (last $parts) -1) -}}
+{{- end -}}
+{{- $digits := dict "0" 0 "1" 1 "2" 2 "3" 3 "4" 4 "5" 5 "6" 6 "7" 7 "8" 8 "9" 9 "a" 10 "b" 11 "c" 12 "d" 13 "e" 14 "f" 15 -}}
+{{- $values := list -}}
+{{- range $group := $groups -}}
+{{- $value := 0 -}}
+{{- range $digit := splitList "" (lower $group) -}}
+{{- $value = add (mul $value 16) (get $digits $digit) -}}
+{{- end -}}
+{{- $values = append $values $value -}}
+{{- end -}}
+{{- if and (eq (index $values 0) 0) (eq (index $values 1) 0) (eq (index $values 2) 0) (eq (index $values 3) 0) (eq (index $values 4) 0) (eq (index $values 5) 65535) -}}
+{{- fail (printf "%s must be an IPv6 CIDR without an IPv4-mapped address" $field) -}}
+{{- end -}}
+{{- $prefix := atoi (last $cidrParts) -}}
+{{- range $index, $value := $values -}}
+{{- $bits := max 0 (min 16 (sub $prefix (mul $index 16))) -}}
+{{- $scale := 1 -}}
+{{- range until (int (sub 16 $bits)) -}}
+{{- $scale = mul $scale 2 -}}
+{{- end -}}
+{{- if ne (mod $value $scale) 0 -}}
+{{- fail (printf "%s must be an IPv6 CIDR with a network address" $field) -}}
+{{- end -}}
+{{- end -}}
+{{- dict "prefix" $prefix | toJson -}}
+{{- end }}
+
+{{/*
+"true" when the IPv4 block `inner` lies inside `outer`. Two CIDR blocks are
+either nested or disjoint. Args (dict): inner, outer (from sie-cluster.cidr.ipv4).
+*/}}
+{{- define "sie-cluster.cidr.ipv4Within" -}}
+{{- if ge (int .inner.prefix) (int .outer.prefix) -}}
+{{- $scale := 1 -}}
+{{- range until (int (sub 32 (int .outer.prefix))) -}}
+{{- $scale = mul $scale 2 -}}
+{{- end -}}
+{{- if eq (div (int64 .inner.ip) $scale) (div (int64 .outer.ip) $scale) -}}
+true
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Fail unless every NetworkPolicy peer is scoped: a podSelector or
+namespaceSelector with matchLabels or matchExpressions, or an ipBlock whose
+prefix length is above 0. Args (dict): peers, path.
+*/}}
+{{- define "sie-cluster.networkPolicy.validatePeers" -}}
+{{- $path := .path -}}
+{{- range $index, $peer := .peers -}}
+{{- $scoped := false -}}
+{{- if kindIs "map" $peer -}}
+{{- if and (hasKey $peer "ipBlock") (or (hasKey $peer "podSelector") (hasKey $peer "namespaceSelector")) -}}
+{{- fail (printf "%s[%d] cannot combine ipBlock with podSelector or namespaceSelector." $path $index) -}}
+{{- end -}}
+{{- range $selectorKey := list "podSelector" "namespaceSelector" -}}
+{{- $selector := index $peer $selectorKey -}}
+{{- if and (kindIs "map" $selector) (or $selector.matchLabels $selector.matchExpressions) -}}
+{{- $scoped = true -}}
+{{- end -}}
+{{- end -}}
+{{- if $peer.ipBlock -}}
+{{- $cidr := toString (dig "cidr" "" (default (dict) $peer.ipBlock)) -}}
+{{- if or (not $cidr) (regexMatch "/0+$" (trim $cidr)) -}}
+{{- fail (printf "%s[%d] admits every address: give the ipBlock a prefix length above 0." $path $index) -}}
+{{- end -}}
+{{- $validator := ternary "sie-cluster.cidr.ipv6" "sie-cluster.cidr.ipv4" (contains ":" $cidr) -}}
+{{- $_ := include $validator (dict "cidr" $cidr "field" (printf "%s[%d].ipBlock.cidr" $path $index)) -}}
+{{- $scoped = true -}}
+{{- end -}}
+{{- end -}}
+{{- if not $scoped -}}
+{{- fail (printf "%s[%d] admits every destination: give it a podSelector or namespaceSelector with matchLabels or matchExpressions, or an ipBlock." $path $index) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Fail unless every NetworkPolicy port names a port and spans at most 60000
+ports. Args (dict): ports, path.
+*/}}
+{{- define "sie-cluster.networkPolicy.validatePorts" -}}
+{{- $path := .path -}}
+{{- range $index, $port := .ports -}}
+{{- if not (and (kindIs "map" $port) $port.port) -}}
+{{- fail (printf "%s[%d] admits every port: set port." $path $index) -}}
+{{- end -}}
+{{- $numeric := or (kindIs "int" $port.port) (kindIs "int64" $port.port) (kindIs "float64" $port.port) -}}
+{{- if $numeric -}}
+{{- if not (and (eq (float64 $port.port) (floor (float64 $port.port))) (ge (float64 $port.port) 1.0) (le (float64 $port.port) 65535.0)) -}}
+{{- fail (printf "%s[%d].port must be an integer between 1 and 65535." $path $index) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (kindIs "invalid" $port.endPort) -}}
+{{- $integral := list -}}
+{{- range $value := list $port.port $port.endPort -}}
+{{- $integral = append $integral (or (kindIs "int" $value) (kindIs "int64" $value) (and (kindIs "float64" $value) (eq (float64 $value) (floor (float64 $value))))) -}}
+{{- end -}}
+{{- if not (index $integral 0) -}}
+{{- fail (printf "%s[%d] sets endPort, which needs a numeric port, not a named one." $path $index) -}}
+{{- end -}}
+{{- if not (index $integral 1) -}}
+{{- fail (printf "%s[%d].endPort must be an integer." $path $index) -}}
+{{- end -}}
+{{- if or (lt (int64 $port.endPort) 1) (gt (int64 $port.endPort) 65535) -}}
+{{- fail (printf "%s[%d].endPort must be between 1 and 65535." $path $index) -}}
+{{- end -}}
+{{- if lt (int64 $port.endPort) (int64 $port.port) -}}
+{{- fail (printf "%s[%d].endPort must be at least port." $path $index) -}}
+{{- end -}}
+{{- if gt (sub (int64 $port.endPort) (int64 $port.port)) 60000 -}}
+{{- fail (printf "%s[%d] spans nearly every port: list the ports instead." $path $index) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Environment variable that carries one upstream's credential on remote lanes.
 Upstream names hold no underscore, so the mapping is one to one.
 */}}
@@ -1740,11 +1946,11 @@ credential pasted as a key would otherwise be printed.
 {{- end -}}
 {{- end -}}
 {{- end -}}
-{{- if and (eq (include "sie-cluster.worker.remoteLaneEnabled" $root) "true") (not (dig "networkPolicy" "enabled" false $root.Values.workers)) -}}
-{{- fail "a remote lane needs workers.networkPolicy.enabled=true. The worker API has no authentication of its own, so without a NetworkPolicy any pod in the cluster could call a remote lane directly and spend its upstream credentials." -}}
+{{- if and (eq (include "sie-cluster.worker.remoteLaneEnabled" $root) "true") (not (dig "networkPolicy" "enabled" false $root.Values.workers)) (ne (include "sie-cluster.worker.remoteNetworkPolicyEnabled" $root) "true") -}}
+{{- fail "a remote lane needs a NetworkPolicy: keep workers.remote.networkPolicy.enabled=true (the default) or set workers.networkPolicy.enabled=true. The worker API has no authentication of its own, so without a NetworkPolicy any pod in the cluster could call a remote lane directly and spend its upstream credentials." -}}
 {{- end -}}
-{{- if and (eq (include "sie-cluster.worker.remoteLaneEnabled" $root) "true") (dig "networkPolicy" "extraIngress" list $root.Values.workers) -}}
-{{- fail "workers.networkPolicy.extraIngress cannot be set while a remote lane is enabled: workers.networkPolicy also selects the remote lane, so every extraIngress source could call it directly and spend its upstream credentials." -}}
+{{- if and (eq (include "sie-cluster.worker.remoteLaneEnabled" $root) "true") (ne (include "sie-cluster.worker.remoteNetworkPolicyEnabled" $root) "true") (dig "networkPolicy" "extraIngress" list $root.Values.workers) -}}
+{{- fail "workers.networkPolicy.extraIngress cannot be set while a remote lane is enabled and workers.remote.networkPolicy.enabled is false: workers.networkPolicy then also selects the remote lane, so every extraIngress source could call it directly and spend its upstream credentials." -}}
 {{- end -}}
 {{- end }}
 
