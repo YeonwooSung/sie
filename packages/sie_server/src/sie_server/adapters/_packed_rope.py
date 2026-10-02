@@ -24,8 +24,8 @@ from __future__ import annotations
 import torch
 
 try:  # Triton ships with CUDA builds of PyTorch; CPU-only installs lack it.
-    import triton
-    import triton.language as tl
+    import triton  # ty: ignore[unresolved-import]
+    import triton.language as tl  # ty: ignore[unresolved-import]
 except ImportError:  # pragma: no cover - exercised only on installs without Triton
     _TRITON = False
 else:
