@@ -826,9 +826,10 @@ Below, `<fullname>` is the chart's full name: `<release>-sie-cluster`, or
   the upstreams file nor the credentials.
 - A remote lane runs no model on an accelerator. It runs the `cpu-default`
   worker image (`imageBundle: default`), which contains the remote adapters, and
-  the render fails when its pool sets `gpu.count` above 0, requests any
-  resource other than `cpu`, `memory` and `ephemeral-storage`, or sets a
-  `runtimeClassName`. It does not inherit `workers.common.runtimeClassName`.
+  the render fails when its resolved engine is not `pytorch`, its pool sets
+  `gpu.count` above 0, requests any resource other than `cpu`, `memory` and
+  `ephemeral-storage`, or sets a `runtimeClassName`. It does not inherit
+  `workers.common.runtimeClassName`.
 - The worker image must ship the `remote` bundle, which server images do from
   the first release that includes #492. With an older image the worker exits
   at start (`Bundle file not found`) and the lane restarts in a loop.

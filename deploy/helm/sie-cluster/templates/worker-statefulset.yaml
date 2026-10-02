@@ -106,6 +106,10 @@ fast at render time.
 {{- if not (or (eq $engine "pytorch") (eq $engine "candle")) }}
 {{- fail (printf "workers.pools.%s.bundles.%s.engine must be one of: pytorch, candle" $poolName $bundleName) }}
 {{- end }}
+{{- $remoteLane := eq $bundle "remote" }}
+{{- if and $remoteLane (ne $engine "pytorch") }}
+{{- fail (printf "workers.pools.%s.bundles.remote: the remote adapters run only in the pytorch worker; set engine: pytorch on this pool or bundle" $poolName) }}
+{{- end }}
 {{- if and (eq $engine "candle") (ne $bundle "candle") }}
 {{- fail (printf "workers.pools.%s.bundles.%s.engine=candle requires bundle=candle so gateway routing and worker heartbeats agree" $poolName $bundleName) }}
 {{- end }}
@@ -139,7 +143,6 @@ fast at render time.
 {{- fail "workers.common.kernelCache.storageSize must be non-empty when the kernel cache is enabled" }}
 {{- end }}
 {{- $gpuCount := int $pool.gpu.count }}
-{{- $remoteLane := eq $bundle "remote" }}
 {{- if and $remoteLane (gt $gpuCount 0) }}
 {{- fail (printf "workers.pools.%s.bundles.remote: a remote lane holds upstream credentials and runs no model on an accelerator; set workers.pools.%s.gpu.count to 0" $poolName $poolName) }}
 {{- end }}
