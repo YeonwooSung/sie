@@ -24,7 +24,7 @@ HERE = Path(__file__).resolve().parent
 EVIDENCE = HERE / "evidence"
 
 DATASET = "superlinked/sie-task-evidence"
-REVISION = "f79ce47607dafc4ab9ee7d796d24a6e22fbbd042"
+REVISION = "492389541d278e8b75cc9407e5170566e4523fa5"
 TASK = "knowledge-graph"
 
 API = f"https://huggingface.co/api/datasets/{DATASET}/tree/{REVISION}"
