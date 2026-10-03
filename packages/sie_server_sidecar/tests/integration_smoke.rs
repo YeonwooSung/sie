@@ -1283,6 +1283,19 @@ async fn smoke_generation_direct_dispatch_is_active_before_capability_reconcile(
 
     let pool = "smoke-gen-hot-add";
     let bundle = "default";
+    let client = async_nats::connect(&nats.url)
+        .await
+        .expect("client connect");
+    let js = async_nats::jetstream::new(client.clone());
+    js.create_stream(async_nats::jetstream::stream::Config {
+        name: "AUTHORITY_SETUP_BLOCKER".into(),
+        subjects: vec![format!(
+            "sie.work.{pool}.{pool}.{bundle}.*.smoke-worker.execution-authority-v1"
+        )],
+        ..Default::default()
+    })
+    .await
+    .expect("create temporary authority subject conflict");
     let probe_port = find_free_tcp_port();
     let _worker =
         WorkerHarness::spawn_with_env(&nats.url, &sock.path, pool, bundle, probe_port, None, &[]);
@@ -1364,6 +1377,27 @@ async fn smoke_generation_direct_dispatch_is_active_before_capability_reconcile(
     assert_eq!(body["smoke"], "generate");
     assert_eq!(body["model_id"], model_id);
     assert_eq!(body["request_id"], request_id);
+    assert!(js
+        .get_stream("WORK_AUTHORITY_V1_smoke-worker")
+        .await
+        .is_err());
+    js.delete_stream("AUTHORITY_SETUP_BLOCKER")
+        .await
+        .expect("remove temporary authority conflict");
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if js
+                .get_stream("WORK_AUTHORITY_V1_smoke-worker")
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("authority setup retries and recovers");
 
     drop(_worker);
     drop(python);
@@ -3351,6 +3385,85 @@ async fn ensure_paths_reconcile_stream_discard_policy_to_new() {
             "{name} must be repaired to DiscardPolicy::New"
         );
     }
+
+    // Verified work lives on a separately named, bounded stream. Replacing
+    // this worker with an older binary can only reconcile its pool/direct
+    // streams; it cannot make those old filters receive the verified work.
+    let authority =
+        sie_server_sidecar::nats_consumer::ensure_authority_stream_and_consumer(&js, &config)
+            .await
+            .expect("authority stream and consumer");
+    let subject = config.authority_subject_filter().replace('*', "model");
+    js.publish(subject.clone(), "verified-work".into())
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    sie_server_sidecar::nats_consumer::ensure_stream_and_consumer(&js, &config)
+        .await
+        .unwrap();
+    sie_server_sidecar::nats_consumer::ensure_worker_stream_and_consumer(&js, &config)
+        .await
+        .unwrap();
+    for name in [config.stream_name(), config.worker_stream_name()] {
+        assert_eq!(
+            js.get_stream(name)
+                .await
+                .unwrap()
+                .info()
+                .await
+                .unwrap()
+                .state
+                .messages,
+            0
+        );
+    }
+    let mut stream = js.get_stream(config.authority_stream_name()).await.unwrap();
+    let info = stream.info().await.unwrap();
+    assert_eq!(info.config.subjects, [config.authority_subject_filter()]);
+    assert!(info.config.max_messages > 0);
+    assert!(!info.config.max_age.is_zero());
+    assert_eq!(info.state.messages, 1);
+    let mut messages = authority
+        .stream()
+        .max_messages_per_batch(1)
+        .expires(Duration::from_millis(100))
+        .messages()
+        .await
+        .unwrap();
+    let delivery = timeout(Duration::from_secs(3), messages.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.subject.as_str(), subject);
+    delivery
+        .ack_with(async_nats::jetstream::AckKind::Nak(None))
+        .await
+        .unwrap();
+    drop(messages);
+
+    // A newer worker may resume the same durable and recheck live authority.
+    // Redelivery stays on the authority contract rather than the legacy pool.
+    let resumed =
+        sie_server_sidecar::nats_consumer::ensure_authority_stream_and_consumer(&js, &config)
+            .await
+            .unwrap();
+    let mut messages = resumed
+        .stream()
+        .max_messages_per_batch(1)
+        .expires(Duration::from_millis(100))
+        .messages()
+        .await
+        .unwrap();
+    let redelivery = timeout(Duration::from_secs(3), messages.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(redelivery.subject.as_str(), subject);
+    assert!(redelivery.info().unwrap().delivered >= 2);
+    redelivery.double_ack().await.unwrap();
 
     drop(nats);
 }

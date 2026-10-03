@@ -15,6 +15,23 @@ const MIN_SUBJECT_PARTS: usize = 6;
 /// Exact token count for worker-direct work subjects.
 const DIRECT_WORK_SUBJECT_PARTS: usize = 7;
 
+/// Incompatible execution contract: older pool/direct filters have fewer tokens.
+pub const EXECUTION_AUTHORITY_V1_TOKEN: &str = "execution-authority-v1";
+
+pub fn requires_execution_authority_v1(subject: &str) -> bool {
+    let parts: Vec<&str> = subject.split('.').collect();
+    parts.len() == DIRECT_WORK_SUBJECT_PARTS + 1
+        && parts.first() == Some(&"sie")
+        && parts.get(1) == Some(&"work")
+        && parts.last() == Some(&EXECUTION_AUTHORITY_V1_TOKEN)
+}
+
+/// Verified subjects may not silently retarget a lossy-normalized model id.
+pub fn execution_authority_model_matches(subject: &str, model_id: &str) -> bool {
+    !requires_execution_authority_v1(subject)
+        || extract_model_id(subject).as_deref() == Some(model_id)
+}
+
 /// Inverse of [`normalize_model_id`]. Best-effort: `__` → `/`, `_dot_` → `.`.
 pub fn denormalize_model_id(normalized: &str) -> String {
     normalized.replace("__", "/").replace("_dot_", ".")
@@ -41,7 +58,7 @@ pub fn extract_model_id(subject: &str) -> Option<String> {
 /// True when the subject addresses one concrete worker rather than the pool.
 pub fn is_worker_direct_work_subject(subject: &str) -> bool {
     let parts: Vec<&str> = subject.split('.').collect();
-    parts.len() == DIRECT_WORK_SUBJECT_PARTS
+    (parts.len() == DIRECT_WORK_SUBJECT_PARTS || requires_execution_authority_v1(subject))
         && parts.first() == Some(&"sie")
         && parts.get(1) == Some(&"work")
 }
@@ -104,6 +121,49 @@ mod tests {
         assert_eq!(normalize_model_id("BAAI/bge-m3"), "BAAI__bge-m3");
         assert_eq!(normalize_model_id("a.b"), "a_dot_b");
         assert_eq!(normalize_model_id("a/b.c"), "a__b_dot_c");
+    }
+
+    #[test]
+    fn execution_authority_subject_excludes_legacy_consumer_filters() {
+        let subject = "sie.work.pool.machine.bundle.model.worker.execution-authority-v1";
+        assert!(requires_execution_authority_v1(subject));
+        assert!(is_worker_direct_work_subject(subject));
+        assert_eq!(extract_model_id(subject), Some("model".into()));
+        assert!(!subjects_overlap("sie.work.pool.*.*.*", subject));
+        assert!(!subjects_overlap(
+            "sie.work.pool.machine.bundle.*.worker",
+            subject
+        ));
+        for invalid in [
+            "sie.work.pool.machine.bundle.model.worker",
+            "sie.work.pool.machine.bundle.model.worker.execution-authority-v2",
+            "sie.work.pool.machine.bundle.model.worker.extra.execution-authority-v1",
+        ] {
+            assert!(!requires_execution_authority_v1(invalid));
+        }
+    }
+
+    #[test]
+    fn authority_subject_cannot_retarget_normalization_collisions() {
+        for (original, decoded) in [
+            ("Org__model", "Org/model"),
+            ("Org/model_dot_v1", "Org/model.v1"),
+        ] {
+            let subject = format!(
+                "sie.work.pool.machine.bundle.{}.worker.execution-authority-v1",
+                normalize_model_id(original)
+            );
+            assert!(!execution_authority_model_matches(&subject, original));
+            assert!(execution_authority_model_matches(&subject, decoded));
+            assert!(execution_authority_model_matches(
+                "sie.work.pool.machine.bundle.legacy.worker",
+                original
+            ));
+        }
+        assert!(execution_authority_model_matches(
+            "sie.work.pool.machine.bundle.Org__model.worker.execution-authority-v1",
+            "Org/model"
+        ));
     }
 
     #[test]
