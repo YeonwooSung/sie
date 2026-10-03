@@ -583,7 +583,9 @@ class ModelRegistry:
         for name, config in self._configs.items():
             validate_no_legacy_scalar_lora_id(name=name, config=config)
             validate_profile_upstreams(config)
-            validate_model_routing(config)
+            validate_model_routing(
+                config, device=self.profile_execution_device(config.sie_id), engine_config=self._engine_config
+            )
 
         self._config_version += 1
 
@@ -701,6 +703,24 @@ class ModelRegistry:
     def devices(self) -> list[str]:
         """Return concrete devices available for whole-model placement."""
         return list(self._devices)
+
+    def profile_execution_device(self, name: str) -> str | None:
+        """Return a stable concrete identity device, or refuse movable placement.
+
+        Hybrid proof currently supports one configured device. A loaded model
+        outside that placement cannot borrow the configured device's proof.
+        """
+        if len(self._devices) != 1:
+            return None
+        device = self._devices[0]
+        if self._resolve_load_device(self._device) != device:
+            return None
+        if _device_family(device) == "cuda" and (":" not in device or not device.partition(":")[2].isdigit()):
+            return None
+        loaded = self._loaded.get(name)
+        if loaded is not None and loaded.device != device:
+            return None
+        return device
 
     def _memory_manager_for_device(self, device: str) -> MemoryManager:
         manager = self._memory_managers.get(device)
@@ -2430,7 +2450,9 @@ class ModelRegistry:
         # Multi-LoRA generation (``loadtime.lora_paths``) is unaffected.
         validate_no_legacy_scalar_lora_id(name=config.sie_id, config=config)
         validate_profile_upstreams(config)
-        validate_model_routing(config)
+        validate_model_routing(
+            config, device=self.profile_execution_device(config.sie_id), engine_config=self._engine_config
+        )
 
     def _apply_config_entry(self, config: ModelConfig, model_dir: Path | None = None) -> None:
         base_id = (
@@ -2499,12 +2521,14 @@ class ModelRegistry:
 
         update_lock = self._get_config_update_lock()
         async with update_lock:
+            retained_names: set[str] = set()
             if retained_models:
                 snapshot_bases = {_config_base_name(name, config) for name, config in new_configs.items()}
                 for name, config in self._configs.items():
                     base_name = _config_base_name(name, config)
                     if base_name in retained_models and base_name not in snapshot_bases and name not in new_configs:
                         new_configs[name] = config
+                        retained_names.add(name)
 
             if self._pool_name is not None:
                 accepted: dict[str, ModelConfig] = {}
@@ -2518,7 +2542,13 @@ class ModelRegistry:
                     accepted[name] = config
             for name, config in new_configs.items():
                 validate_no_legacy_scalar_lora_id(name=name, config=config)
-                validate_model_routing(config)
+                # These exact current entries were retained after an exported
+                # update was refused. Expiring admission must stop the bridge,
+                # not reject unrelated changes in the same snapshot.
+                if name not in retained_names:
+                    validate_model_routing(
+                        config, device=self.profile_execution_device(config.sie_id), engine_config=self._engine_config
+                    )
 
             async with self._get_load_admission_lock():
                 removed = set(self._configs) - set(new_configs)
