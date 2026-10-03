@@ -43,6 +43,7 @@ from sie_server.adapters.errors import (
 from sie_server.adapters.remote._limits import upstream_limiter
 from sie_server.config.upstreams import UpstreamCredentialError, upstream_for_serving
 from sie_server.core.upstream_client import UpstreamRedirectRefusedError
+from sie_server.core.upstream_deadline import DEADLINE_EXTENSION
 from sie_server.types.inputs import InvalidInputError
 
 DEFAULT_RETRY_AFTER_S = 5
@@ -101,6 +102,7 @@ def send_bounded(
 
 
 def _send(client: httpx.Client, request: httpx.Request, *, upstream: str, max_bytes: int, deadline: float) -> bytes:
+    request.extensions[DEADLINE_EXTENSION] = deadline
     try:
         response = client.send(request, stream=True)
     except UpstreamCredentialError:
@@ -177,7 +179,18 @@ async def open_stream(
     upstream_for_serving(upstream)
     with upstream_limiter(upstream).call():
         try:
-            response = await client.send(request, stream=True)
+            timeouts = {**client.timeout.as_dict(), **request.extensions.get("timeout", {})}
+            # Include pool/connect/write allowances as well as the effective
+            # read override; acquire headers once under a finite envelope.
+            header_timeout = (
+                sum(value for value in timeouts.values() if value is not None) if timeouts["read"] is not None else None
+            )
+            async with asyncio.timeout(header_timeout):
+                response = await client.send(request, stream=True)
+        except TimeoutError:
+            raise failure_for_transport_error(
+                httpx.ReadTimeout("upstream response headers exceeded the deadline"), upstream=upstream
+            ) from None
         except UpstreamCredentialError:
             raise RemoteUpstreamError("the upstream credential is unavailable") from None
         except httpx.HTTPError as exc:
