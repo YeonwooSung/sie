@@ -69,6 +69,22 @@ Message settlement:
 - Malformed subjects and bad msgpack payloads are NAKed.
 - Unknown operations publish per-item error outcomes when reply publication
   succeeds.
+- A `load` work item carries no input. It goes through the same admission,
+  config and readiness checks as other work for that model. Once
+  `EnsureModelReady` reports ready, it is ACKed without inference or a result.
+  This is the NATS worker-side warm-up primitive; the gateway does not yet
+  produce these items. Local-ingest `publish_work` rejects `load` before
+  dispatch because that request/response lane requires a result.
+- A work item may carry `fallback_reason` for a future gateway remote fallback
+  attempt. If the backend returns `nak_retry`, the sidecar publishes an error
+  result with the outcome's `error_code` (`QUEUE_FULL` when absent) and
+  `retry_after_s` (the NAK delay rounded up to seconds when absent), then ACKs
+  after successful publication. Ordinary items retain NAK behavior. Admission,
+  config/readiness barriers and failed result publication retain their existing
+  retry behavior; this does not yet provide the full cluster fallback contract.
+- An outcome's optional `retry_after_s` is published on the `WorkResult`
+  unchanged; the gateway uses it as `Retry-After` for a `QUEUE_FULL` or
+  `RESOURCE_EXHAUSTED` answer.
 - Active local model loads are held with JetStream progress ACKs until
   `EnsureModelReady` returns ready; this preserves the delivery budget during
   cold starts. The progress delay is clamped below the pool consumer `ack_wait`
