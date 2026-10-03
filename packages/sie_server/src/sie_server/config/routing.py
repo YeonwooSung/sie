@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from sie_server.adapters._generation_base import GenerationAdapter
 from sie_server.config.model import ModelConfig
 from sie_server.core.loader import expand_profile_variants, resolve_adapter_class
 
@@ -53,6 +54,8 @@ def remote_output_refusal(config: ModelConfig) -> str | None:
         adapter_class = resolve_adapter_class(variant, Path())
     except (ImportError, ValueError):
         return f"Model '{config.sie_id}': the adapter of remote profile '{routing.fallback_profile}' cannot be imported"
+    if config.tasks.generate is not None and not issubclass(adapter_class, GenerationAdapter):
+        return f"Model '{config.sie_id}': remote profile '{routing.fallback_profile}' requires a GenerationAdapter"
     spec = getattr(adapter_class, "spec", None)
     uncovered = sorted(set(config.outputs) - set(getattr(spec, "outputs", ())))
     if not uncovered:
@@ -72,10 +75,6 @@ def validate_model_routing(config: ModelConfig) -> None:
     if routing.policy == "threshold":
         msg = f"Model '{config.sie_id}': routing policy 'threshold' is not available yet"
         raise ValueError(msg)
-    # Token output support alone does not make a bridged stream safe: the
-    # ingress must preserve the original refusal before committing its 200.
-    if routing.policy == "fallback" and config.tasks.generate is not None:
-        raise ValueError("routing policy 'fallback' cannot serve generate before pre-output fallback handling")
     refusal = hybrid_equivalence_refusal(config) or remote_output_refusal(config)
     if refusal is not None:
         raise ValueError(refusal)
