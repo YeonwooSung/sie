@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import importlib.metadata
 import json
 import logging
@@ -205,6 +206,37 @@ class Journal:
         self.output.close()
 
 
+class EvidenceCaptureError(Exception):
+    pass
+
+
+class OperationEvents:
+    """Snapshot one operation's safe events without persistence in its timers."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.events: list[tuple[str, dict[str, Any]]] = []
+        self.failed = False
+
+    def append(self, event: str, **fields: Any) -> None:
+        try:
+            require(event in ("call_intent", "dispatch", "response", "call_result"), "Unexpected buffered event")
+            captured = copy.deepcopy(fields)
+            with self.lock:
+                self.events.append((event, captured))
+        except Exception:
+            self.failed = True
+            raise EvidenceCaptureError from None
+
+    def flush(self, journal: Journal) -> None:
+        # Both M paths have joined before replay. A capture or flush failure must
+        # escape to the child supervisor without a misleading operation seal.
+        if self.failed:
+            raise EvidenceCaptureError
+        for event, fields in self.events:
+            journal.append(event, **fields)
+
+
 def operation_identity(obs: dict[str, Any], arm: str) -> dict[str, Any]:
     return {k: obs[k] for k in ("observation_id", "base_id", "stage", "phase", "rule", "repetition", "arm_order")} | {
         "arm": arm,
@@ -229,17 +261,18 @@ class TransportEvidence:
         self.journal = journal
         self.local = threading.local()
 
-    def begin(self, identity: dict[str, Any]) -> None:
+    def begin(self, identity: dict[str, Any], events: OperationEvents | None = None) -> None:
         self.local.identity = identity
         self.local.dispatches = 0
+        self.local.sink = events if events is not None else self.journal
 
     def request(self, request: Any) -> None:
         self.local.dispatches += 1
+        self.local.sink.append("dispatch", **self.local.identity, dispatch_index=self.local.dispatches)
         self.local.dispatched_at = time.perf_counter()
-        self.journal.append("dispatch", **self.local.identity, dispatch_index=self.local.dispatches)
 
     def response(self, response: Any) -> None:
-        self.journal.append(
+        self.local.sink.append(
             "response",
             **self.local.identity,
             dispatch_index=self.local.dispatches,
@@ -455,7 +488,7 @@ class Executor:
                 elapsed_s=time.perf_counter() - start,
             )
 
-    def call(self, obs: dict[str, Any], arm: str, index: int) -> Any:
+    def call(self, obs: dict[str, Any], arm: str, index: int, events: OperationEvents) -> Any:
         from sie_sdk import Item
 
         call = obs["requests"][arm][index]
@@ -463,8 +496,8 @@ class Executor:
         client_key = call["model"] if arm == "sie" else call["provider"]
         client = self.clients[client_key]
         hooks = self.evidence[client_key]
-        self.journal.append("call_intent", **identity)
-        hooks.begin(identity)
+        events.append("call_intent", **identity)
+        hooks.begin(identity, events)
         start = time.perf_counter()
         reply = None
         try:
@@ -495,8 +528,10 @@ class Executor:
             if reply.get("item_error"):
                 raise CallFailure("ITEM_ERROR")
             validated = validate_reply(obs["stage"], arm, reply, obs["unit"]["data"], call)
+        except (EvidenceCaptureError, MemoryError):
+            raise
         except Exception as error:
-            self.journal.append(
+            events.append(
                 "call_result",
                 **identity,
                 status="failed",
@@ -508,7 +543,7 @@ class Executor:
                 execution_revision=revision(client.last_model_revision) if arm == "sie" else None,
             )
             raise CallFailure(stable_error(error).get("code", "CALL_FAILED")) from None
-        self.journal.append(
+        events.append(
             "call_result",
             **identity,
             status="success",
@@ -523,6 +558,7 @@ class Executor:
     def operation(self, obs: dict[str, Any], arm: str) -> None:
         identity = operation_identity(obs, arm)
         self.journal.append("operation_intent", **identity)
+        events = OperationEvents()
         start = time.perf_counter()
         result = None
         try:
@@ -532,11 +568,17 @@ class Executor:
             if obs["stage"] == "M" and arm == "sie":
 
                 def model_path(model: str) -> list[dict[str, Any]]:
-                    entities = []
-                    for index, call in enumerate(expected):
-                        if call["model"] == model:
-                            entities.extend(self.call(obs, arm, index))
-                    return entities
+                    try:
+                        entities = []
+                        for index, call in enumerate(expected):
+                            if call["model"] == model:
+                                entities.extend(self.call(obs, arm, index, events))
+                        return entities
+                    except (EvidenceCaptureError, MemoryError):
+                        # Another future may raise an ordinary call failure first.
+                        # Resource loss in either joined path forbids a seal.
+                        events.failed = True
+                        raise
 
                 with ThreadPoolExecutor(max_workers=2) as pool:
                     futures = [pool.submit(model_path, model) for model in MODELS["M"]]
@@ -544,19 +586,23 @@ class Executor:
                 spans = compose(obs["unit"]["data"]["text"], outputs)
                 result = {"spans": spans, "masked": masked(obs["unit"]["data"]["text"], spans)}
             else:
-                result = self.call(obs, arm, 0)
+                result = self.call(obs, arm, 0, events)
+        except (EvidenceCaptureError, MemoryError):
+            raise
         except Exception as error:
-            self.journal.append(
-                "operation_result",
-                **identity,
-                status="failed",
-                error=stable_error(error),
-                result=result,
-                elapsed_s=time.perf_counter() - start,
-            )
-            return
+            outcome = {"status": "failed", "error": stable_error(error)}
+        else:
+            outcome = {"status": "success"}
+        elapsed = time.perf_counter() - start
+        events.flush(self.journal)
         self.journal.append(
-            "operation_result", **identity, status="success", result=result, elapsed_s=time.perf_counter() - start
+            "operation_result",
+            **identity,
+            **outcome,
+            result=result,
+            elapsed_s=elapsed,
+            evidence_sealed=True,
+            captured_event_count=len(events.events),
         )
 
     def close(self) -> None:

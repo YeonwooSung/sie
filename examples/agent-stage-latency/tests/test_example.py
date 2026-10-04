@@ -13,8 +13,10 @@ import sys
 import threading
 import time
 from collections import Counter
+from concurrent.futures import Future
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import msgpack
@@ -104,6 +106,117 @@ def rechain(path: Path, rows: list[dict[str, Any]], *, total_elapsed_s: float | 
         end["journal_digest"] = protocol.sha256(path.read_bytes())
         end["end_digest"] = protocol.digest({k: v for k, v in end.items() if k != "end_digest"})
         end_path.write_bytes(protocol.canonical(end) + b"\n")
+
+
+def diagnostic_journal(path: Path, packet: dict[str, Any]) -> run.Journal:
+    journal = run.Journal(path, packet, [], create=True)
+    settings = packet["config"]
+    journal.append(
+        "run_start",
+        wall_limit_s=settings["wall_limit_s"],
+        placement_label=settings["placement_label"],
+        timeout_budgets_s={k: settings["request_timeout_s"] for k in ("connect", "read", "provision")},
+    )
+    journal.append("discovery_intent", call_id="metadata")
+    journal.append("discovery_result", call_id="metadata", status="success", models=[], elapsed_s=0.001)
+    return journal
+
+
+def diagnostic_end(path: Path, packet: dict[str, Any], reason: str) -> None:
+    end = {k: packet[k] for k in ("packet_digest", "protocol_digest", "source_digest")} | {
+        "reason": reason,
+        "journal_digest": protocol.sha256(path.read_bytes()),
+        "elapsed_s": 1.0,
+        "child_exitcode": -15 if reason == "interrupted" else 0,
+    }
+    fetch.write_exclusive(path.with_name(path.name + ".end.json"), end | {"end_digest": protocol.digest(end)})
+
+
+def synthetic_executor(packet: dict[str, Any], journal: run.Journal, advance: Any = lambda _: None) -> run.Executor:
+    """Exercise actual calls, hooks and composition without a socket or inference."""
+    executor = object.__new__(run.Executor)
+    executor.packet, executor.journal = packet, journal
+    executor.config = {"deadline": time.monotonic() + 60}
+    executor.clients, executor.evidence = {}, {}
+
+    class Client:
+        last_retry_count = 0
+        last_model_revision = "a" * 64
+
+        def __init__(self, model: str, hooks: run.TransportEvidence) -> None:
+            self.model, self.hooks = model, hooks
+
+        def invoke(self, reply: dict[str, Any]) -> dict[str, Any]:
+            assert journal_rows(journal.path)[-1]["event"] == "operation_intent"
+            self.hooks.request(None)
+            advance(1)
+            self.hooks.response(SimpleNamespace(status_code=200, headers={"X-SIE-Model-Revision": "a" * 64}))
+            advance(2)
+            return {"model": self.model, **reply}
+
+        def encode(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            return self.invoke({"dense": [0.125] * 2560})
+
+        def extract(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            return self.invoke({"entities": []})
+
+        def close(self) -> None:
+            pass
+
+    for stage in packet["config"]["stages"]:
+        for model in protocol.MODELS[stage]:
+            hooks = run.TransportEvidence(journal)
+            executor.evidence[model] = hooks
+            executor.clients[model] = Client(model, hooks)
+    return executor
+
+
+def checkpoint_worker(packet_path: Path, journal_path: Path, connection: Any, checkpoint: str) -> None:
+    """Pause at an acknowledged boundary so the parent can really terminate us."""
+    packet = prepare.load_packet(packet_path)
+    journal = run.Journal(journal_path, packet, [])
+    executor = synthetic_executor(packet, journal)
+
+    def pause() -> None:
+        connection.send(checkpoint)
+        connection.recv()
+
+    original_capture, original_append = run.OperationEvents.append, journal.append
+
+    def capture(events: run.OperationEvents, event: str, **fields: Any) -> None:
+        original_capture(events, event, **fields)
+        if checkpoint == "after_response" and event == "response":
+            pause()
+
+    def append(event: str, **fields: Any) -> None:
+        if checkpoint == "partial_flush" and event == "response":
+            journal.output.write(b'{"partial":')
+            journal.output.flush()
+            os.fsync(journal.output.fileno())
+            pause()
+        original_append(event, **fields)
+        if (checkpoint, event) in {
+            ("after_intent", "operation_intent"),
+            ("mid_flush", "call_intent"),
+            ("after_seal", "operation_result"),
+        }:
+            pause()
+
+    original_result = Future.result
+
+    def result(future: Any, *args: Any, **kwargs: Any) -> Any:
+        value = original_result(future, *args, **kwargs)
+        if checkpoint == "after_m_path":
+            pause()
+        return value
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(run.OperationEvents, "append", capture)
+        patch.setattr(journal, "append", append)
+        patch.setattr(Future, "result", result)
+        if checkpoint == "before_flush":
+            patch.setattr(run.OperationEvents, "flush", lambda *_: pause())
+        executor.operation(packet["observations"][0], "sie")
 
 
 class FakeServer:
@@ -198,8 +311,8 @@ class FakeServer:
                         }
                     )
                     rows = journal_rows(fixture.journal)
-                    if not any(r["event"] == "call_intent" for r in rows):
-                        fixture.errors.append("Server observed dispatch before a durable intent")
+                    if not any(r["event"] == "operation_intent" for r in rows):
+                        fixture.errors.append("Server observed dispatch before a durable operation intent")
                 fixture.observed.set()
                 try:
                     if fixture.delay:
@@ -672,6 +785,8 @@ def test_long_m_partial_success_and_no_outer_retry(tmp_path: Path) -> None:
     arm = report["stages"]["M"]["accounting"]["sie"]
     assert not report["complete"] and arm["planned"] == arm["failed"] == 1
     assert arm["semantic_calls"]["unattempted"] == 1 and arm["semantic_calls"]["successful"] == 4
+    assert arm["semantic_calls"]["attempt_status_unknown"] == 0 and arm["semantic_calls"]["attempted_count_exact"]
+    assert arm["physical_dispatches_exact"] and arm["sdk_retries_exact"]
 
 
 @pytest.mark.parametrize("with_auth,catalog_status", [(False, 200), (True, 200), (False, 404), (False, 501)])
@@ -744,17 +859,23 @@ def test_wall_deadline_reaps_child_and_preserves_unresolved_intent(tmp_path: Pat
         start = time.monotonic()
         assert run.run_trial(path, journal, server.url, {}, execute=True) == "deadline"
         assert time.monotonic() - start < 2.5 and server.observed.is_set()
+        actual_dispatches = len(server.captures)
     assert {p.pid for p in multiprocessing.active_children()} == before
     report = score.score_trial(path, journal)
     assert not report["complete"] and report["ending"]["reason"] == "deadline"
     arm = report["stages"]["E"]["accounting"]["sie"]
     assert arm["unresolved"] + arm["failed"] == 1
     calls = arm["semantic_calls"]
-    assert calls["failed"] + calls["unresolved"] == 1 and calls["successful"] == 0
-    if loading_sleep:
-        assert any(row["event"] == "response" and row["status"] == 503 for row in journal_rows(journal))
-    else:
-        assert calls["unresolved"] == 1
+    assert calls["failed"] + calls["unresolved"] + calls["attempt_status_unknown"] == 1
+    assert calls["successful"] == 0
+    assert calls["unattempted"] == 0
+    assert calls["attempted"] + calls["attempt_status_unknown"] == 1
+    assert arm["physical_dispatches"] <= actual_dispatches
+    assert arm["physical_dispatches_exact"] == arm["sdk_retries_exact"] == (arm["unresolved"] == 0)
+    if arm["physical_dispatches_exact"]:
+        assert arm["physical_dispatches"] == actual_dispatches
+    if not calls["attempted"]:
+        assert calls["attempt_status_unknown"] == 1 and arm["physical_dispatches"] == arm["sdk_retries"] == 0
 
 
 @pytest.mark.parametrize("code,expected", [("WALL_DEADLINE", "deadline"), ("CALL_FAILED", "child_failure")])
@@ -874,7 +995,8 @@ def test_interrupt_preserves_intent_and_reaps_child(tmp_path: Path, monkeypatch:
     assert {p.pid for p in multiprocessing.active_children()} == before
     report = score.score_trial(path, journal)
     assert not report["complete"] and report["ending"]["reason"] == "interrupted"
-    assert report["stages"]["E"]["accounting"]["sie"]["semantic_calls"]["unresolved"] == 1
+    calls = report["stages"]["E"]["accounting"]["sie"]["semantic_calls"]
+    assert calls["attempt_status_unknown"] == 1 and calls["unresolved"] == calls["unattempted"] == 0
 
 
 def test_truncated_tail_and_terminal_binding(tmp_path: Path) -> None:
@@ -1054,6 +1176,7 @@ def long_m_history(tmp_path: Path) -> tuple[Path, Path, list[dict[str, Any]], li
 def replace_m_calls(rows: list[dict[str, Any]], calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     begin = next(i for i, row in enumerate(rows) if row["event"] == "operation_intent")
     end = next(i for i, row in enumerate(rows) if row["event"] == "operation_result")
+    rows[end]["captured_event_count"] = len(calls)
     return rows[: begin + 1] + calls + rows[end:]
 
 
@@ -1284,6 +1407,281 @@ def test_offline_cli_help_and_opt_in_error(tmp_path: Path) -> None:
     )
     assert result.returncode == 2 and "--execute" in result.stderr and not (tmp_path / "out.jsonl").exists()
     assert "API_KEY" not in result.stdout + result.stderr
+
+
+def test_persistence_is_outside_timers_but_inside_wall_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, packet = packet_file(tmp_path, stages=["E"], n=1, arms="sie")
+    path = tmp_path / "timing.jsonl"
+    journal = diagnostic_journal(path, packet)
+    clock = {"now": 1.0}
+
+    def advance(seconds: float) -> None:
+        clock["now"] += seconds
+
+    monkeypatch.setattr(run.time, "perf_counter", lambda: clock["now"])
+    monkeypatch.setattr(run.time, "monotonic", lambda: clock["now"])
+    original_append, original_capture = journal.append, run.OperationEvents.append
+    persisted = []
+
+    def append(event: str, **fields: Any) -> None:
+        original_append(event, **fields)
+        advance(100)
+        persisted.append(event)
+
+    def capture(events: run.OperationEvents, event: str, **fields: Any) -> None:
+        original_capture(events, event, **fields)
+        advance(0.25)
+
+    monkeypatch.setattr(journal, "append", append)
+    monkeypatch.setattr(run.OperationEvents, "append", capture)
+    executor = synthetic_executor(packet, journal, advance)
+    executor.config["deadline"] = clock["now"] + 600
+    executor.operation(packet["observations"][0], "sie")
+    journal.close()
+    rows = journal_rows(path)
+    operation = rows[-1]
+    assert operation["evidence_sealed"] and operation["captured_event_count"] == 4
+    assert operation["elapsed_s"] == 4.0
+    assert next(r for r in rows if r["event"] == "call_result")["elapsed_s"] == 3.5
+    assert next(r for r in rows if r["event"] == "response")["headers_elapsed_s"] == 1.0
+    assert persisted == ["operation_intent", "call_intent", "dispatch", "response", "call_result", "operation_result"]
+    assert clock["now"] == 605.0
+    with pytest.raises(run.CallFailure, match="WALL_DEADLINE"):
+        executor.remaining()
+
+
+def test_m_buffer_preserves_interleaving_without_serializing_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packet_path, packet = packet_file(tmp_path, long=True, stages=["M"], n=1, arms="sie")
+    path = tmp_path / "interleaving.jsonl"
+    journal = diagnostic_journal(path, packet)
+    barrier = threading.Barrier(2)
+    captured = []
+    original_flush = run.OperationEvents.flush
+    original_append = journal.append
+
+    def advance(seconds: float) -> None:
+        if seconds == 1:
+            barrier.wait(timeout=3)
+
+    def flush(events: run.OperationEvents, target: run.Journal) -> None:
+        captured.extend(events.events)
+        original_flush(events, target)
+
+    def append(event: str, **fields: Any) -> None:
+        assert threading.current_thread() is threading.main_thread(), "M worker persisted during measured work"
+        original_append(event, **fields)
+
+    monkeypatch.setattr(run.OperationEvents, "flush", flush)
+    monkeypatch.setattr(journal, "append", append)
+    executor = synthetic_executor(packet, journal, advance)
+    executor.operation(packet["observations"][0], "sie")
+    journal.close()
+    diagnostic_end(path, packet, "finished")
+    rows = journal_rows(path)
+    replayed = rows[4:-1]
+    assert len(captured) == len(replayed) == 24
+    for (event, fields), row in zip(captured, replayed, strict=True):
+        assert event == row["event"] and all(row[k] == value for k, value in fields.items())
+    for model in protocol.MODELS["M"]:
+        ordered = [r for r in replayed if r["model"] == model and r["event"] in ("call_intent", "call_result")]
+        assert [r["event"] for r in ordered] == ["call_intent", "call_result"] * 3
+        assert [r["window"] for r in ordered] == [0, 0, 1, 1, 2, 2]
+    report = score.score_trial(packet_path, path)
+    counts = report["stages"]["M"]["accounting"]["sie"]
+    assert report["complete"] and counts["physical_dispatches_exact"] and counts["sdk_retries_exact"]
+    assert counts["semantic_calls"]["successful"] == 6
+
+
+def test_buffer_snapshots_nested_values_and_redacts_before_persistence(tmp_path: Path) -> None:
+    _, packet = packet_file(tmp_path, stages=["E"], n=1, arms="sie")
+    path = tmp_path / "snapshot.jsonl"
+    journal = run.Journal(path, packet, ["fake-auth-sentinel"], create=True)
+    events = run.OperationEvents()
+    reply = {"text": "fake-auth-sentinel", "usage": {"input_tokens": 3}, "dense": [0.5]}
+    identity = {"arm_order": ["sie", "rival"]}
+    events.append("call_result", reply=reply, **identity, sdk_retry_count=1, execution_revision="a" * 64)
+    reply["usage"]["input_tokens"] = 99
+    reply["dense"][0] = 99.0
+    identity["arm_order"].reverse()
+    events.flush(journal)
+    journal.close()
+    row = journal_rows(path)[0]
+    assert row["reply"] == {"text": "[REDACTED_CREDENTIAL]", "usage": {"input_tokens": 3}, "dense": [0.5]}
+    assert row["arm_order"] == ["sie", "rival"] and row["sdk_retry_count"] == 1
+    assert "fake-auth-sentinel" not in path.read_text()
+
+
+@pytest.mark.parametrize(
+    "checkpoint,stage,attempted,unknown,physical",
+    [
+        ("after_intent", "E", 0, 1, 0),
+        ("after_response", "E", 0, 1, 0),
+        ("after_m_path", "M", 0, 6, 0),
+        ("before_flush", "M", 0, 6, 0),
+        ("mid_flush", "M", 1, 5, 0),
+        ("partial_flush", "E", 1, 0, 1),
+        ("after_seal", "E", 1, 0, 1),
+    ],
+)
+def test_real_termination_preserves_only_durable_checkpoints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint: str,
+    stage: str,
+    attempted: int,
+    unknown: int,
+    physical: int,
+) -> None:
+    # Pytest importlib mode does not otherwise expose this namespace module to spawn.
+    monkeypatch.syspath_prepend(str(HERE.parents[1]))
+    packet_path, packet = packet_file(tmp_path, long=stage == "M", stages=[stage], n=2, arms="sie")
+    path = tmp_path / "stopped.jsonl"
+    diagnostic_journal(path, packet).close()
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    process = context.Process(target=checkpoint_worker, args=(packet_path, path, child, checkpoint))
+    try:
+        process.start()
+        child.close()
+        assert parent.poll(10) and parent.recv() == checkpoint
+        process.terminate()
+        process.join(3)
+        assert not process.is_alive()
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join()
+        parent.close()
+        child.close()
+    diagnostic_end(path, packet, "interrupted")
+    report = score.score_trial(packet_path, path)
+    counts = report["stages"][stage]["accounting"]["sie"]
+    calls = counts["semantic_calls"]
+    assert not report["complete"] and not report["qualifying_confirmatory"]
+    assert counts["planned"] == 2 and counts["unattempted"] == 1
+    assert calls["planned"] == packet["planned_semantic_calls"][stage]["sie"]
+    assert calls["attempted"] == attempted and calls["attempt_status_unknown"] == unknown
+    assert calls["attempted_count_exact"] == (unknown == 0)
+    assert counts["physical_dispatches"] == physical and counts["sdk_retries"] == 0
+    assert counts["physical_dispatches_exact"] == counts["sdk_retries_exact"] == (checkpoint == "after_seal")
+    assert calls["planned"] == sum(
+        calls[k] for k in ("successful", "failed", "unresolved", "unattempted", "attempt_status_unknown")
+    )
+    if checkpoint == "after_seal":
+        assert counts["successful"] == calls["successful"] == calls["unattempted"] == 1
+    else:
+        assert counts["unresolved"] == 1 and counts["successful_operation_latency"]["count"] == 0
+        assert calls["successful"] == calls["failed"] == 0
+    assert (report["truncated_tail_sha256"] is not None) == (checkpoint == "partial_flush")
+
+
+@pytest.mark.parametrize("failure", ["capture", "flush", "m_memory"])
+def test_observer_failure_stops_child_without_seal_or_next_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    stage = "M" if failure == "m_memory" else "E"
+    packet_path, packet = packet_file(tmp_path, stages=[stage], n=2, arms="sie")
+    path = tmp_path / "observer-failure.jsonl"
+    diagnostic_journal(path, packet).close()
+    original_journal = run.Journal
+
+    class FailingJournal(original_journal):
+        def append(self, event: str, **fields: Any) -> None:
+            if failure == "flush" and event == "dispatch":
+                self.output.write(b'{"partial":')
+                self.output.flush()
+                os.fsync(self.output.fileno())
+                raise OSError("synthetic persistence failure")
+            super().append(event, **fields)
+
+    class Executor(run.Executor):
+        def __init__(self, packet: dict[str, Any], journal: run.Journal, config: dict[str, Any]) -> None:
+            self.__dict__.update(synthetic_executor(packet, journal).__dict__)
+            if failure == "m_memory":
+
+                def ordinary_failure(*args: Any, **kwargs: Any) -> Any:
+                    raise run.CallFailure("CALL_FAILED")
+
+                def memory_failure(*args: Any, **kwargs: Any) -> Any:
+                    raise MemoryError
+
+                monkeypatch.setattr(self.clients[protocol.MODELS["M"][0]], "extract", ordinary_failure)
+                monkeypatch.setattr(self.clients[protocol.MODELS["M"][1]], "extract", memory_failure)
+
+        def discover(self) -> None:
+            pass
+
+    class Connection:
+        messages: list[str] = []
+
+        def recv(self) -> dict[str, Any]:
+            return {"packet_path": str(packet_path), "journal": str(path), "credentials": {}}
+
+        def send(self, message: str) -> None:
+            self.messages.append(message)
+
+        def close(self) -> None:
+            pass
+
+    original_capture = run.OperationEvents.append
+
+    def capture(events: run.OperationEvents, event: str, **fields: Any) -> None:
+        if failure == "capture" and event == "response":
+            events.failed = True
+            raise run.EvidenceCaptureError
+        original_capture(events, event, **fields)
+
+    monkeypatch.setattr(run, "Journal", FailingJournal)
+    monkeypatch.setattr(run, "Executor", Executor)
+    monkeypatch.setattr(run.OperationEvents, "append", capture)
+    connection = Connection()
+    run.child_main(connection)
+    assert connection.messages == ["child_failure"]
+    rows = journal_rows(path)
+    assert sum(r["event"] == "operation_intent" for r in rows) == 1
+    assert not any(r["event"] == "operation_result" for r in rows)
+    diagnostic_end(path, packet, "child_failure")
+    report = score.score_trial(packet_path, path)
+    assert not report["complete"]
+    assert report["stages"][stage]["accounting"]["sie"]["unattempted"] == 1
+
+
+@pytest.mark.parametrize("change", ["missing", "count", "premature"])
+def test_invalid_evidence_seals_are_rejected(
+    long_m_history: tuple[Path, Path, list[dict[str, Any]], list[list[dict[str, Any]]]], change: str
+) -> None:
+    packet_path, path, rows, _ = long_m_history
+    terminal = next(r for r in rows if r["event"] == "operation_result")
+    if change == "missing":
+        terminal.pop("evidence_sealed")
+    elif change == "count":
+        terminal["captured_event_count"] -= 1
+    else:
+        rows.remove(terminal)
+        terminal.update(status="failed", result=None, error={"code": "CALL_FAILED"})
+        at = next(i for i, r in enumerate(rows) if r["event"] == "call_result")
+        rows.insert(at, terminal)
+    rechain(path, rows)
+    with pytest.raises(ValueError, match="seal|operation terminal"):
+        score.score_trial(packet_path, path)
+
+
+def test_old_timing_binding_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path, packet = packet_file(tmp_path, stages=["E"], n=1, arms="sie")
+    current = protocol.protocol_digest()
+    legacy = protocol.digest(
+        {name: protocol.sha256((HERE / name).read_bytes()) for name in ("protocol.py", "prepare.py", "run.py")}
+    )
+    assert legacy != current
+    packet["protocol_digest"] = legacy
+    packet["packet_digest"] = protocol.digest({k: v for k, v in packet.items() if k != "packet_digest"})
+    path.write_bytes(protocol.canonical(packet))
+    with pytest.raises(ValueError, match="protocol binding"):
+        prepare.load_packet(path)
+    monkeypatch.setitem(protocol.TIMING_POLICY, "version", 1)
+    assert protocol.protocol_digest() != current
 
 
 def test_source_templates_match_builders_and_no_external_runtime_defaults() -> None:

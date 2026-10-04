@@ -63,6 +63,16 @@ SCHEMA = {
 WORD = re.compile(r"\w+(?:[-_]\w+)*|\S")
 NAME_TOKEN = re.compile(r"[^\W\d_]{3,}")
 M_POLICY = {"window_units": 300, "overlap": 50, "score_floor": 0.6, "model_paths": 2, "serial_windows": True}
+TIMING_POLICY = {
+    "version": 2,
+    "clock": "perf_counter",
+    "stage": "request-building-through-joined-caller-composition",
+    "call": "after-intent-capture-through-body-validation",
+    "headers": "after-dispatch-capture-through-response-headers",
+    "checkpoint": "durable-operation-intent-buffered-events-sealed-operation-result",
+    "replay": "after-stage-timer-before-next-operation",
+    "unsealed_missing_calls": "attempt-status-unknown",
+}
 PROVIDER_URLS = {
     "anthropic": "https://api.anthropic.com",
     "openai": "https://api.openai.com",
@@ -98,7 +108,12 @@ def source_digest() -> str:
 
 def protocol_digest() -> str:
     # These are behavior bindings, never endpoint eligibility requirements.
-    return digest({name: sha256((HERE / name).read_bytes()) for name in ("protocol.py", "prepare.py", "run.py")})
+    return digest(
+        {
+            "timing_policy": TIMING_POLICY,
+            "files": {name: sha256((HERE / name).read_bytes()) for name in ("protocol.py", "prepare.py", "run.py")},
+        }
+    )
 
 
 def safe_path(value: str) -> str:

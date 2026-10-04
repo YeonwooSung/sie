@@ -13,7 +13,7 @@ from typing import Any
 
 from fetch import write_exclusive
 from prepare import load_packet
-from protocol import MODELS, compose, digest, masked, positive, require, sha256, validate_reply
+from protocol import MODELS, TIMING_POLICY, compose, digest, masked, positive, require, sha256, validate_reply
 from run import operation_identity, subcall_identity
 
 
@@ -129,16 +129,21 @@ def read_journal(path: Path, packet: dict[str, Any]) -> tuple[list[dict[str, Any
     return rows, end, truncated
 
 
-def accounting(keys: list[Any], intents: dict[Any, Any], outcomes: dict[Any, Any]) -> dict[str, Any]:
+def accounting(
+    keys: list[Any], intents: dict[Any, Any], outcomes: dict[Any, Any], unknown: set[Any] | None = None
+) -> dict[str, Any]:
+    unknown = unknown or set()
     terminal = [outcomes[k] for k in keys if k in outcomes]
     successful = [r for r in terminal if r["status"] == "success"]
     return {
         "planned": len(keys),
         "attempted": sum(k in intents for k in keys),
+        "attempted_count_exact": not any(k in unknown for k in keys),
         "successful": len(successful),
         "failed": len(terminal) - len(successful),
         "unresolved": sum(k in intents and k not in outcomes for k in keys),
-        "unattempted": sum(k not in intents for k in keys),
+        "unattempted": sum(k not in intents and k not in unknown for k in keys),
+        "attempt_status_unknown": sum(k in unknown for k in keys),
         "successful_operation_latency": elapsed_summary([r["elapsed_s"] for r in successful]),
         "all_terminal_attempt_elapsed": elapsed_summary([r["elapsed_s"] for r in terminal]),
         "failures": [
@@ -184,6 +189,7 @@ def score_trial(packet_path: Path, journal_path: Path) -> dict[str, Any]:
     active_calls = set()
     next_in_path: dict[tuple[str, str, str], int] = defaultdict(int)
     failed_paths = set()
+    captured_counts: dict[tuple[str, str], int] = defaultdict(int)
     for row in rows[1:]:
         event = row["event"]
         if event in ("discovery_intent", "discovery_result"):
@@ -224,6 +230,12 @@ def score_trial(packet_path: Path, journal_path: Path) -> dict[str, Any]:
                 require(
                     row["status"] in ("success", "failed") and positive(row["elapsed_s"]),
                     "Invalid operation duration/status",
+                )
+                require(
+                    row.get("evidence_sealed") is True
+                    and type(row.get("captured_event_count")) is int
+                    and row["captured_event_count"] == captured_counts[key],
+                    "Missing or incomplete operation evidence seal",
                 )
                 if row["status"] == "failed":
                     require(isinstance(row.get("error"), dict), "Missing failure evidence")
@@ -297,6 +309,7 @@ def score_trial(packet_path: Path, journal_path: Path) -> dict[str, Any]:
                 )
                 op_key = (row["observation_id"], row["arm"])
                 require(active_operation == op_key, "Subcall outside its operation")
+                captured_counts[op_key] += 1
             if event == "call_intent":
                 require(cid not in call_intents, "Duplicate call intent")
                 obs, identity = calls[cid]
@@ -352,7 +365,7 @@ def score_trial(packet_path: Path, journal_path: Path) -> dict[str, Any]:
                 call_results[cid] = row
                 active_calls.remove(cid)
             elif event == "dispatch":
-                require(cid == "metadata" or cid in active_calls, "Dispatch before durable intent")
+                require(cid == "metadata" or cid in active_calls, "Dispatch before captured call intent")
                 require(row["dispatch_index"] == len(dispatches[cid]) + 1, "Physical dispatch sequence differs")
                 require(len(dispatches[cid]) == len(responses[cid]), "Overlapping physical retries")
                 dispatches[cid].append(row)
@@ -381,6 +394,7 @@ def score_trial(packet_path: Path, journal_path: Path) -> dict[str, Any]:
         "schema": 1,
         "packet_digest": packet["packet_digest"],
         "protocol_digest": packet["protocol_digest"],
+        "timing_policy": TIMING_POLICY,
         "complete": complete,
         "qualifying_confirmatory": complete and config["phase"] == "confirmatory",
         "ending": end,
@@ -388,7 +402,7 @@ def score_trial(packet_path: Path, journal_path: Path) -> dict[str, Any]:
         "discovery": discovery_result,
         "discovery_attempted": discovery_intent is not None,
         "discovery_unresolved": discovery_intent is not None and discovery_result is None,
-        "statistics_scope": "client wall time; successful complete base-case pairs, independent stages",
+        "statistics_scope": "client operation time excluding journal replay; successful complete base-case pairs",
         "phases": {},
         "stages": {},
     }
@@ -409,14 +423,25 @@ def score_trial(packet_path: Path, journal_path: Path) -> dict[str, Any]:
                     if obs["stage"] == stage and obs["phase"] == phase and identity["arm"] == arm
                 ]
                 summary = accounting(op_keys, op_intents, op_results)
-                summary["semantic_calls"] = accounting(call_keys, call_intents, call_results)
+                unknown_calls = {
+                    cid
+                    for cid in call_keys
+                    if cid not in call_intents
+                    and (calls[cid][1]["observation_id"], arm) in op_intents
+                    and (calls[cid][1]["observation_id"], arm) not in op_results
+                }
+                summary["semantic_calls"] = accounting(call_keys, call_intents, call_results, unknown_calls)
                 summary["semantic_calls"]["successful_call_latency"] = summary["semantic_calls"].pop(
                     "successful_operation_latency"
                 )
                 summary["physical_dispatches"] = sum(len(dispatches[cid]) for cid in call_keys)
+                summary["physical_dispatches_exact"] = all(
+                    key not in op_intents or key in op_results for key in op_keys
+                )
                 summary["sdk_retries"] = sum(
                     call_results[cid]["sdk_retry_count"] for cid in call_keys if cid in call_results
                 )
+                summary["sdk_retries_exact"] = summary["physical_dispatches_exact"]
                 result["phases"][phase][stage][arm] = summary
             if phase != "confirmatory":
                 continue

@@ -127,10 +127,15 @@ windows inside each path. No repetitions or automatic sample extension occur.
 
 ## Read the report
 
-The journal syncs metadata and intents before dispatch, then records each
-physical HTTP attempt, reply, stable error, elapsed duration and observable
-SDK retry count. An SDK per-item error, malformed verdict, bad vector or
-invalid ranking remains a failure. Earlier M subcalls survive a later error.
+The journal syncs metadata and the complete frozen `operation_intent` before
+any constituent dispatch. During that operation, a short-lock memory buffer
+captures call intents, physical HTTP attempts, replies, stable errors, elapsed
+durations and observable SDK retry counts. After the stage timer stops, those
+snapshots are replayed in their original interleaving through the fsynced hash
+chain. An `operation_result` seals the complete captured event count and is
+synced before the next operation. No background writer is used. An SDK per-item
+error, malformed verdict, bad vector or invalid ranking remains a failure.
+Ordinary failed M operations join both paths and preserve earlier subcalls.
 There is no outer retry campaign: capacity waits and OOM retries are disabled.
 The SDK can still retry admission/model-loading responses; those attempts and
 their full elapsed time remain recorded.
@@ -141,10 +146,13 @@ the total child deadline, including blocked requests and SDK retry sleeps,
 then stops/reaps the child. Terminal-record writing and reaping add a small
 amount of cleanup time after that deadline. Discovery and client setup are
 outside measured operations. Stage timing includes request building/windowing,
-transport, SDK processing, caller composition/masking and journal work inside
-that boundary. Constituent call timers exclude their own intent/result appends.
+transport, SDK processing, reply projection/sanitization/validation, caller
+composition/masking and memory event capture. Durable journal replay is outside
+stage and call timing but inside the total wall budget. Constituent call timers
+start after intent capture and stop after body processing and validation,
+before result capture. No calibration value is subtracted from these timers.
 Each physical `response.headers_elapsed_s` stops at the response headers,
-before consuming the body, and includes the dispatch observer's journal append.
+before consuming the body; it starts after dispatch event capture.
 It differs from `call_result.elapsed_s`, which includes body consumption and
 SDK processing, and from the complete-stage `operation_result.elapsed_s`.
 The scorer requires the frozen next window in each M model path and checks
@@ -171,11 +179,25 @@ are omitted; exact configured credentials echoed in replies are replaced by
 
 Scoring validates packet/request bindings, the journal hash chain, observation
 and subcall identities, unique terminals, execution order and reply shapes.
-It reports planned, attempted, successful, failed, unresolved and unattempted
-counts per phase/stage/arm, with the fixed denominator beside latency results.
+It reports planned, observed attempted, successful, failed, unresolved,
+unattempted and `attempt_status_unknown` counts per phase/stage/arm, with the
+fixed denominator beside latency results. A stop before or during replay can
+lose replies, calls or retries that occurred. Missing call intents in a started
+operation without a complete seal are attempt-status-unknown; its observed
+attempt count is a lower bound when `attempted_count_exact` is false. A sealed
+failed operation permits its never-started windows to be known unattempted.
+Later operations without durable intent are unattempted. Physical-dispatch and
+SDK-retry totals are observed lower bounds whenever their corresponding
+`physical_dispatches_exact` or `sdk_retries_exact` flag is false; zero observed
+does not establish zero actual activity. Completed captured call records remain
+diagnostic evidence even when the operation seal is absent. Persistence errors
+stop the child without sealing that operation or starting the next.
 Successful-operation p50/p90 and all-terminal elapsed p50/p90 are separate.
 Partial runs remain incomplete and nonqualifying. A missing earlier outcome
-is never repaired into a better history.
+is never repaired into a better history. The versioned timing/checkpoint policy
+is bound into `protocol_digest` and included in the report; prepare a fresh
+packet after changing the runner. Packets from earlier timing policies are
+rejected, so those measurements cannot silently mix.
 
 Confirmatory comparisons use only successful, complete base-case pairs. R's
 two rule variants stay together; if any variant fails, that whole base cluster
