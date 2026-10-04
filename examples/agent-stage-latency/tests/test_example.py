@@ -1049,6 +1049,42 @@ def test_malformed_cohere_reply_is_durable_failed_call(tmp_path: Path) -> None:
     assert all(len(row["reply"]["results"]) == 21 and row["reply"]["results"][-1] is None for row in replies)
 
 
+@pytest.mark.parametrize("index", [False, True, 0.0, "0", None])
+def test_openai_embedding_projection_requires_integer_zero_index(index: Any) -> None:
+    data = population(1)["E"][0]["data"]
+    reply = run.project_reply("E", "rival", {"data": [{"index": index, "embedding": [0.0] * 3072}]}, data)
+    assert reply["dense"] is None and reply["malformed_reply"]
+    call = protocol.requests("E", data, "rival")[0]
+    with pytest.raises(ValueError, match="malformed reply"):
+        protocol.validate_reply("E", "rival", reply, data, call)
+
+
+@pytest.mark.parametrize("stage", ["G", "M"])
+@pytest.mark.parametrize("member", [None, 17])
+def test_anthropic_non_object_content_is_preserved_as_malformed(stage: str, member: Any) -> None:
+    data = population(1)[stage][0]["data"]
+    text = "unharmful" if stage == "G" else '{"entities":[]}'
+    reply = run.project_reply(stage, "rival", {"content": [{"type": "text", "text": text}, member]}, data)
+    assert reply["text"] == text and reply["content"][1] is None and reply["malformed_reply"]
+    call = protocol.requests(stage, data, "rival")[0]
+    with pytest.raises(ValueError, match="malformed reply"):
+        protocol.validate_reply(stage, "rival", reply, data, call)
+
+
+@pytest.mark.parametrize("member,first", [(None, False), (17, False), (None, True)])
+def test_non_object_guard_choices_keep_stable_failure_evidence(member: Any, first: bool) -> None:
+    data = population(1)["G"][0]["data"]
+    choices = [{"message": {"content": "Safety: Safe"}, "finish_reason": "stop"}]
+    choices.insert(0 if first else 1, member)
+    reply = run.project_reply("G", "sie", {"choices": choices}, data)
+    assert reply["malformed_reply"] and reply["choice_count"] == 2
+    assert reply["malformed_choice_indices"] == [0 if first else 1]
+    assert reply["text"] == (None if first else "Safety: Safe")
+    call = protocol.requests("G", data, "sie")[0]
+    with pytest.raises(ValueError, match="malformed reply"):
+        protocol.validate_reply("G", "sie", reply, data, call)
+
+
 def test_paired_cluster_bootstrap_known_statistics() -> None:
     settings = config()["bootstrap"]
     clusters = [[(1.0, 4.0), (3.0, 6.0)], [(2.0, 5.0), (4.0, 7.0)]]

@@ -261,21 +261,34 @@ def project_reply(stage: str, arm: str, raw: Any, data: dict[str, Any]) -> dict[
         reply["item_error"] = {"code": "ITEM_ERROR"}
     if stage == "G" or (stage == "M" and arm == "rival"):
         if arm == "sie":
-            choices = raw.get("choices") or []
-            message = choices[0].get("message", {}) if choices and isinstance(choices[0], dict) else {}
+            choices = raw.get("choices")
+            if not isinstance(choices, list):
+                reply["malformed_reply"] = True
+                choices = []
+            malformed = [index for index, choice in enumerate(choices) if not isinstance(choice, dict)]
+            if malformed:
+                reply.update(malformed_reply=True, malformed_choice_indices=malformed, choice_count=len(choices))
+            first = choices[0] if choices and isinstance(choices[0], dict) else {}
+            message = first.get("message", {})
+            if not isinstance(message, dict):
+                reply["malformed_reply"] = True
+                message = {}
             reply.update(
                 {
                     "text": message.get("content"),
                     "refusal": message.get("refusal"),
-                    "finish_reason": public_id(choices[0].get("finish_reason")) if choices else None,
+                    "finish_reason": public_id(first.get("finish_reason")),
                 }
             )
         else:
             blocks = raw.get("content")
             if isinstance(blocks, list):
                 reply["content"] = [
-                    {"type": public_id(b.get("type")), "text": b.get("text")} for b in blocks if isinstance(b, dict)
+                    {"type": public_id(b.get("type")), "text": b.get("text")} if isinstance(b, dict) else None
+                    for b in blocks
                 ]
+                if any(not isinstance(b, dict) for b in blocks):
+                    reply["malformed_reply"] = True
                 reply["text"] = "".join(
                     b.get("text", "")
                     for b in blocks
@@ -297,10 +310,17 @@ def project_reply(stage: str, arm: str, raw: Any, data: dict[str, Any]) -> dict[
             reply["dense"] = raw.get("dense")
         else:
             rows = raw.get("data")
-            if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict) and rows[0].get("index") == 0:
+            if (
+                isinstance(rows, list)
+                and len(rows) == 1
+                and isinstance(rows[0], dict)
+                and type(rows[0].get("index")) is int
+                and rows[0]["index"] == 0
+            ):
                 reply["dense"] = rows[0].get("embedding")
             else:
                 reply["dense"] = None
+                reply["malformed_reply"] = True
     elif arm == "sie":
         scores = raw.get("scores")
         reply["scores"] = (
