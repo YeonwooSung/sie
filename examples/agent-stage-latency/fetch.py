@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import shutil
@@ -13,12 +14,43 @@ from typing import Any
 from protocol import canonical, digest, require, safe_path, sha256, sources
 
 
+def fsync_directory(path: Path) -> None:
+    """Sync directory entries on POSIX filesystems that support directory fsync."""
+    if os.name != "posix":
+        return
+    descriptor = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        os.fsync(descriptor)
+    except OSError as error:
+        if error.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP):
+            raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def mkdir_synced(path: Path, *, exist_ok: bool = True) -> None:
+    """Create missing ancestors and sync each new directory and its parent."""
+    if path.parent != path and not path.parent.is_dir():
+        mkdir_synced(path.parent)
+    try:
+        path.mkdir()
+    except FileExistsError:
+        if not exist_ok or not path.is_dir():
+            raise
+    else:
+        fsync_directory(path)
+        fsync_directory(path.parent)
+
+
 def write_exclusive(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    mkdir_synced(path.parent)
     with path.open("xb") as output:
         output.write(canonical(value) + b"\n")
         output.flush()
         os.fsync(output.fileno())
+    fsync_directory(path.parent)
 
 
 def verify_inputs(root: Path, catalog: dict[str, Any] | None = None) -> dict[str, bytes]:
@@ -59,11 +91,13 @@ def verify_inputs(root: Path, catalog: dict[str, Any] | None = None) -> dict[str
 
 def fetch_inputs(destination: Path, catalog: dict[str, Any] | None = None) -> None:
     catalog = sources() if catalog is None else catalog
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    mkdir_synced(destination.parent)
     destination.mkdir()  # exclusive reservation, including empty existing directories
     staging = destination / ".staging"
-    staging.mkdir()
     try:
+        fsync_directory(destination)
+        fsync_directory(destination.parent)
+        mkdir_synced(staging, exist_ok=False)
         for entry in catalog["files"]:
             name = safe_path(entry["path"])
             request = urllib.request.Request(entry["url"], headers={"User-Agent": "sie-examples/agent-stage-latency"})
@@ -73,19 +107,28 @@ def fetch_inputs(destination: Path, catalog: dict[str, Any] | None = None) -> No
                 len(body) == entry["bytes"] and sha256(body) == entry["sha256"], "Downloaded bytes or digest differ"
             )
             target = staging / name
-            target.parent.mkdir(parents=True, exist_ok=True)
+            mkdir_synced(target.parent)
             with target.open("xb") as output:
                 output.write(body)
+                output.flush()
+                os.fsync(output.fileno())
+            fsync_directory(target.parent)
         write_exclusive(staging / "verified.json", {"source_digest": digest(catalog)})
         verify_inputs(staging, catalog)
         for child in staging.iterdir():
             if child.name != "verified.json":
                 child.rename(destination / child.name)
+        fsync_directory(staging)
+        fsync_directory(destination)
         (staging / "verified.json").rename(destination / "verified.json")
+        fsync_directory(staging)
+        fsync_directory(destination)
         staging.rmdir()
+        fsync_directory(destination)
     except BaseException:
         # Only this invocation's exclusively reserved directory is removed.
         shutil.rmtree(destination)
+        fsync_directory(destination.parent)
         raise
 
 

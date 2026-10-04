@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from fetch import write_exclusive
+from fetch import fsync_directory, mkdir_synced, write_exclusive
 from prepare import load_packet
 from protocol import (
     MODELS,
@@ -171,8 +171,11 @@ class Journal:
         self.packet = packet
         self.credentials = credentials
         self.lock = threading.Lock()
-        path.parent.mkdir(parents=True, exist_ok=True)
+        mkdir_synced(path.parent)
         self.output = path.open("xb" if create else "ab")
+        self.output.flush()
+        os.fsync(self.output.fileno())
+        fsync_directory(path.parent)
         rows = [] if create else [json.loads(line) for line in path.read_bytes().splitlines()]
         self.sequence = len(rows)
         self.previous = rows[-1]["entry_digest"] if rows else None
@@ -578,6 +581,8 @@ def child_main(connection: Any) -> None:
                     executor.remaining()
                     executor.operation(obs, arm)
             connection.send("finished")
+        except CallFailure as error:
+            connection.send("deadline" if error.code == "WALL_DEADLINE" else "child_failure")
         except BaseException:
             connection.send("child_failure")
         finally:

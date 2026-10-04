@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import multiprocessing
+import os
 import random
 import struct
 import subprocess
@@ -380,6 +381,81 @@ def test_fetch_allowlist_verification_and_exclusive_staging(tmp_path: Path) -> N
     assert not (tmp_path / "failed").exists()
 
 
+def inode(path: Path) -> tuple[int, int]:
+    status = path.stat()
+    return status.st_dev, status.st_ino
+
+
+def record_syncs(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
+    synced = []
+    original = os.fsync
+
+    def record(descriptor: int) -> None:
+        original(descriptor)
+        status = os.fstat(descriptor)
+        synced.append((status.st_dev, status.st_ino))
+
+    monkeypatch.setattr(os, "fsync", record)
+    return synced
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Directory fsync is a POSIX persistence step")
+@pytest.mark.parametrize("journal", [False, True])
+def test_output_creation_syncs_file_and_new_parent_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, journal: bool
+) -> None:
+    synced = record_syncs(monkeypatch)
+    path = tmp_path / "new-parent" / "leaf" / "output.jsonl"
+    if journal:
+        output = run.Journal(path, {}, [], create=True)
+        output.close()
+    else:
+        fetch.write_exclusive(path, {"fixture": True})
+    if inode(path.parent) not in synced:
+        pytest.skip("This filesystem does not support directory fsync")
+    file_sync = synced.index(inode(path))
+    assert inode(path.parent) in synced[file_sync + 1 :]
+    assert all(inode(parent) in synced for parent in (tmp_path, path.parent.parent, path.parent))
+    with pytest.raises(FileExistsError):
+        if journal:
+            run.Journal(path, {}, [], create=True)
+        else:
+            fetch.write_exclusive(path, {})
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Directory fsync is a POSIX persistence step")
+def test_fetch_syncs_data_and_renames_before_publishing_marker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, catalog = tiny_catalog(tmp_path / "source")
+    output = tmp_path / "downloaded"
+    synced = record_syncs(monkeypatch)
+    rename = Path.rename
+    last_data_rename = 0
+    published = False
+
+    def checked_rename(path: Path, target: Path) -> Path:
+        nonlocal last_data_rename, published
+        if path.name == "verified.json":
+            if inode(output) not in synced:
+                pytest.skip("This filesystem does not support directory fsync")
+            for entry in catalog["files"]:
+                data = output / entry["path"]
+                file_sync = synced.index(inode(data))
+                assert inode(data.parent) in synced[file_sync + 1 :]
+            assert inode(path) in synced
+            assert inode(output) in synced[last_data_rename:]
+            assert inode(path.parent) in synced[last_data_rename:]
+            published = True
+        result = rename(path, target)
+        if not published:
+            last_data_rename = len(synced)
+        return result
+
+    monkeypatch.setattr(Path, "rename", checked_rename)
+    fetch.fetch_inputs(output, catalog)
+    assert published and len(fetch.verify_inputs(output, catalog)) == 9
+    assert synced[-1] == inode(output)
+
+
 @pytest.mark.parametrize("path", ["../escape", "/absolute", "a/../b", "a\\b", "a//b", "a/./b"])
 def test_unsafe_paths(path: str) -> None:
     with pytest.raises(ValueError):
@@ -679,6 +755,92 @@ def test_wall_deadline_reaps_child_and_preserves_unresolved_intent(tmp_path: Pat
         assert any(row["event"] == "response" and row["status"] == 503 for row in journal_rows(journal))
     else:
         assert calls["unresolved"] == 1
+
+
+@pytest.mark.parametrize("code,expected", [("WALL_DEADLINE", "deadline"), ("CALL_FAILED", "child_failure")])
+def test_child_terminal_signal_wins_before_parent_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: str, expected: str
+) -> None:
+    path, _ = packet_file(tmp_path, stages=["E"], n=1, arms="sie")
+    journal = tmp_path / "child-terminal.jsonl"
+    checked = []
+
+    class ExpiredExecutor(run.Executor):
+        def __init__(self, packet: Any, journal: Any, settings: dict[str, Any]) -> None:
+            self.config = settings | {"deadline": time.monotonic() - 1}
+
+        def discover(self) -> None:
+            pass
+
+        def remaining(self) -> float:
+            checked.append(code)
+            if code == "WALL_DEADLINE":
+                return super().remaining()
+            raise run.CallFailure(code)
+
+        def close(self) -> None:
+            pass
+
+    class Connection:
+        peer: Connection
+
+        def __init__(self) -> None:
+            self.messages: list[Any] = []
+            self.received: list[Any] = []
+
+        def recv(self) -> Any:
+            message = self.messages.pop(0)
+            self.received.append(message)
+            return message
+
+        def poll(self) -> bool:
+            return bool(self.messages)
+
+        def send(self, message: Any) -> None:
+            self.peer.messages.append(message)
+
+        def close(self) -> None:
+            pass
+
+    parent, child = Connection(), Connection()
+    parent.peer, child.peer = child, parent
+
+    # Complete the real child function during join, before the parent's live
+    # budget expires, so terminal classification is independent of scheduling.
+    class InlineProcess:
+        pid = 1
+        exitcode: int | None = None
+
+        def __init__(self, target: Any, args: tuple[Any, ...]) -> None:
+            self.target, self.args = target, args
+
+        def start(self) -> None:
+            pass
+
+        def join(self, timeout: float | None = None) -> None:
+            assert timeout is not None and timeout > 0
+            self.target(*self.args)
+            self.exitcode = 0
+
+        def is_alive(self) -> bool:
+            return self.exitcode is None
+
+    class Context:
+        Process = InlineProcess
+
+        @staticmethod
+        def Pipe() -> tuple[Connection, Connection]:
+            return parent, child
+
+    monkeypatch.setattr(run, "Executor", ExpiredExecutor)
+    monkeypatch.setattr(run.multiprocessing, "get_context", lambda _: Context())
+    assert run.run_trial(path, journal, "http://127.0.0.1:8000", {}, execute=True) == expected
+    assert checked == [code] and parent.received == [expected]
+    ending = json.loads(journal.with_name(journal.name + ".end.json").read_bytes())
+    assert ending["reason"] == expected and ending["child_exitcode"] == 0
+    assert ending["elapsed_s"] < 15
+    report = score.score_trial(path, journal)
+    assert not report["complete"] and report["stages"]["E"]["accounting"]["sie"]["unattempted"] == 1
 
 
 def test_interrupt_preserves_intent_and_reaps_child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

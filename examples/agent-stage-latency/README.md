@@ -82,6 +82,10 @@ directory. The example never replaces inputs, packets, journals or reports.
 The runner creates `trial-1.jsonl.end.json` beside its journal. Preserve both
 files: the exclusive terminal record binds the full journal bytes to the
 packet, including any partial final line left by a deadline or interrupt.
+Files are flushed and synced before their publication directories; newly
+created parent directories and download renames are synced too. Directory
+syncing applies on POSIX filesystems that support it. Storage and filesystem
+behavior still govern survival after power loss.
 
 ## Pilot and disjoint confirmation
 
