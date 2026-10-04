@@ -190,8 +190,10 @@ Later operations without durable intent are unattempted. Physical-dispatch and
 SDK-retry totals are observed lower bounds whenever their corresponding
 `physical_dispatches_exact` or `sdk_retries_exact` flag is false; zero observed
 does not establish zero actual activity. Completed captured call records remain
-diagnostic evidence even when the operation seal is absent. Persistence errors
-stop the child without sealing that operation or starting the next.
+diagnostic evidence even when the operation seal is absent. Capture or replay
+errors prevent a seal; any persistence error stops the child before another
+operation. A complete seal row can remain visible if its own sync fails, but
+the child failure still makes the run nonqualifying.
 Successful-operation p50/p90 and all-terminal elapsed p50/p90 are separate.
 Partial runs remain incomplete and nonqualifying. A missing earlier outcome
 is never repaired into a better history. The versioned timing/checkpoint policy
