@@ -140,11 +140,16 @@ pub(crate) struct RecordingDispatcher {
     stream_mid_error: AtomicBool,
     stream_terminal_failure: Mutex<Option<&'static str>>,
     dispatched: Mutex<Vec<Dispatched>>,
+    execution_authority: Mutex<Vec<bool>>,
 }
 
 impl RecordingDispatcher {
     pub(crate) fn dispatched(&self) -> Vec<Dispatched> {
         self.dispatched.lock().unwrap().clone()
+    }
+
+    pub(crate) fn execution_authority(&self) -> Vec<bool> {
+        self.execution_authority.lock().unwrap().clone()
     }
 
     pub(crate) fn saturate_local_queue(&self) {
@@ -277,7 +282,7 @@ impl WorkDispatcher for RecordingDispatcher {
         _engine: &str,
         _bundle_config_hash: &str,
         items: Vec<rmpv::Value>,
-        _params: &WorkParams,
+        params: &WorkParams,
     ) -> Result<
         (
             String,
@@ -286,6 +291,10 @@ impl WorkDispatcher for RecordingDispatcher {
         ),
         DispatchError,
     > {
+        self.execution_authority
+            .lock()
+            .unwrap()
+            .push(params.require_execution_authority_v1);
         self.record(Dispatched::new(endpoint, &target));
         if self.work_refused.load(Ordering::SeqCst) {
             return Err(DispatchError::Other("private upstream failure".into()));
@@ -329,7 +338,7 @@ impl WorkDispatcher for RecordingDispatcher {
         display_model: &str,
         _engine: &str,
         bundle_config_hash: &str,
-        _params: &WorkParams,
+        params: &WorkParams,
         _admission_pool: &str,
     ) -> Result<
         (
@@ -343,6 +352,10 @@ impl WorkDispatcher for RecordingDispatcher {
         if self.generate_refused.load(Ordering::SeqCst) {
             return Err("private upstream failure".into());
         }
+        self.execution_authority
+            .lock()
+            .unwrap()
+            .push(params.require_execution_authority_v1);
         self.record(Dispatched::new("generate", &target));
         let (rx, _tap) = terminal_chunk_collector(display_model, bundle_config_hash);
         Ok((
@@ -359,7 +372,7 @@ impl WorkDispatcher for RecordingDispatcher {
         display_model: &str,
         _engine: &str,
         bundle_config_hash: &str,
-        _params: &WorkParams,
+        params: &WorkParams,
         _admission_pool: &str,
     ) -> Result<
         (
@@ -370,6 +383,10 @@ impl WorkDispatcher for RecordingDispatcher {
         ),
         String,
     > {
+        self.execution_authority
+            .lock()
+            .unwrap()
+            .push(params.require_execution_authority_v1);
         self.record(Dispatched::new("generate", &target));
         if self.generate_refused.load(Ordering::SeqCst) {
             return Err("private upstream failure".into());
@@ -444,6 +461,10 @@ pub(crate) struct TestGateway {
 
 impl TestGateway {
     pub(crate) async fn new(models: &[&str]) -> Self {
+        Self::with_threshold_routing(models, false).await
+    }
+
+    pub(crate) async fn with_threshold_routing(models: &[&str], threshold: bool) -> Self {
         let bundles_dir = tempfile::TempDir::new().unwrap();
         let models_dir = tempfile::TempDir::new().unwrap();
         std::fs::write(bundles_dir.path().join("default.yaml"), DEFAULT_BUNDLE).unwrap();
@@ -468,10 +489,11 @@ impl TestGateway {
                 profiles,
                 lanes.clone(),
             )),
-            model_registry: Arc::new(ModelRegistry::new(
+            model_registry: Arc::new(ModelRegistry::with_threshold_routing(
                 bundles_dir.path(),
                 models_dir.path(),
                 true,
+                threshold,
             )),
             pool_manager,
             work_publisher: Some(dispatcher.clone()),
@@ -599,5 +621,99 @@ fn test_config(
         config_modal_proxy_token: None,
         payload_store_url: String::new(),
         public_base_url: None,
+    }
+}
+
+/// Independent authenticated control broker for request-path regressions.
+/// The inference dispatcher remains the recording fixture above.
+pub(crate) struct ThresholdBroker {
+    pub context: async_nats::jetstream::Context,
+    _process: tokio::process::Child,
+    _config: tempfile::NamedTempFile,
+    _store_dir: tempfile::TempDir,
+}
+
+impl ThresholdBroker {
+    pub(crate) async fn start() -> Option<Self> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let fixture = include_str!("../../../../tools/ci/fixtures/sie-threshold-nats.conf")
+            .replace("port: 4222", &format!("listen: 127.0.0.1:{port}"))
+            .replace("http_port: 8222", "http_port: -1");
+        let store_dir = tempfile::tempdir().unwrap();
+        let config = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(config.path(), fixture).unwrap();
+        let process = tokio::process::Command::new("nats-server")
+            .args(["-c", config.path().to_str().unwrap()])
+            .arg("-sd")
+            .arg(store_dir.path())
+            .env(
+                "SIE_NATS_AUTH_GATEWAY_PASSWORD",
+                "GatewayThresholdTestPassword0123456789",
+            )
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn();
+        let mut process = match process {
+            Ok(process) => process,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                assert!(
+                    std::env::var("NATS_URL").is_err(),
+                    "NATS integration requires nats-server"
+                );
+                return None;
+            }
+            Err(error) => panic!("control fixture start failed: {error}"),
+        };
+        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < ready_deadline {
+            if let Some(status) = process.try_wait().expect("control fixture status") {
+                panic!("control fixture exited before readiness: {status}");
+            }
+            if let Ok(Ok(client)) = tokio::time::timeout(
+                Duration::from_millis(250),
+                async_nats::ConnectOptions::new()
+                    .user_and_password(
+                        "sie-gateway".into(),
+                        "GatewayThresholdTestPassword0123456789".into(),
+                    )
+                    .connect(format!("nats://127.0.0.1:{port}")),
+            )
+            .await
+            {
+                return Some(Self {
+                    context: async_nats::jetstream::new(client),
+                    _process: process,
+                    _config: config,
+                    _store_dir: store_dir,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("control broker did not become ready");
+    }
+
+    pub(crate) async fn bind(
+        &self,
+        gateway: &TestGateway,
+    ) -> Arc<crate::state::threshold_runtime::ThresholdBinding> {
+        use crate::state::threshold_coordinator::ThresholdCoordinator;
+        use crate::state::threshold_runtime::ThresholdBinding;
+        gateway.state.config_epoch.set_max(1);
+        let (generation, targets) = gateway.state.model_registry.threshold_targets(1).unwrap();
+        let binding = Arc::new(ThresholdBinding {
+            generation,
+            epoch: 1,
+            coordinator: ThresholdCoordinator::connect(&self.context, 1, targets)
+                .await
+                .unwrap(),
+        });
+        gateway
+            .state
+            .model_registry
+            .install_threshold_binding(Arc::clone(&binding));
+        binding
     }
 }
