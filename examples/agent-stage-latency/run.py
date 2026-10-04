@@ -241,7 +241,7 @@ class TransportEvidence:
             **self.local.identity,
             dispatch_index=self.local.dispatches,
             status=response.status_code,
-            elapsed_s=time.perf_counter() - self.local.dispatched_at,
+            headers_elapsed_s=time.perf_counter() - self.local.dispatched_at,
             execution_revision=revision(response.headers.get("X-SIE-Model-Revision")),
         )
 
@@ -251,6 +251,8 @@ def project_reply(stage: str, arm: str, raw: Any, data: dict[str, Any]) -> dict[
     if not isinstance(raw, dict):
         return {"malformed_reply": True}
     reply: dict[str, Any] = {"returned_model": public_id(raw.get("model"))}
+    if raw.get("model") is not None and reply["returned_model"] is None:
+        reply["malformed_reply"] = True
     request = raw.get("request")
     if isinstance(request, dict):
         reply["execution_identity_sha256"] = revision(request.get("execution_identity_sha256"))
@@ -316,15 +318,18 @@ def project_reply(stage: str, arm: str, raw: Any, data: dict[str, Any]) -> dict[
         results = raw.get("results")
         reply["results"] = (
             [
-                {"index": r.get("index"), "relevance_score": r.get("relevance_score")}
+                {"index": r.get("index"), "relevance_score": r.get("relevance_score")} if isinstance(r, dict) else None
                 for r in results
-                if isinstance(r, dict)
             ]
             if isinstance(results, list)
             else []
         )
+        if not isinstance(results, list) or any(not isinstance(r, dict) for r in results):
+            reply["malformed_reply"] = True
         reply["scores"] = []
         for row in reply["results"]:
+            if not isinstance(row, dict):
+                continue
             index = row["index"]
             if type(index) is int and 0 <= index < len(data["candidates"]):
                 reply["scores"].append({"item_id": data["candidates"][index]["id"], "score": row["relevance_score"]})

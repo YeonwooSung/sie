@@ -139,6 +139,21 @@ amount of cleanup time after that deadline. Discovery and client setup are
 outside measured operations. Stage timing includes request building/windowing,
 transport, SDK processing, caller composition/masking and journal work inside
 that boundary. Constituent call timers exclude their own intent/result appends.
+Each physical `response.headers_elapsed_s` stops at the response headers,
+before consuming the body, and includes the dispatch observer's journal append.
+It differs from `call_result.elapsed_s`, which includes body consumption and
+SDK processing, and from the complete-stage `operation_result.elapsed_s`.
+The scorer requires the frozen next window in each M model path and checks
+that the stage duration covers each path's sum of completed call durations,
+including failed calls. The two paths may interleave. The timing comparison
+allows only 1 microsecond absolute or 1e-9 relative floating-point tolerance.
+
+Discovery must finish before any operation; failed/unsupported or empty
+catalogs remain valid discovery outcomes. Missing response model IDs are
+allowed. An explicit SIE ID must equal the frozen requested ID. For Anthropic,
+the frozen `claude-haiku-4-5` alias may return that ID or a dated snapshot
+`claude-haiku-4-5-YYYYMMDD`; other explicit provider IDs must equal their frozen
+request ID. This identity check is independent of weights/execution revisions.
 
 Only selected model names, dimensions and safe revision digests are retained
 from metadata discovery. Catalog `weights_revision` and response

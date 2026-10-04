@@ -300,6 +300,20 @@ def validate_reply(stage: str, arm: str, reply: dict[str, Any], data: dict[str, 
         isinstance(reply, dict) and not reply.get("item_error") and not reply.get("malformed_reply"),
         "Per-item or malformed reply",
     )
+    returned_model = reply.get("returned_model")
+    if returned_model is not None:
+        # The Haiku alias can resolve to a dated snapshot; SIE IDs and the other
+        # frozen provider IDs have no alias-to-snapshot substitution in this trial.
+        require(
+            returned_model == call["model"]
+            or (
+                arm == "rival"
+                and call.get("provider") == "anthropic"
+                and isinstance(returned_model, str)
+                and re.fullmatch(re.escape(call["model"]) + r"-[0-9]{8}", returned_model) is not None
+            ),
+            "Response model differs from the frozen request",
+        )
     if stage == "G":
         text = reply["text"]
         require(isinstance(text, str) and not reply.get("refusal"), "Malformed guard reply")
@@ -348,11 +362,18 @@ def validate_reply(stage: str, arm: str, reply: dict[str, Any], data: dict[str, 
     if arm == "rival":
         results = reply["results"]
         require(
-            len(results) == 20 and {r["index"] for r in results if type(r["index"]) is int} == set(range(20)),
+            isinstance(results, list)
+            and len(results) == 20
+            and all(isinstance(r, dict) and type(r.get("index")) is int for r in results)
+            and {r["index"] for r in results} == set(range(20)),
             "Invalid provider rerank indices",
         )
     require(
-        len(scores) == 20 and len({s["item_id"] for s in scores}) == 20 and {s["item_id"] for s in scores} == set(ids),
+        isinstance(scores, list)
+        and len(scores) == 20
+        and all(isinstance(s, dict) and isinstance(s.get("item_id"), str) for s in scores)
+        and len({s["item_id"] for s in scores}) == 20
+        and {s["item_id"] for s in scores} == set(ids),
         "Rerank candidate set differs",
     )
     require(

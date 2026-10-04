@@ -85,7 +85,7 @@ def journal_rows(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_bytes().splitlines() if line.endswith(b"}")]
 
 
-def rechain(path: Path, rows: list[dict[str, Any]]) -> None:
+def rechain(path: Path, rows: list[dict[str, Any]], *, total_elapsed_s: float | None = None) -> None:
     previous = None
     with path.open("wb") as output:
         for sequence, row in enumerate(rows):
@@ -98,6 +98,8 @@ def rechain(path: Path, rows: list[dict[str, Any]]) -> None:
     end_path = path.with_name(path.name + ".end.json")
     if end_path.exists():
         end = json.loads(end_path.read_bytes())
+        if total_elapsed_s is not None:
+            end["elapsed_s"] = total_elapsed_s
         end["journal_digest"] = protocol.sha256(path.read_bytes())
         end["end_digest"] = protocol.digest({k: v for k, v in end.items() if k != "end_digest"})
         end_path.write_bytes(protocol.canonical(end) + b"\n")
@@ -113,8 +115,11 @@ class FakeServer:
         retry: bool = False,
         malformed: bool = False,
         catalog: bool = True,
+        catalog_status: int = 200,
         revision_headers: bool = True,
         loading_sleep: bool = False,
+        response_model: str | None = "requested",
+        malformed_ranking: bool = False,
     ) -> None:
         self.journal = journal
         self.delay = delay
@@ -122,8 +127,11 @@ class FakeServer:
         self.retry = retry
         self.malformed = malformed
         self.catalog = catalog
+        self.catalog_status = catalog_status
         self.revision_headers = revision_headers
         self.loading_sleep = loading_sleep
+        self.response_model = response_model
+        self.malformed_ranking = malformed_ranking
         self.lock = threading.Lock()
         self.captures: list[dict[str, Any]] = []
         self.errors: list[str] = []
@@ -142,6 +150,11 @@ class FakeServer:
             def reply(
                 self, payload: Any, status: int = 200, *, native: bool = False, headers: dict[str, str] | None = None
             ) -> None:
+                if isinstance(payload, dict) and "model" in payload and fixture.response_model != "requested":
+                    if fixture.response_model is None:
+                        payload.pop("model")
+                    else:
+                        payload["model"] = fixture.response_model
                 body = msgpack.packb(payload, use_bin_type=True) if native else json.dumps(payload).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/msgpack" if native else "application/json")
@@ -158,7 +171,7 @@ class FakeServer:
                     for group in protocol.MODELS.values()
                     for model in group
                 ]
-                self.reply({"models": models} if fixture.catalog else {"models": []})
+                self.reply({"models": models} if fixture.catalog else {"models": []}, fixture.catalog_status)
 
             def do_POST(self) -> None:
                 body = self.rfile.read(int(self.headers["Content-Length"]))
@@ -293,6 +306,7 @@ class FakeServer:
                                 "results": [
                                     {"index": index, "relevance_score": index / 20} for index in reversed(range(20))
                                 ]
+                                + ([None] if fixture.malformed_ranking else [])
                             }
                         )
                     else:
@@ -531,6 +545,11 @@ def test_real_sdk_and_provider_adapters_durable_paired_flow(tmp_path: Path) -> N
     model_replies = [r for r in rows if r["event"] == "call_result" and r["stage"] == "M" and r["arm"] == "sie"]
     assert all(r["execution_revision"] == ("a" * 64 if "gliner" in r["model"] else "b" * 64) for r in model_replies)
     assert sum(r["sdk_retry_count"] for r in model_replies) == 1
+    retried = next(r for r in model_replies if r["sdk_retry_count"] == 1)
+    assert [r["status"] for r in rows if r["event"] == "response" and r["call_id"] == retried["call_id"]] == [
+        503,
+        200,
+    ]
     assert report["stages"]["M"]["accounting"]["sie"]["physical_dispatches"] == 5
     assert all(c["auth"] == "Bearer fake-auth-sentinel" for c in captures if c["path"] != "/v1/messages")
     assert all(c["api_key"] == "fake-auth-sentinel" for c in captures if c["path"] == "/v1/messages")
@@ -579,17 +598,23 @@ def test_long_m_partial_success_and_no_outer_retry(tmp_path: Path) -> None:
     assert arm["semantic_calls"]["unattempted"] == 1 and arm["semantic_calls"]["successful"] == 4
 
 
-@pytest.mark.parametrize("with_auth", [False, True])
-def test_optional_auth_absent_catalog_and_sie_only(tmp_path: Path, with_auth: bool) -> None:
+@pytest.mark.parametrize("with_auth,catalog_status", [(False, 200), (True, 200), (False, 404), (False, 501)])
+def test_optional_auth_absent_catalog_and_sie_only(tmp_path: Path, with_auth: bool, catalog_status: int) -> None:
     path, _ = packet_file(tmp_path, stages=["E"], n=1, arms="sie")
     journal = tmp_path / "local.jsonl"
     keys = {"sie": "fake-auth-sentinel"} if with_auth else {}
-    with FakeServer(journal, catalog=False, revision_headers=False) as server:
+    with FakeServer(
+        journal, catalog=False, catalog_status=catalog_status, revision_headers=False, response_model=None
+    ) as server:
         assert run.run_trial(path, journal, server.url, keys, execute=True) == "finished"
         assert server.captures[0]["auth"] == ("Bearer fake-auth-sentinel" if with_auth else None)
         assert len(server.captures) == 1
     report = score.score_trial(path, journal)
-    assert report["complete"] and report["discovery"]["models"] == []
+    assert report["complete"] and report["discovery_attempted"] and not report["discovery_unresolved"]
+    if catalog_status == 200:
+        assert report["discovery"]["status"] == "success" and report["discovery"]["models"] == []
+    else:
+        assert report["discovery"]["status"] == "failed" and report["discovery"]["error"]
     assert report["stages"]["E"]["accounting"]["sie"]["successful"] == 1
     assert next(r for r in journal_rows(journal) if r["event"] == "call_result")["execution_revision"] is None
     assert report["stages"]["E"]["paired_latency"]["status"] == "sie_only"
@@ -773,7 +798,20 @@ def test_opt_in_missing_paired_keys_and_transport_sanitizing(
     assert report["stages"]["E"]["accounting"]["sie"]["failed"] == 1
 
 
-@pytest.mark.parametrize("change", ["missing", "duplicate", "unexpected", "protocol", "derived_mask"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing",
+        "duplicate",
+        "unexpected",
+        "protocol",
+        "derived_mask",
+        "all_503",
+        "missing_discovery",
+        "unresolved_discovery",
+        "late_discovery",
+    ],
+)
 def test_strict_journal_rejects_unexpected_or_nonqualifies_missing(tmp_path: Path, change: str) -> None:
     path, _ = packet_file(tmp_path, stages=["M"], n=1, arms="sie")
     journal = tmp_path / "journal.jsonl"
@@ -789,8 +827,21 @@ def test_strict_journal_rejects_unexpected_or_nonqualifies_missing(tmp_path: Pat
         rows[index]["observation_id"] = "unexpected"
     elif change == "protocol":
         rows[index]["protocol_digest"] = "0" * 64
-    else:
+    elif change == "derived_mask":
         rows[index]["result"]["masked"] = "wrong mask"
+    elif change == "all_503":
+        for row in rows:
+            if row["event"] == "response" and row["call_id"] != "metadata":
+                row["status"] = 503
+    elif change == "missing_discovery":
+        rows = [row for row in rows if row.get("call_id") != "metadata"]
+    elif change == "unresolved_discovery":
+        rows = [row for row in rows if row["event"] != "discovery_result"]
+    else:
+        discovery = next(row for row in rows if row["event"] == "discovery_result")
+        rows.remove(discovery)
+        first_operation = next(i for i, row in enumerate(rows) if row["event"] == "operation_intent")
+        rows.insert(first_operation + 1, discovery)
     rechain(journal, rows)
     if change == "missing":
         result = score.score_trial(path, journal)
@@ -798,6 +849,204 @@ def test_strict_journal_rejects_unexpected_or_nonqualifies_missing(tmp_path: Pat
     else:
         with pytest.raises(ValueError):
             score.score_trial(path, journal)
+
+
+def test_interrupted_discovery_remains_unresolved(tmp_path: Path) -> None:
+    path, _ = packet_file(tmp_path, stages=["E"], n=1, arms="sie")
+    journal = tmp_path / "discovery.jsonl"
+    with FakeServer(journal) as server:
+        run.run_trial(path, journal, server.url, {}, execute=True)
+    rows = journal_rows(journal)
+    terminal = next(i for i, row in enumerate(rows) if row["event"] == "discovery_result")
+    rechain(journal, rows[:terminal])
+    end_path = journal.with_name(journal.name + ".end.json")
+    end = json.loads(end_path.read_bytes()) | {"reason": "deadline"}
+    end["end_digest"] = protocol.digest({k: v for k, v in end.items() if k != "end_digest"})
+    end_path.write_bytes(protocol.canonical(end) + b"\n")
+    report = score.score_trial(path, journal)
+    assert not report["complete"] and not report["qualifying_confirmatory"]
+    assert report["discovery"] is None and report["discovery_attempted"] and report["discovery_unresolved"]
+    assert report["stages"]["E"]["accounting"]["sie"]["unattempted"] == 1
+
+
+@pytest.fixture
+def long_m_history(tmp_path: Path) -> tuple[Path, Path, list[dict[str, Any]], list[list[dict[str, Any]]]]:
+    path, packet = packet_file(tmp_path, long=True, stages=["M"], n=1, arms="sie")
+    journal = tmp_path / "long.jsonl"
+    with FakeServer(journal, delay=0.005) as server:
+        assert run.run_trial(path, journal, server.url, {}, execute=True) == "finished"
+        assert 1 <= server.maximum <= 2 and not server.errors
+    rows = journal_rows(journal)
+    obs = packet["observations"][0]
+    blocks = [
+        [row for row in rows if row.get("call_id") == protocol.call_id(obs["observation_id"], "sie", index)]
+        for index in range(len(obs["requests"]["sie"]))
+    ]
+    assert len(blocks) == 6 and all(
+        [row["event"] for row in block] == ["call_intent", "dispatch", "response", "call_result"] for block in blocks
+    )
+    assert score.score_trial(path, journal)["qualifying_confirmatory"]
+    return path, journal, rows, blocks
+
+
+def replace_m_calls(rows: list[dict[str, Any]], calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    begin = next(i for i, row in enumerate(rows) if row["event"] == "operation_intent")
+    end = next(i for i, row in enumerate(rows) if row["event"] == "operation_result")
+    return rows[: begin + 1] + calls + rows[end:]
+
+
+@pytest.mark.parametrize("change", ["reversed", "skipped", "after_failure", "serial_total", "failed_total"])
+def test_strict_model_path_order_and_serial_duration(
+    long_m_history: tuple[Path, Path, list[dict[str, Any]], list[list[dict[str, Any]]]], change: str
+) -> None:
+    path, journal, rows, blocks = long_m_history
+    operation = next(row for row in rows if row["event"] == "operation_result")
+    if change == "reversed":
+        ordered = [blocks[index] for index in (2, 1, 0, 5, 4, 3)]
+    elif change == "skipped":
+        ordered = blocks[1:]
+    elif change == "after_failure":
+        blocks[0][-1].update(status="failed", error={"code": "CALL_FAILED"})
+        operation.update(status="failed", result=None, error={"code": "CALL_FAILED"})
+        ordered = blocks
+    else:
+        for block in blocks:
+            block[-1]["elapsed_s"] = 1.0
+        operation["elapsed_s"] = 1.0
+        ordered = blocks
+        if change == "failed_total":
+            # The failed second call contributes one second to its stopped path;
+            # the other path finishes three much shorter serial windows.
+            blocks[1][-1].update(status="failed", error={"code": "CALL_FAILED"})
+            for block in blocks[3:]:
+                block[-1]["elapsed_s"] = 0.1
+            ordered = blocks[:2] + blocks[3:]
+            operation.update(status="failed", result=None, error={"code": "CALL_FAILED"}, elapsed_s=1.5)
+    rows = replace_m_calls(rows, [row for block in ordered for row in block])
+    rechain(journal, rows, total_elapsed_s=5.0)
+    with pytest.raises(ValueError, match="model path|serial call time"):
+        score.score_trial(path, journal)
+    if change == "failed_total":
+        operation["elapsed_s"] = 2.0
+        rechain(journal, rows)
+        report = score.score_trial(path, journal)
+        counts = report["stages"]["M"]["accounting"]["sie"]
+        assert not report["complete"] and counts["failed"] == 1
+        assert counts["all_terminal_attempt_elapsed"]["p50_s"] == 2.0
+        assert counts["semantic_calls"]["failed"] == counts["semantic_calls"]["unattempted"] == 1
+
+
+def test_interleaved_model_paths_cover_serial_sums_with_float_tolerance(
+    long_m_history: tuple[Path, Path, list[dict[str, Any]], list[list[dict[str, Any]]]],
+) -> None:
+    path, journal, rows, blocks = long_m_history
+    for block in blocks:
+        block[-1]["elapsed_s"] = 1.0
+    operation = next(row for row in rows if row["event"] == "operation_result")
+    operation["elapsed_s"] = 3.0 - 0.0000005
+    interleaved = [
+        row
+        for left, right in zip(blocks[:3], blocks[3:], strict=True)
+        for row in left[:2] + right[:2] + right[2:] + left[2:]
+    ]
+    rechain(journal, replace_m_calls(rows, interleaved), total_elapsed_s=5.0)
+    report = score.score_trial(path, journal)
+    assert report["complete"] and report["qualifying_confirmatory"]
+    assert report["stages"]["M"]["accounting"]["sie"]["semantic_calls"]["successful"] == 6
+
+
+@pytest.mark.parametrize("stage", ["G", "E"])
+def test_wrong_sie_model_is_failed_live_and_rejected_if_recast_success(tmp_path: Path, stage: str) -> None:
+    path, _ = packet_file(tmp_path, stages=[stage], n=1, arms="sie")
+    journal = tmp_path / "wrong-model.jsonl"
+    with FakeServer(journal, response_model="unrelated/model") as server:
+        assert run.run_trial(path, journal, server.url, {}, execute=True) == "finished"
+    report = score.score_trial(path, journal)
+    assert report["stages"][stage]["accounting"]["sie"]["failed"] == 1
+    rows = journal_rows(journal)
+    terminal = next(row for row in rows if row["event"] == "call_result")
+    assert terminal["status"] == "failed" and terminal["reply"]["returned_model"] == "unrelated/model"
+    assert terminal["error"]["class"] == "ValueError"
+    terminal["status"] = "success"
+    terminal.pop("error")
+    rechain(journal, rows)
+    with pytest.raises(ValueError, match="Response model differs"):
+        score.score_trial(path, journal)
+
+
+@pytest.mark.parametrize("stage", protocol.STAGES)
+@pytest.mark.parametrize("returned", [None, "requested", "unrelated/model"])
+def test_sie_reply_model_binding(stage: str, returned: str | None) -> None:
+    data = population(1)[stage][0]["data"]
+    call = protocol.requests(stage, data, "sie", "in-force" if stage == "R" else None)[0]
+    reply = {
+        "returned_model": call["model"] if returned == "requested" else returned,
+        "text": "Safety: Safe",
+        "entities": [],
+        "dense": [0.0] * 2560,
+        "scores": [{"item_id": c["id"], "score": 0.5} for c in data.get("candidates", [])],
+    }
+    if returned == "unrelated/model":
+        with pytest.raises(ValueError, match="Response model differs"):
+            protocol.validate_reply(stage, "sie", reply, data, call)
+    else:
+        protocol.validate_reply(stage, "sie", reply, data, call)
+
+
+@pytest.mark.parametrize("stage", ["G", "M"])
+def test_haiku_alias_accepts_dated_snapshot_identity(stage: str) -> None:
+    data = population(1)[stage][0]["data"]
+    call = protocol.requests(stage, data, "rival")[0]
+    reply = {
+        "returned_model": "claude-haiku-4-5-20260102",
+        "text": "unharmful" if stage == "G" else '{"entities":[]}',
+    }
+    protocol.validate_reply(stage, "rival", reply, data, call)
+    reply["returned_model"] = "claude-unrelated-20260102"
+    with pytest.raises(ValueError, match="Response model differs"):
+        protocol.validate_reply(stage, "rival", reply, data, call)
+
+
+@pytest.mark.parametrize("member,extra", [(None, True), (None, False), (42, True), ("bad", False)])
+def test_malformed_cohere_members_survive_projection_as_failure(member: Any, extra: bool) -> None:
+    data = population(1)["R"][0]["data"]
+    rankings = [{"index": i, "relevance_score": i / 20} for i in range(20)]
+    if extra:
+        rankings.append(member)
+    else:
+        rankings[5] = member
+    reply = run.project_reply("R", "rival", {"results": rankings}, data)
+    assert reply["malformed_reply"] and reply["results"][-1 if extra else 5] is None
+    assert len(reply["results"]) == len(rankings)
+    call = protocol.requests("R", data, "rival", "in-force")[0]
+    with pytest.raises(ValueError, match="malformed reply"):
+        protocol.validate_reply("R", "rival", reply, data, call)
+    reply.pop("malformed_reply")
+    with pytest.raises(ValueError, match="rerank indices"):
+        protocol.validate_reply("R", "rival", reply, data, call)
+
+
+def test_malformed_cohere_reply_is_durable_failed_call(tmp_path: Path) -> None:
+    path, _ = packet_file(tmp_path, stages=["R"], n=1)
+    journal = tmp_path / "rankings.jsonl"
+    with FakeServer(journal, malformed_ranking=True) as server:
+        assert (
+            run.run_trial(
+                path,
+                journal,
+                server.url,
+                {"cohere": "fake-auth-sentinel"},
+                execute=True,
+                provider_urls={"cohere": server.url},
+            )
+            == "finished"
+        )
+    report = score.score_trial(path, journal)
+    assert not report["qualifying_confirmatory"]
+    assert report["stages"]["R"]["accounting"]["rival"]["failed"] == 2
+    replies = [row for row in journal_rows(journal) if row["event"] == "call_result" and row["arm"] == "rival"]
+    assert all(row["status"] == "failed" and row["reply"]["malformed_reply"] for row in replies)
+    assert all(len(row["reply"]["results"]) == 21 and row["reply"]["results"][-1] is None for row in replies)
 
 
 def test_paired_cluster_bootstrap_known_statistics() -> None:

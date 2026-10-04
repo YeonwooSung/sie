@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import statistics
 from collections import defaultdict
@@ -165,12 +166,14 @@ def score_trial(packet_path: Path, journal_path: Path) -> dict[str, Any]:
         "Run request budgets differ",
     )
     operations, calls = {}, {}
+    model_paths: dict[tuple[str, str, str], list[str]] = defaultdict(list)
     for obs in packet["observations"]:
         for arm in obs["arm_order"]:
             operations[(obs["observation_id"], arm)] = (obs, operation_identity(obs, arm))
             for index in range(len(obs["requests"][arm])):
                 identity = subcall_identity(obs, arm, index)
                 calls[identity["call_id"]] = (obs, identity)
+                model_paths[(obs["observation_id"], arm, identity["model"])].append(identity["call_id"])
     op_intents, op_results, call_intents, call_results = {}, {}, {}, {}
     dispatches: dict[str, list[dict[str, Any]]] = defaultdict(list)
     responses: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -179,6 +182,8 @@ def score_trial(packet_path: Path, journal_path: Path) -> dict[str, Any]:
     expected_op_order = list(operations)
     next_operation = 0
     active_calls = set()
+    next_in_path: dict[tuple[str, str, str], int] = defaultdict(int)
+    failed_paths = set()
     for row in rows[1:]:
         event = row["event"]
         if event in ("discovery_intent", "discovery_result"):
@@ -200,6 +205,7 @@ def score_trial(packet_path: Path, journal_path: Path) -> dict[str, Any]:
                 "Unexpected operation identity/request",
             )
             if event == "operation_intent":
+                require(discovery_result is not None, "Operation before completed discovery")
                 require(
                     key not in op_intents
                     and active_operation is None
@@ -259,13 +265,20 @@ def score_trial(packet_path: Path, journal_path: Path) -> dict[str, Any]:
                         )
                     else:
                         require(row["result"] == validated[0], "Operation result differs from its constituent reply")
+                completed = [call_results[cid] for cid in expected_calls if cid in call_results]
+                if row["stage"] == "M" and row["arm"] == "sie":
+                    lower_bound = max(
+                        math.fsum(call["elapsed_s"] for call in completed if call["model"] == model)
+                        for model in MODELS["M"]
+                    )
+                else:
+                    lower_bound = max((call["elapsed_s"] for call in completed), default=0)
+                # One microsecond or 1e-9 relative covers floating timer subtraction/summation,
+                # not omitted serial work. Failed completed calls remain inside the bound.
                 require(
-                    all(
-                        row["elapsed_s"] >= call_results[cid]["elapsed_s"]
-                        for cid in expected_calls
-                        if cid in call_results
-                    ),
-                    "Operation timer excludes a subcall",
+                    row["elapsed_s"] >= lower_bound
+                    or math.isclose(row["elapsed_s"], lower_bound, rel_tol=1e-9, abs_tol=1e-6),
+                    "Operation timer excludes completed serial call time",
                 )
                 op_results[key] = row
                 active_operation = None
@@ -286,9 +299,17 @@ def score_trial(packet_path: Path, journal_path: Path) -> dict[str, Any]:
                 require(active_operation == op_key, "Subcall outside its operation")
             if event == "call_intent":
                 require(cid not in call_intents, "Duplicate call intent")
+                obs, identity = calls[cid]
+                if obs["stage"] == "M" and row["arm"] == "sie":
+                    path = (row["observation_id"], row["arm"], identity["model"])
+                    require(path not in failed_paths, "Continuation after model path failure")
+                    require(
+                        next_in_path[path] < len(model_paths[path]) and cid == model_paths[path][next_in_path[path]],
+                        "Skipped or reordered model path window",
+                    )
+                    next_in_path[path] += 1
                 call_intents[cid] = row
                 active_calls.add(cid)
-                obs, identity = calls[cid]
                 limit = 2 if obs["stage"] == "M" and row["arm"] == "sie" else 1
                 require(len(active_calls) <= limit, "Exceeded dispatch concurrency")
                 require(
@@ -319,11 +340,15 @@ def score_trial(packet_path: Path, journal_path: Path) -> dict[str, Any]:
                         obs["requests"][row["arm"]][identity["request_index"]],
                     )
                     require(
-                        len(responses[cid]) == len(dispatches[cid]) and bool(dispatches[cid]),
+                        len(responses[cid]) == len(dispatches[cid])
+                        and bool(dispatches[cid])
+                        and 200 <= responses[cid][-1]["status"] < 300,
                         "Successful call lacks completed HTTP evidence",
                     )
                 else:
                     require(isinstance(row.get("error"), dict), "Missing subcall failure evidence")
+                    if row["stage"] == "M" and row["arm"] == "sie":
+                        failed_paths.add((row["observation_id"], row["arm"], row["model"]))
                 call_results[cid] = row
                 active_calls.remove(cid)
             elif event == "dispatch":
@@ -338,7 +363,7 @@ def score_trial(packet_path: Path, journal_path: Path) -> dict[str, Any]:
                     "Unexpected physical response",
                 )
                 require(
-                    type(row["status"]) is int and 100 <= row["status"] <= 599 and positive(row["elapsed_s"]),
+                    type(row["status"]) is int and 100 <= row["status"] <= 599 and positive(row["headers_elapsed_s"]),
                     "Invalid HTTP result",
                 )
                 responses[cid].append(row)
@@ -348,6 +373,7 @@ def score_trial(packet_path: Path, journal_path: Path) -> dict[str, Any]:
         end is not None
         and end["reason"] == "finished"
         and truncated is None
+        and discovery_result is not None
         and len(op_results) == len(operations)
         and len(call_results) == len(calls)
     )
@@ -360,6 +386,8 @@ def score_trial(packet_path: Path, journal_path: Path) -> dict[str, Any]:
         "ending": end,
         "truncated_tail_sha256": truncated,
         "discovery": discovery_result,
+        "discovery_attempted": discovery_intent is not None,
+        "discovery_unresolved": discovery_intent is not None and discovery_result is None,
         "statistics_scope": "client wall time; successful complete base-case pairs, independent stages",
         "phases": {},
         "stages": {},
