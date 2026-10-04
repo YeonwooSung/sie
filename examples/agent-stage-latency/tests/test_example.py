@@ -14,6 +14,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import Future
+from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -311,8 +312,8 @@ class FakeServer:
                         }
                     )
                     rows = journal_rows(fixture.journal)
-                    if not any(r["event"] == "operation_intent" for r in rows):
-                        fixture.errors.append("Server observed dispatch before a durable operation intent")
+                    if not rows or rows[-1]["event"] != "operation_intent":
+                        fixture.errors.append("Server observed dispatch without the current durable operation intent")
                 fixture.observed.set()
                 try:
                     if fixture.delay:
@@ -1494,23 +1495,113 @@ def test_m_buffer_preserves_interleaving_without_serializing_paths(
     assert counts["semantic_calls"]["successful"] == 6
 
 
-def test_buffer_snapshots_nested_values_and_redacts_before_persistence(tmp_path: Path) -> None:
+def test_buffer_owns_sanitized_reply_and_snapshots_metadata(tmp_path: Path) -> None:
     _, packet = packet_file(tmp_path, stages=["E"], n=1, arms="sie")
     path = tmp_path / "snapshot.jsonl"
     journal = run.Journal(path, packet, ["fake-auth-sentinel"], create=True)
     events = run.OperationEvents()
-    reply = {"text": "fake-auth-sentinel", "usage": {"input_tokens": 3}, "dense": [0.5]}
-    identity = {"arm_order": ["sie", "rival"]}
+    reply = run.sanitize(
+        {"text": "fake-auth-sentinel", "usage": {"input_tokens": 3}, "dense": [0.5]}, ["fake-auth-sentinel"]
+    )
+    identity = {"arm_order": ["sie", "rival"], "error": {"code": "CALL_FAILED"}}
     events.append("call_result", reply=reply, **identity, sdk_retry_count=1, execution_revision="a" * 64)
-    reply["usage"]["input_tokens"] = 99
-    reply["dense"][0] = 99.0
+    assert events.events[0][1]["reply"] is reply
+    assert events.events[0][1]["reply"]["dense"] is reply["dense"]
     identity["arm_order"].reverse()
+    identity["error"]["code"] = "changed-metadata"
     events.flush(journal)
     journal.close()
     row = journal_rows(path)[0]
     assert row["reply"] == {"text": "[REDACTED_CREDENTIAL]", "usage": {"input_tokens": 3}, "dense": [0.5]}
     assert row["arm_order"] == ["sie", "rival"] and row["sdk_retry_count"] == 1
+    assert row["error"] == {"code": "CALL_FAILED"} and row["execution_revision"] == "a" * 64
     assert "fake-auth-sentinel" not in path.read_text()
+
+
+@pytest.mark.parametrize("arm", ["sie", "rival"])
+def test_retained_owned_vector_is_independent_from_mutable_raw_reply(tmp_path: Path, arm: str) -> None:
+    _, packet = packet_file(tmp_path, stages=["E"], n=1)
+    path = tmp_path / "owned-vector.jsonl"
+    data = packet["observations"][0]["unit"]["data"]
+    call = packet["observations"][0]["requests"][arm][0]
+    vector = [0.125] * (2560 if arm == "sie" else 3072)
+    raw = {"model": call["model"], "usage": {"input_tokens": 3}}
+    raw.update({"dense": vector} if arm == "sie" else {"data": [{"index": 0, "embedding": vector}]})
+    reply = run.sanitize(run.project_reply("E", arm, raw, data), [])
+    assert reply["dense"] is not vector
+    assert protocol.validate_reply("E", arm, reply, data, call)["dimensions"] == len(vector)
+    events = run.OperationEvents()
+    events.append("call_result", reply=reply)
+    assert events.events[0][1]["reply"] is reply and events.events[0][1]["reply"]["dense"] is reply["dense"]
+    vector[0] = 99.0
+    raw["usage"]["input_tokens"] = 99
+    raw["model"] = "changed-raw-model"
+    journal = run.Journal(path, packet, [], create=True)
+    events.flush(journal)
+    journal.close()
+    recorded = journal_rows(path)[0]["reply"]
+    assert recorded["dense"] == [0.125] * len(vector)
+    assert recorded["usage"] == {"input_tokens": 3} and recorded["returned_model"] == call["model"]
+
+
+@pytest.mark.parametrize("error_type", [MemoryError, ValueError])
+def test_deepcopy_failure_in_second_m_path_prevents_replay_and_seal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]
+) -> None:
+    packet_path, packet = packet_file(tmp_path, stages=["M"], n=1, arms="sie")
+    path = tmp_path / "copy-failure.jsonl"
+    journal = diagnostic_journal(path, packet)
+    executor = synthetic_executor(packet, journal)
+    original_copy = run.copy.deepcopy
+
+    def ordinary_failure(*args: Any, **kwargs: Any) -> Any:
+        raise run.CallFailure("CALL_FAILED")
+
+    def copy(value: Any, memo: dict[int, Any] | None = None) -> Any:
+        if isinstance(value, dict) and value.get("model") == protocol.MODELS["M"][1]:
+            raise error_type
+        return original_copy(value, memo)
+
+    monkeypatch.setattr(executor.clients[protocol.MODELS["M"][0]], "extract", ordinary_failure)
+    monkeypatch.setattr(run.copy, "deepcopy", copy)
+    with pytest.raises(run.EvidenceCaptureError):
+        executor.operation(packet["observations"][0], "sie")
+    journal.close()
+    assert [row["event"] for row in journal_rows(path)] == [
+        "run_start",
+        "discovery_intent",
+        "discovery_result",
+        "operation_intent",
+    ]
+    diagnostic_end(path, packet, "child_failure")
+    report = score.score_trial(packet_path, path)
+    counts = report["stages"]["M"]["accounting"]["sie"]
+    assert not report["complete"] and counts["unresolved"] == 1
+    assert counts["semantic_calls"]["attempt_status_unknown"] == 2
+    assert not counts["physical_dispatches_exact"] and not counts["sdk_retries_exact"]
+
+
+def test_fake_server_rejects_post_after_last_operation_seal(tmp_path: Path) -> None:
+    packet_path, packet = packet_file(tmp_path, stages=["G"], n=2, arms="sie")
+    path = tmp_path / "last-intent.jsonl"
+    with FakeServer(path) as server:
+        assert run.run_trial(packet_path, path, server.url, {}, execute=True) == "finished"
+        assert not server.errors and journal_rows(path)[-1]["event"] == "operation_result"
+        call = packet["observations"][0]["requests"]["sie"][0]
+        connection = HTTPConnection("127.0.0.1", server.server.server_port, timeout=2)
+        try:
+            connection.request(
+                "POST",
+                "/v1/chat/completions",
+                body=protocol.canonical({"model": call["model"], **call["body"]}),
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            assert response.status == 200
+            response.read()
+        finally:
+            connection.close()
+        assert server.errors == ["Server observed dispatch without the current durable operation intent"]
 
 
 @pytest.mark.parametrize(

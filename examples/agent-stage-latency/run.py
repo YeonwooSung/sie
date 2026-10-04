@@ -211,7 +211,7 @@ class EvidenceCaptureError(Exception):
 
 
 class OperationEvents:
-    """Snapshot one operation's safe events without persistence in its timers."""
+    """Snapshot mutable event metadata; call_result transfers its owned sanitized reply."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -221,7 +221,9 @@ class OperationEvents:
     def append(self, event: str, **fields: Any) -> None:
         try:
             require(event in ("call_intent", "dispatch", "response", "call_result"), "Unexpected buffered event")
-            captured = copy.deepcopy(fields)
+            reply = fields.get("reply")
+            memo = {id(reply): reply} if event == "call_result" else None
+            captured = copy.deepcopy(fields, memo)
             with self.lock:
                 self.events.append((event, captured))
         except Exception:
