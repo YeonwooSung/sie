@@ -51,7 +51,8 @@ operator-owned equivalence admission described below. SIE hybrid encode and
 score require the fresh identity admission described below. Cluster remote
 profiles use the queue. Cluster generation and extraction fallback are described
 below. Cluster saturation and unhealthy-worker spill require explicit triggers.
-Numeric fleet bridges remain separately gated. Experimental `threshold` routing
+Cluster `encode` and `score` bridges need a numerical admission (see
+[Cluster numerical bridges](#cluster-numerical-bridges)). Experimental `threshold` routing
 is cluster-only and opt-in, as described below. A single node refuses a
 `threshold` routing block at configuration load; use `fallback` there.
 
@@ -505,10 +506,64 @@ caller then receives its local refusal with
 after a change: a batch that has already passed it completes its upstream calls,
 and an SIE upstream's identity comes from a cache trusted for up to 30 seconds.
 
-These observations and the evidence file grant no gateway routing authority.
-An `observed` child can still lack a local identity. Numerical gateway routing
-remains inactive until operator-owned evidence, complete live membership and
-execution fencing are connected.
+An observation alone grants no routing authority, and an `observed` child can
+still lack a local identity. The gateway combines these observations into the
+admission decision described next.
+
+## Cluster numerical bridges
+
+In a cluster, a bare `encode` or `score` request for a model with a `fallback`
+or `threshold` policy runs on the remote profile only under a current numerical
+admission. `/v1/embeddings` follows the same rule, because it wraps `encode`.
+The gateway validates such a request before it counts threshold demand,
+publishes load-only work or makes a decision, so an invalid request gets its
+`400` and nothing else. It decides when it is about to commit to the remote
+attempt:
+
+- The request must set no runtime option other than `is_query`, and every
+  output it asks for must be listed in the admission. Any other option, such as
+  `output_dtype`, keeps the request local, because the remote process would
+  refuse it.
+- A remote-lane worker qualifies when it is fresh, eligible and positively
+  supports both execution authority and the numerical admission method,
+  consumes the admission subject, carries the remote profile's exact
+  configuration hash, and every adapter child reports
+  the same admission for the model with the model contract it reports itself.
+  That admission must expire at least five seconds later.
+- Its admission must cover every local process that could serve the model.
+  Each child of every worker on the model's local bundles and in the model's
+  pool (`default` when it names none), starting and degraded workers included,
+  must report an admitted identity and the admission's model contract.
+  A worker without a complete inventory, a worker past the heartbeat timeout
+  that has not been evicted, or a child without an identity or without the
+  model keeps the request local. So does every request until the gateway has
+  heard worker health for one heartbeat timeout after its health subscription
+  starts or resumes, or after a longer silence. With no local worker the remote
+  admission decides alone.
+- The request is pinned to one admitted remote worker that still reports the
+  capability and the same admission digest. Its items carry that digest on a
+  subject that only a worker with the numerical admission check consumes, and
+  the worker checks the admission again before calling the upstream.
+
+A request that names a profile, including one in its body options, stays on its
+selected route. Generation and extraction requests of a model with numerical
+outputs never bridge in a cluster. If the remote worker refuses an admitted
+attempt, for example because the admission changed after the gateway checked
+it, a fallback route answers with its local refusal, and a threshold route
+answers `503 INFERENCE_ERROR` with the worker's `Retry-After`. Each request's
+decision is counted once on `sie.gateway.remote.numerical_admissions`.
+
+Upgrade workers and gateways before applying a hybrid `encode` or `score`
+configuration. A remote lane rolled back below the numerical admission subject
+stops numerical bridging: its older sidecar never consumes admitted work, so
+queued attempts time out instead of running unchecked, and a fenced sidecar
+that later consumes them drops those past their deadline. Configuring a numerical
+bridge also changes local behavior while no admission holds: a trigger that
+would bridge a request commits to its local refusal, so a cold model answers
+`MODEL_LOADING` instead of waiting for its load, and an opted-in `saturated` or
+`unhealthy` trigger refuses instead of queueing. A request that could never
+bridge, because it sets a runtime option other than `is_query`, keeps its
+ordinary local path.
 
 
 ## Single-node generation fallback
@@ -602,7 +657,8 @@ local refusal and retry interval; streaming failures after the first output
 remain in the stream. Explicit selectors and `X-SIE-Remote: forbid` retain
 their existing authority.
 
-Numerical fleet equivalence remains inactive. Threshold routing requires its separate deployment opt-in.
+Numerical models bridge only as described in
+[Cluster numerical bridges](#cluster-numerical-bridges). Threshold routing requires its separate deployment opt-in.
 
 ### Observing cluster fallback
 
@@ -655,8 +711,11 @@ requests stay local. Sustained low demand returns requests to remote; existing
 worker idle eviction and autoscaling govern when the local lane sleeps.
 
 Explicit profiles, bundle/pool/machine/engine selectors and `X-SIE-Remote:
-forbid` retain caller authority. Managed deployment routes and numerical
-encode/score models remain outside this flag. Invalid requests do not add
+forbid` retain caller authority. Managed deployment routes remain outside this
+flag. A numerical `encode` or `score` model takes the remote route only under a
+current numerical admission (see
+[Cluster numerical bridges](#cluster-numerical-bridges)); otherwise its request
+stays local. Invalid requests do not add
 threshold demand. A remote-selected request still requires the current exact
 worker execution contract; it cannot select a legacy worker or retry into
 another backend after output has started. An unavailable remote lane returns
