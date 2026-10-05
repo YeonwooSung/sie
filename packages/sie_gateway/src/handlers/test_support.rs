@@ -23,6 +23,7 @@ use crate::state::demand_tracker::{DemandTracker, PhysicalLane, PhysicalLaneCata
 use crate::state::model_registry::ModelRegistry;
 use crate::state::pool_manager::PoolManager;
 use crate::state::worker_registry::WorkerRegistry;
+use crate::types::model::FallbackTrigger;
 use crate::types::WorkerStatusMessage;
 
 /// The local lane's `(pool, machine_profile, bundle)`.
@@ -162,8 +163,11 @@ pub(crate) struct RecordingDispatcher {
     stream_mid_error: AtomicBool,
     stream_terminal_failure: Mutex<Option<&'static str>>,
     remote_refusal: Mutex<Option<(&'static str, Option<u32>)>>,
+    bridged_refusal: Mutex<Option<(&'static str, u32)>>,
+    redelivered: Mutex<Vec<oneshot::Sender<Vec<WorkResult>>>>,
     dispatched: Mutex<Vec<Dispatched>>,
     execution_authority: Mutex<Vec<bool>>,
+    fallback_reasons: Mutex<Vec<Option<FallbackTrigger>>>,
 }
 
 impl RecordingDispatcher {
@@ -179,6 +183,19 @@ impl RecordingDispatcher {
 
     pub(crate) fn execution_authority(&self) -> Vec<bool> {
         self.execution_authority.lock().unwrap().clone()
+    }
+
+    /// The fallback reason each published work request carried, in order.
+    pub(crate) fn fallback_reasons(&self) -> Vec<Option<FallbackTrigger>> {
+        self.fallback_reasons.lock().unwrap().clone()
+    }
+
+    /// Answer remote-lane work the way a remote worker whose backend asks for
+    /// redelivery does: a remote attempt that carries a fallback reason gets a
+    /// retryable `code` result with the upstream's hint at once, while other
+    /// work is redelivered, so its result never arrives.
+    pub(crate) fn answer_only_bridged_remote_work(&self, code: &'static str, retry_after_s: u32) {
+        *self.bridged_refusal.lock().unwrap() = Some((code, retry_after_s));
     }
 
     /// Behave as a transport that cannot keep the execution-authority fence.
@@ -357,10 +374,29 @@ impl WorkDispatcher for RecordingDispatcher {
     > {
         self.record_authority(&target, params);
         self.record(Dispatched::new(endpoint, &target));
+        self.fallback_reasons
+            .lock()
+            .unwrap()
+            .push(params.fallback_reason);
         if self.work_refused.load(Ordering::SeqCst) {
             return Err(DispatchError::Other("private upstream failure".into()));
         }
         let request_id = "request-1".to_string();
+        let bridged_refusal = *self.bridged_refusal.lock().unwrap();
+        if let Some((code, retry_after_s)) =
+            bridged_refusal.filter(|_| target.bundle() == REMOTE_LANE.2)
+        {
+            let (tx, rx) = oneshot::channel();
+            if params.fallback_reason.is_some() {
+                let refused = (0..items.len().max(1) as u32)
+                    .map(|index| refused_result(&request_id, index, (code, Some(retry_after_s))))
+                    .collect();
+                tx.send(refused).unwrap();
+            } else {
+                self.redelivered.lock().unwrap().push(tx);
+            }
+            return Ok((request_id, rx, DispatchDurability::accepted()));
+        }
         let remote_refusal = *self.remote_refusal.lock().unwrap();
         let results = if let Some(refusal) =
             remote_refusal.filter(|_| target.bundle() == REMOTE_LANE.2)
@@ -422,6 +458,10 @@ impl WorkDispatcher for RecordingDispatcher {
         }
         self.record_authority(&target, params);
         self.record(Dispatched::new("generate", &target));
+        self.fallback_reasons
+            .lock()
+            .unwrap()
+            .push(params.fallback_reason);
         let (rx, _tap) = terminal_chunk_collector(display_model, bundle_config_hash);
         Ok((
             "request-1".to_string(),
@@ -450,6 +490,10 @@ impl WorkDispatcher for RecordingDispatcher {
     > {
         self.record_authority(&target, params);
         self.record(Dispatched::new("generate", &target));
+        self.fallback_reasons
+            .lock()
+            .unwrap()
+            .push(params.fallback_reason);
         if self.generate_refused.load(Ordering::SeqCst) {
             return Err("private upstream failure".into());
         }
