@@ -1873,6 +1873,175 @@ mod tests {
         assert_eq!(stamped(&unknown), (None, None));
     }
 
+    /// JetStream-gated: the gateway knows a remote-only model's upstream by name
+    /// only. It publishes the request without that name and opens no upstream
+    /// connection; a test consumer stands in for the remote worker.
+    #[tokio::test]
+    async fn the_gateway_publishes_a_remote_only_request_and_never_calls_its_upstream() {
+        use futures_util::StreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use crate::queue::dispatch::WorkResult;
+        use crate::queue::publisher::{WorkPublisher, WorkStreamConfig};
+
+        let Ok(url) = std::env::var("NATS_URL") else {
+            assert_ne!(
+                std::env::var("SIE_RUN_NATS_PUBLISHER_TEST").as_deref(),
+                Ok("1"),
+                "mandatory publisher tests require NATS_URL"
+            );
+            return;
+        };
+        let pool = format!("egress{}", uuid::Uuid::now_v7().simple());
+        let stream_name = format!("WORK_POOL_{pool}");
+        let client = async_nats::connect(url)
+            .await
+            .expect("test NATS connection");
+        let jetstream = async_nats::jetstream::new(client.clone());
+        let stream = jetstream
+            .create_stream(async_nats::jetstream::stream::Config {
+                name: stream_name.clone(),
+                subjects: vec![format!("sie.work.{pool}.*.*.*")],
+                retention: async_nats::jetstream::stream::RetentionPolicy::WorkQueue,
+                storage: async_nats::jetstream::stream::StorageType::Memory,
+                max_age: Duration::from_secs(300),
+                discard: async_nats::jetstream::stream::DiscardPolicy::New,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        stream
+            .create_consumer(async_nats::jetstream::consumer::pull::Config {
+                durable_name: Some("remote-1".into()),
+                filter_subject: format!("sie.work.{pool}.cpu.remote.*"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let upstream_task = tokio::spawn({
+            let connections = Arc::clone(&connections);
+            async move {
+                while let Ok((mut socket, _)) = upstream.accept().await {
+                    connections.fetch_add(1, Ordering::SeqCst);
+                    let _ = socket.read(&mut [0u8; 1024]).await;
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                }
+            }
+        });
+
+        let model = format!("{REMOTE_ENCODE_MODEL}pool: {pool}\n");
+        let mut gateway = TestGateway::with_remote_queue_pool(&[&model], &pool).await;
+        gateway
+            .add_worker(
+                "remote-1",
+                (pool.as_str(), REMOTE_LANE.1, REMOTE_LANE.2),
+                &[],
+            )
+            .await;
+        let publisher = Arc::new(WorkPublisher::new(
+            jetstream.clone(),
+            "egress-gateway".into(),
+            Arc::new(crate::queue::payload_store::DisabledPayloadStore),
+            Duration::from_secs(10),
+            1024,
+            WorkStreamConfig {
+                max_age: Duration::from_secs(300),
+                storage: async_nats::jetstream::stream::StorageType::Memory,
+                num_replicas: 1,
+            },
+        ));
+        publisher.start_inbox_subscription(&client).await.unwrap();
+        Arc::get_mut(&mut gateway.state).unwrap().work_publisher = Some(publisher);
+
+        let mut work = client
+            .subscribe(format!("sie.work.{pool}.cpu.remote.>"))
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        let consumer = tokio::spawn({
+            let client = client.clone();
+            async move {
+                let message = work.next().await.expect("a published work item");
+                let item: rmpv::Value = rmp_serde::from_slice(&message.payload).unwrap();
+                let field = |name: &str| {
+                    item.as_map()
+                        .and_then(|fields| {
+                            fields.iter().find(|(key, _)| key.as_str() == Some(name))
+                        })
+                        .and_then(|(_, value)| value.as_str())
+                        .unwrap()
+                        .to_string()
+                };
+                let mut call = tokio::net::TcpStream::connect(upstream_addr).await.unwrap();
+                call.write_all(b"POST /v1/encode/acme/remote HTTP/1.1\r\n\r\n")
+                    .await
+                    .unwrap();
+                let _ = call.read(&mut [0u8; 64]).await;
+                let mut result: WorkResult = serde_json::from_value(json!({
+                    "work_item_id": field("work_item_id"),
+                    "request_id": field("request_id"),
+                    "item_index": 0,
+                    "success": true,
+                }))
+                .unwrap();
+                result.result_msgpack =
+                    rmp_serde::to_vec_named(&json!({"dense": [0.5, 0.25]})).unwrap();
+                client
+                    .publish(
+                        field("reply_subject"),
+                        rmp_serde::to_vec_named(&result).unwrap().into(),
+                    )
+                    .await
+                    .unwrap();
+                client.flush().await.unwrap();
+                (field("model_id"), message.payload)
+            }
+        });
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            proxy_request(
+                State(Arc::clone(&gateway.state)),
+                json_request(
+                    "/v1/encode/acme/remote",
+                    json!({"items": [{"text": "hello"}]}),
+                ),
+                "encode",
+            ),
+        )
+        .await;
+        if !matches!(&response, Ok(served) if served.status().is_success()) {
+            consumer.abort();
+        }
+        let consumer = tokio::time::timeout(Duration::from_secs(10), consumer).await;
+        upstream_task.abort();
+        let _ = jetstream.delete_stream(&stream_name).await;
+
+        let response = response.expect("served through the queue");
+        assert_eq!(response.status(), StatusCode::OK);
+        let (model_id, published) = consumer
+            .expect("the test consumer finished")
+            .expect("the test consumer answered");
+        assert_eq!(stamped(&response), (Some("remote"), Some("team-sie")));
+        assert_eq!(model_id, "acme/remote");
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "the test consumer's call is the only upstream connection"
+        );
+        assert!(
+            !String::from_utf8_lossy(&published).contains("team-sie"),
+            "the work item names the upstream"
+        );
+    }
+
     #[tokio::test]
     async fn the_embeddings_route_forwards_the_disclosure_of_the_encode_it_wraps() {
         let gateway = gateway().await;
