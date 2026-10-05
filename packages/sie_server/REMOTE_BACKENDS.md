@@ -233,7 +233,11 @@ that keeps the application model name stable.
 
 The single-node model detail and catalog responses include
 `profiles.<name>.identity`, a versioned digest or `null`. Version 2 conservatively
-identifies revision-pinned BGE-M3 profiles on the native and the flash adapter. It
+identifies revision-pinned BGE-M3 profiles on the native and the flash adapter,
+and profiles on the BERT, BERT cross-encoder, Qwen2 cross-encoder and Nomic
+flash adapters. Those four fall back to adapters that have no identity when
+flash attention is unavailable, so they are identified only on a CUDA device
+with compute capability 8.0 or newer and an installed flash-attn. It
 includes model/tokenizer pins, resolved profile settings, engine configuration,
 device/platform, serving Python sources, the exact builds of installed inference
 libraries (each library's version and installed-file record, including
@@ -260,8 +264,11 @@ flash BGE-M3 adapter, which applies LoRA per request and disables the adapter
 layers for base requests; on other adapters any declared LoRA reports `null`.
 SentenceTransformers and CrossEncoder require verified checkpoint module metadata:
 disabling `trust_remote_code` alone does not identify installed checkpoint-selected
-code. FlagEmbedding BGE-M3 cannot identify its effective revision; other engines
-need additional runtime evidence. An identity is a descriptor, not a numerical
+code. FlagEmbedding BGE-M3 cannot identify its effective revision. The other
+flash adapters have inputs the identity does not bind: CUDA graphs that replay
+or not depending on free memory and timing, side files fetched on a best-effort
+basis, model code from the Hub that cannot be pinned, or LoRA support. Other
+engines need additional runtime evidence. An identity is a descriptor, not a numerical
 measurement. This field alone does not activate hybrid routing: OpenAI profiles
 need passing numerical evidence; SIE profiles require the fresh comparison below.
 
@@ -278,7 +285,7 @@ its installed endpoint, model serving configuration, credential reference and re
 transforms to the operator files supplied to the probe. The remote execution
 digest identifies the serving code and inference libraries that run the remote
 profile. Credential values are never included. Version 2 local identities
-support BGE-M3 on the native and the flash adapter.
+cover the adapters listed under [Local profile identity](#local-profile-identity).
 
 From the locked public workspace, run:
 
@@ -350,8 +357,9 @@ report the same immutable weights revision and non-null local execution identity
 The remote profile must name an explicit upstream profile, for example
 `upstream_model: BAAI/bge-m3:default`, so the upstream's bare-model routing policy
 cannot change where the request runs. Both deployments must use the same pinned
-BGE-M3 execution contract on the same adapter, including hardware, libraries and
-resolved profile settings. Unknown identities remain refused.
+execution contract on the same identified adapter (see
+[Local profile identity](#local-profile-identity)), including hardware, libraries
+and resolved profile settings. Unknown identities remain refused.
 
 Configuration load and each bridge compare bounded metadata obtained through
 `SIEClient` with the deployment's configured credential, TLS and proxy policy.
@@ -416,8 +424,8 @@ name is served locally. The valid policies are `remote_only`, `fallback` and
 direct worker, writing to the declared evidence path, then add
 `routing: {policy: fallback, fallback_profile: remote}` to the model YAML.
 Model-config hot reload admits the change in the same process. All profile
-settings must stay unchanged between measurement and activation. An immutable
-BGE-M3 local profile on the native or the flash adapter is currently required;
+settings must stay unchanged between measurement and activation. The local
+profile must have an identity (see [Local profile identity](#local-profile-identity));
 unidentified engines remain closed.
 
 Every bridge rechecks the record and its age before loading or calling the remote
