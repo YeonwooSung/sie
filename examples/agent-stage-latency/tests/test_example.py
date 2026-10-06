@@ -229,6 +229,7 @@ class FakeServer:
         fail_at: int | None = None,
         retry: bool = False,
         malformed: bool = False,
+        chat_content: Any = "Safety: Safe",
         catalog: bool = True,
         catalog_status: int = 200,
         revision_headers: bool = True,
@@ -241,6 +242,7 @@ class FakeServer:
         self.fail_at = fail_at
         self.retry = retry
         self.malformed = malformed
+        self.chat_content = chat_content
         self.catalog = catalog
         self.catalog_status = catalog_status
         self.revision_headers = revision_headers
@@ -341,7 +343,7 @@ class FakeServer:
                     if not fixture.revision_headers:
                         headers = {}
                     if self.path == "/v1/chat/completions":
-                        text = "fake-auth-sentinel" if fixture.malformed else "Safety: Safe"
+                        text = "fake-auth-sentinel" if fixture.malformed else fixture.chat_content
                         self.reply(
                             {
                                 "model": data["model"],
@@ -1035,6 +1037,54 @@ def test_malformed_reply_keeps_actual_redacted_reply(tmp_path: Path) -> None:
         next(r for r in journal_rows(journal) if r["event"] == "call_result")["reply"]["text"]
         == "[REDACTED_CREDENTIAL]"
     )
+
+
+def test_malformed_reply_redacts_nested_keys_and_preserves_collisions(tmp_path: Path) -> None:
+    secret = "fake-auth-sentinel"
+    marker = "[REDACTED_CREDENTIAL]"
+    content = {
+        secret: [{f"nested-{secret}": secret}],
+        marker: "second entry",
+        marker + "#2": "third entry",
+    }
+    path, _ = packet_file(tmp_path, stages=["G"], n=1, arms="sie")
+    journal = tmp_path / "malformed-keys.jsonl"
+    with FakeServer(journal, chat_content=content) as server:
+        assert run.run_trial(path, journal, server.url, {"sie": secret}, execute=True) == "finished"
+        assert not server.errors and len(server.captures) == 1
+    assert secret not in journal.read_text() and marker in journal.read_text()
+    terminal = next(r for r in journal_rows(journal) if r["event"] == "call_result")
+    assert terminal["status"] == "failed" and terminal["error"]["code"] == "MALFORMED_REPLY"
+    assert terminal["reply"]["text"] == {
+        marker: [{"nested-" + marker: marker}],
+        marker + "#2": "second entry",
+        marker + "#2#2": "third entry",
+    }
+    report = score.score_trial(path, journal)
+    assert secret not in protocol.canonical(report).decode()
+    counts = report["stages"]["G"]["accounting"]["sie"]
+    assert counts["planned"] == counts["attempted"] == counts["failed"] == 1
+    assert counts["successful"] == counts["unattempted"] == counts["attempt_status_unknown"] == 0
+    assert counts["semantic_calls"]["failed"] == counts["physical_dispatches"] == 1
+    assert counts["sdk_retries"] == 0 and counts["physical_dispatches_exact"]
+
+
+@pytest.mark.parametrize(
+    "keys",
+    [
+        ["first-secret", "second-secret", "[REDACTED_CREDENTIAL]"],
+        ["[REDACTED_CREDENTIAL]", "second-secret", "first-secret"],
+        ["first-secret", "[REDACTED_CREDENTIAL]#2", "[REDACTED_CREDENTIAL]"],
+    ],
+)
+def test_redacted_key_collisions_keep_all_values_and_are_stable(keys: list[str]) -> None:
+    raw = dict(zip(keys, (1, 2, 3), strict=True))
+    credentials = ["first-secret", "second-secret"]
+    redacted = run.sanitize(raw, credentials)
+    assert len(redacted) == 3 and sorted(redacted.values()) == [1, 2, 3]
+    assert all(secret not in protocol.canonical(redacted).decode() for secret in credentials)
+    assert run.sanitize(raw, credentials) == run.sanitize(redacted, credentials) == redacted
+    assert list(raw) == keys
 
 
 @pytest.mark.parametrize(

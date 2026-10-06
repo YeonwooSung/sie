@@ -131,7 +131,17 @@ def sanitize(value: Any, credentials: list[str]) -> Any:
                 value = value.replace(secret, "[REDACTED_CREDENTIAL]")
         return value
     if isinstance(value, dict):
-        return {str(k): sanitize(v, credentials) for k, v in value.items()}
+        result = {}
+        for key, item in value.items():
+            redacted_key = sanitize(str(key), credentials)
+            unique_key = redacted_key
+            suffix = 2
+            # Retain every value when distinct keys redact to the same name.
+            while unique_key in result:
+                unique_key = f"{redacted_key}#{suffix}"
+                suffix += 1
+            result[unique_key] = sanitize(item, credentials)
+        return result
     if isinstance(value, (list, tuple)):
         return [sanitize(v, credentials) for v in value]
     if isinstance(value, float) and not math.isfinite(value):
