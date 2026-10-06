@@ -3899,6 +3899,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn models_leave_out_a_remote_profile_hidden_from_the_caller() {
+        async fn json_of(response: Response) -> serde_json::Value {
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+        let config = fallback_config(
+            &HYBRID_EXTRACT_MODEL
+                .replace(
+                    "    max_batch_tokens: 8192\n  remote:",
+                    "    max_batch_tokens: 8192\n    adapter_options:\n      loadtime:\n        lora_paths:\n          shared: org/shared\n  remote:",
+                )
+                .replace(
+                    "        upstream_model: acme/extract\n",
+                    "        upstream_model: acme/extract\n        lora_paths:\n          shared: org/shared\n          remote-only: org/remote-only\n",
+                ),
+        );
+        let remote_lora_only = fallback_config(&HYBRID_ENCODE_MODEL.replace(
+            "        upstream_model: acme/hybrid-encode\n",
+            "        upstream_model: acme/hybrid-encode\n        lora_paths:\n          remote-only: org/remote-only\n",
+        ));
+        for hide_remote in [false, true] {
+            let policy = Arc::new(RoutePolicy {
+                hide_remote,
+                ..Default::default()
+            });
+            let gateway = cold_gateway(&[&config, &remote_lora_only], policy).await;
+            let listing = json_of(
+                crate::handlers::models::get_models(
+                    State(Arc::clone(&gateway.state)),
+                    Request::builder()
+                        .uri("/v1/models")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .into_response(),
+            )
+            .await;
+            let models = listing["models"].as_array().unwrap();
+            let listed = models
+                .iter()
+                .find(|model| model["name"] == "acme/extract")
+                .unwrap()
+                .clone();
+            let detail = json_of(
+                crate::handlers::models::get_model(
+                    axum::extract::Path("acme/extract".to_string()),
+                    State(Arc::clone(&gateway.state)),
+                    Request::builder()
+                        .uri("/v1/models/acme/extract")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await,
+            )
+            .await;
+            let (routing, lora_adapters, profile_lora_adapters) = if hide_remote {
+                (
+                    json!({"policy": null, "upstream_kind": null}),
+                    json!(["shared"]),
+                    json!({"default": ["shared"]}),
+                )
+            } else {
+                (
+                    json!({"policy": "fallback", "upstream_kind": "sie"}),
+                    json!(["shared", "remote-only"]),
+                    json!({"default": ["shared"], "remote": ["shared", "remote-only"]}),
+                )
+            };
+            for body in [&listed, &detail] {
+                assert_eq!(body["routing"], routing, "hide_remote={hide_remote}");
+                assert_eq!(
+                    body["capabilities"]["lora_adapters"], lora_adapters,
+                    "hide_remote={hide_remote}"
+                );
+                assert_eq!(
+                    body["capabilities"]["profile_lora_adapters"], profile_lora_adapters,
+                    "hide_remote={hide_remote}"
+                );
+                assert_eq!(
+                    body["profiles"].get("remote").is_some(),
+                    !hide_remote,
+                    "hide_remote={hide_remote}"
+                );
+                assert!(body["profiles"].get("default").is_some());
+            }
+            assert_eq!(
+                models
+                    .iter()
+                    .any(|model| model["name"] == "acme/extract:remote"),
+                !hide_remote
+            );
+            let encode = models
+                .iter()
+                .find(|model| model["name"] == "acme/hybrid-encode")
+                .unwrap();
+            let (lora_adapters, profile_lora_adapters) = if hide_remote {
+                (json!(null), json!(null))
+            } else {
+                (json!(["remote-only"]), json!({"remote": ["remote-only"]}))
+            };
+            assert_eq!(encode["capabilities"]["lora_adapters"], lora_adapters);
+            assert_eq!(
+                encode["capabilities"]["profile_lora_adapters"],
+                profile_lora_adapters
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn remote_forbid_never_asks_the_policy() {
         let config = fallback_config(HYBRID_EXTRACT_MODEL);
         let policy = Arc::new(RoutePolicy {

@@ -66,7 +66,7 @@ pub async fn get_models(
             let worker_urls = model_workers.get(name).cloned().unwrap_or_default();
             let loaded = !worker_urls.is_empty();
             let mut body = match state.model_registry.get_model_info(name) {
-                Some(entry) => entry.to_model_info_value(loaded),
+                Some(entry) => model_info_for_caller(state.as_ref(), &entry, loaded, ext),
                 None => worker_only_model_info(name, loaded),
             };
             attach_model_revision(&mut body, state.as_ref(), name);
@@ -95,6 +95,73 @@ pub async fn get_models(
         })),
     )
         .into_response()
+}
+
+/// A model as the caller in `ext` may see it. When the caller may not see the
+/// remote profile that the model's routing names, the model is shown without
+/// that profile and without the routing, like a model that has no remote
+/// route.
+fn model_info_for_caller(
+    state: &AppState,
+    entry: &ModelEntry,
+    loaded: bool,
+    ext: &axum::http::Extensions,
+) -> Value {
+    let mut body = entry.to_model_info_value(loaded);
+    let Some((remote_model, profile)) = entry.routed_remote_profile() else {
+        return body;
+    };
+    let hidden = state
+        .model_access_policy
+        .as_ref()
+        .is_some_and(|policy| !policy.visible(&remote_model, ext));
+    if hidden {
+        body["routing"] = ModelEntry::no_routing_value();
+        leave_out_profile(&mut body, profile);
+    }
+    body
+}
+
+/// Leave `profile` out of a model's JSON: its entry in `profiles`, its LoRA
+/// adapters, and every adapter name in the union that no other profile
+/// declares. An emptied map or union becomes `null`, as for a model that
+/// declares none.
+fn leave_out_profile(body: &mut Value, profile: &str) {
+    if let Some(profiles) = body["profiles"].as_object_mut() {
+        profiles.remove(profile);
+    }
+    let capabilities = &mut body["capabilities"];
+    let (retained, emptied) = {
+        let Some(per_profile) = capabilities["profile_lora_adapters"].as_object_mut() else {
+            return;
+        };
+        if per_profile.remove(profile).is_none() {
+            return;
+        }
+        let retained: HashSet<String> = per_profile
+            .values()
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        (retained, per_profile.is_empty())
+    };
+    if emptied {
+        capabilities["profile_lora_adapters"] = Value::Null;
+    }
+    let union: Vec<Value> = capabilities["lora_adapters"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|name| name.as_str().is_some_and(|name| retained.contains(name)))
+        .cloned()
+        .collect();
+    capabilities["lora_adapters"] = if union.is_empty() {
+        Value::Null
+    } else {
+        Value::Array(union)
+    };
 }
 
 /// Detail counterpart to `get_models`.
@@ -162,7 +229,7 @@ pub async fn get_model(
 
     let loaded = !worker_urls.is_empty();
     let mut body = match model_entry {
-        Some(entry) => entry.to_model_info_value(loaded),
+        Some(entry) => model_info_for_caller(state.as_ref(), &entry, loaded, req.extensions()),
         None => worker_only_model_info(&model, loaded),
     };
 
