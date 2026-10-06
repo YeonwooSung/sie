@@ -2391,6 +2391,36 @@ fn generation_bridge_allowed(state: &AppState) -> bool {
         .is_none()
 }
 
+/// A transport that manages its own capacity can report a cold lane that the
+/// registry still lists.
+fn transport_lane_provisioning(
+    state: &AppState,
+    pool: &str,
+    machine_profile: &str,
+    bundle: &str,
+    model: &str,
+) -> bool {
+    state.work_publisher.as_ref().is_some_and(|publisher| {
+        publisher.lane_provisioning(&LaneKey::new(pool, machine_profile, bundle), model)
+    })
+}
+
+/// The lane a transport wakes for a `provisioning` bridge. No worker is
+/// pinned, because the transport reports that none is ready.
+fn lane_wake_target(
+    pool: &str,
+    machine_profile: &str,
+    bundle: &str,
+    model: &str,
+) -> publisher::PublishTarget {
+    publisher::PublishTarget::Pool {
+        pool: pool.to_string(),
+        machine_profile: machine_profile.to_string(),
+        bundle: bundle.to_string(),
+        model: model.to_string(),
+    }
+}
+
 /// Threshold decisions are counted only after caller validation and before
 /// any local demand or work is published. Caller selectors retain authority.
 #[allow(clippy::too_many_arguments)]
@@ -2740,6 +2770,22 @@ fn native_fallback_plan(
     })
 }
 
+/// The bridge a request would take, admitted in full: the deployment's
+/// decision and, for a numerical plan, its admission.
+#[allow(clippy::too_many_arguments)]
+fn native_bridge_plan(
+    state: &AppState,
+    req: &Request,
+    endpoint: &str,
+    model: &str,
+    parsed: Option<&(Vec<rmpv::Value>, publisher::WorkParams)>,
+    body_held: bool,
+    trigger: FallbackTrigger,
+) -> Option<crate::state::model_registry::RemoteFallbackPlan> {
+    native_fallback_plan(state, req, endpoint, model, parsed, body_held, trigger)
+        .and_then(|plan| admit_numerical(state, plan, endpoint, parsed, req.extensions()))
+}
+
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
 fn begin_native_fallback(
     state: &AppState,
@@ -2751,11 +2797,20 @@ fn begin_native_fallback(
     refusal: Response,
     trigger: FallbackTrigger,
 ) -> Result<(), Response> {
-    let Some(plan) = native_fallback_plan(state, req, endpoint, model, parsed, body_held, trigger)
-        .and_then(|plan| admit_numerical(state, plan, endpoint, parsed, req.extensions()))
+    let Some(plan) = native_bridge_plan(state, req, endpoint, model, parsed, body_held, trigger)
     else {
         return Err(refusal);
     };
+    begin_planned_native_fallback(req, plan, refusal, trigger);
+    Ok(())
+}
+
+fn begin_planned_native_fallback(
+    req: &mut Request,
+    plan: crate::state::model_registry::RemoteFallbackPlan,
+    refusal: Response,
+    trigger: FallbackTrigger,
+) {
     let attempt = req
         .extensions()
         .get::<FallbackAttempt>()
@@ -2765,7 +2820,6 @@ fn begin_native_fallback(
         "request-owned bridge begins once synchronously"
     );
     req.extensions_mut().insert(RemoteFallbackOverride(plan));
-    Ok(())
 }
 
 pub(crate) async fn proxy_request(
@@ -3242,6 +3296,59 @@ async fn proxy_request_inner(
     .await
     {
         return resp;
+    }
+
+    let provisioning_bridge = if transport_lane_provisioning(
+        &state,
+        effective_pool,
+        effective_machine_profile,
+        &bundle,
+        &dispatch_model,
+    ) {
+        native_bridge_plan(
+            &state,
+            &req,
+            endpoint,
+            &model_name,
+            prepared_native_parsed.as_ref(),
+            body_held,
+            FallbackTrigger::Provisioning,
+        )
+    } else {
+        None
+    };
+    if let Some(plan) = provisioning_bridge {
+        let refusal = build_provisioning_response_for_surface(&gpu, &bundle, provisioning_surface);
+        let target = lane_wake_target(
+            effective_pool,
+            effective_machine_profile,
+            &bundle,
+            &dispatch_model,
+        );
+        if !warm_local_model(
+            &state,
+            work_publisher.as_ref(),
+            &physical_lane,
+            target,
+            &engine,
+            &bundle_config_hash,
+        )
+        .await
+        {
+            return refusal;
+        }
+        begin_planned_native_fallback(&mut req, plan, refusal, FallbackTrigger::Provisioning);
+        if let Some(body) = prepared_native_body {
+            *req.body_mut() = Body::from(body);
+        }
+        return Box::pin(proxy_request_inner(
+            state,
+            req,
+            endpoint,
+            provisioning_surface,
+            inbound_publish_cx,
+        ))
+        .await;
     }
 
     if native_fallback_plan(
@@ -8510,6 +8617,64 @@ async fn resolve_generation_route(
     .await
     {
         return Err(resp);
+    }
+
+    if transport_lane_provisioning(
+        state,
+        &effective_pool,
+        &effective_machine_profile,
+        &bundle,
+        dispatch_model,
+    ) {
+        if let Some(plan) = fallback_plan_for_request(
+            state,
+            hdr,
+            ext,
+            customer_model,
+            bridge_allowed,
+            explicit_bundle_override,
+            FallbackTrigger::Provisioning,
+        ) {
+            let refusal = build_openai_provisioning_response(&gpu, &bundle);
+            let target = lane_wake_target(
+                &effective_pool,
+                &effective_machine_profile,
+                &bundle,
+                dispatch_model,
+            );
+            if !warm_local_model(
+                state,
+                work_publisher_arc.as_ref(),
+                &physical_lane,
+                target,
+                &engine,
+                &bundle_config_hash,
+            )
+            .await
+            {
+                return Err(refusal);
+            }
+            let attempt = ext
+                .get::<FallbackAttempt>()
+                .expect("plan requires a request record");
+            assert!(attempt.begin(refusal, FallbackTrigger::Provisioning));
+            let mut remote_ext = ext.clone();
+            remote_ext.insert(RemoteFallbackOverride(plan.clone()));
+            return Box::pin(resolve_generation_route(
+                state,
+                hdr,
+                &plan.bundle,
+                customer_model,
+                &plan.model,
+                request_intent,
+                "",
+                &remote_ext,
+                false,
+                token_limit,
+                metric_labels_slot,
+            ))
+            .await;
+        }
     }
 
     if fallback_plan_for_request(
