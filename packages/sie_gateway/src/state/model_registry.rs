@@ -1903,28 +1903,46 @@ impl ModelRegistry {
         self.threshold_binding.store(None);
     }
 
+    /// `accept`, when given, decides the plan before the request is counted
+    /// as demand. It runs while no registry lock is held, so it may read the
+    /// registry. The plan is counted only while its binding and snapshot are
+    /// still current.
     pub(crate) fn threshold_remote_route(
         &self,
         model: &str,
         epoch: u64,
+        accept: Option<&dyn Fn(&RemoteFallbackPlan) -> bool>,
     ) -> Option<RemoteFallbackPlan> {
         let binding = self.threshold_binding.load_full()?;
         if binding.epoch != epoch || model.contains(':') {
             return None;
         }
+        let snap = &binding.generation.snapshot;
+        let canonical = Self::canonical_model_name(snap, model)?;
+        let plan = snap
+            .models
+            .get(&canonical)
+            .and_then(|entry| Self::remote_plan_from_snapshot(snap, entry));
+        if accept.is_some_and(|accept| !plan.as_ref().is_some_and(accept)) {
+            return None;
+        }
         // A snapshot writer must never block a request thread. Contention is
         // unavailable authority and retains the ordinary local/fallback path.
         let _fence = self.write_lock.try_lock().ok()?;
-        if !Arc::ptr_eq(&self.snapshot.load_full(), &binding.generation.snapshot) {
+        if !Arc::ptr_eq(&self.snapshot.load_full(), snap)
+            || !self
+                .threshold_binding
+                .load()
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &binding))
+        {
             return None;
         }
-        let snap = &binding.generation.snapshot;
-        let canonical = Self::canonical_model_name(snap, model)?;
         binding.coordinator.record_request(&canonical).ok()?;
         if binding.coordinator.decision(&canonical).ok()? != ThresholdDecision::Remote {
             return None;
         }
-        Self::remote_plan_from_snapshot(snap, snap.models.get(&canonical)?)
+        plan
     }
 
     pub fn get_model_pool_name(&self, model: &str) -> Option<String> {
@@ -3117,7 +3135,7 @@ mod tests {
         assert!(gateway
             .state
             .model_registry
-            .threshold_remote_route("acme/chat", 1)
+            .threshold_remote_route("acme/chat", 1, None)
             .is_some());
 
         let registry = Arc::clone(&gateway.state.model_registry);
@@ -3133,15 +3151,62 @@ mod tests {
         let route = gateway
             .state
             .model_registry
-            .threshold_remote_route("acme/chat", 1);
+            .threshold_remote_route("acme/chat", 1, None);
         release_tx.send(()).unwrap();
         writer.join().unwrap();
         assert!(route.is_none());
         assert!(gateway
             .state
             .model_registry
-            .threshold_remote_route("acme/chat", 1)
+            .threshold_remote_route("acme/chat", 1, None)
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn a_threshold_accept_callback_runs_outside_the_registry_lock() {
+        let Some(broker) = ThresholdBroker::start().await else {
+            return;
+        };
+        let model = format!(
+            "{HYBRID_GENERATE_MODEL}\nrouting:\n  policy: threshold\n  fallback_profile: remote\n  wake_above: 1\n  sleep_below: 0.5\n  window_s: 1\n  cooldown_s: 1\n"
+        );
+        let gateway = TestGateway::with_threshold_routing(&[&model], true).await;
+        let binding = broker.bind(&gateway).await;
+        let mut sampler = ThresholdSampler::default();
+        binding.coordinator.sample(&mut sampler).await.unwrap();
+        for _ in 0..2 {
+            tokio::time::sleep(Duration::from_millis(1050)).await;
+            binding.coordinator.sample(&mut sampler).await.unwrap();
+        }
+        let route = |clear_binding: bool| {
+            let registry = Arc::clone(&gateway.state.model_registry);
+            let (done_tx, done_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let accept = |_: &RemoteFallbackPlan| {
+                    let read =
+                        registry.with_current_generation(&registry.capture_generation(), || ());
+                    if clear_binding {
+                        registry.clear_threshold_binding();
+                    }
+                    read.is_some()
+                };
+                let _ = done_tx.send(
+                    registry
+                        .threshold_remote_route("acme/chat", 1, Some(&accept))
+                        .is_some(),
+                );
+            });
+            // Bound a regression's deadlock so this test cannot hang.
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the callback ran without the registry lock")
+        };
+
+        assert!(route(false), "a callback may read the registry");
+        assert!(
+            !route(true),
+            "a binding that changed while the callback ran is not counted"
+        );
     }
 
     #[test]
