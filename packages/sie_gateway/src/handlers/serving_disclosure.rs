@@ -3519,7 +3519,19 @@ mod tests {
                 _ => unreachable!(),
             }
             let response = encode(&gateway, body).await;
-            assert!(!response.status().is_success(), "{case}");
+            let local_worker = matches!(
+                case,
+                "uncovered local identity" | "local worker without inventory"
+            );
+            assert_eq!(response.status().is_success(), local_worker, "{case}");
+            assert!(
+                gateway
+                    .dispatcher
+                    .dispatched()
+                    .iter()
+                    .all(|work| work.endpoint != "load"),
+                "{case}"
+            );
             assert_numerical_work_stayed_local(&gateway, &response, case);
         }
     }
@@ -3643,6 +3655,7 @@ mod tests {
         for params in [
             json!({"output_dtype": "int8"}),
             json!({"output_types": ["sparse"]}),
+            json!({"instruction": "Represent this sentence:"}),
         ] {
             let gateway = numerical_gateway(NUMERICAL_FALLBACK, false).await;
             gateway
@@ -3686,6 +3699,101 @@ mod tests {
                     .iter()
                     .all(Option::is_none),
                 "{params}"
+            );
+        }
+    }
+
+    /// A numerical model whose local worker reports `identity`, on a gateway
+    /// whose remote worker admits only `ADMITTED_IDENTITY`.
+    async fn numerical_gateway_with_local(
+        routing: &str,
+        loaded: &[&str],
+        identity: &str,
+    ) -> TestGateway {
+        let gateway = numerical_gateway(routing, false).await;
+        gateway
+            .add_numerical_worker(
+                "local-1",
+                LOCAL_LANE,
+                loaded,
+                true,
+                local_identity(identity),
+            )
+            .await;
+        gateway
+    }
+
+    #[tokio::test]
+    async fn a_cold_model_without_a_current_admission_waits_for_its_local_load() {
+        for (identity, bridged) in [(UNADMITTED_IDENTITY, false), (ADMITTED_IDENTITY, true)] {
+            let gateway = numerical_gateway_with_local(NUMERICAL_FALLBACK, &[], identity).await;
+            let response = encode(&gateway, json!({"items":[{"text":"hello"}]})).await;
+            let dispatched = gateway.dispatcher.dispatched();
+            if bridged {
+                assert_eq!(response.headers()["x-sie-fallback-reason"], "model_loading");
+                assert!(dispatched.iter().any(|work| work.endpoint == "load"));
+                assert!(dispatched.iter().any(|work| work.bundle == REMOTE_LANE.2));
+            } else {
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(!response.headers().contains_key("x-sie-fallback-reason"));
+                assert!(dispatched.iter().all(|work| work.endpoint != "load"));
+                assert!(dispatched.iter().all(|work| work.bundle != REMOTE_LANE.2));
+                assert!(dispatched.iter().any(|work| work.bundle == LOCAL_LANE.2));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_saturated_model_without_a_current_admission_keeps_its_local_queue() {
+        let routing =
+            "\nrouting:\n  policy: fallback\n  fallback_profile: remote\n  triggers: [saturated]\n";
+        for (identity, bridged) in [(UNADMITTED_IDENTITY, false), (ADMITTED_IDENTITY, true)] {
+            let gateway =
+                numerical_gateway_with_local(routing, &["acme/hybrid-encode"], identity).await;
+            gateway.dispatcher.saturate_local_queue();
+            let response = encode(&gateway, json!({"items":[{"text":"hello"}]})).await;
+            let dispatched = gateway.dispatcher.dispatched();
+            if bridged {
+                assert_eq!(response.headers()["x-sie-fallback-reason"], "saturated");
+                assert!(dispatched.iter().any(|work| work.bundle == REMOTE_LANE.2));
+            } else {
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(!response.headers().contains_key("x-sie-fallback-reason"));
+                assert!(dispatched.iter().all(|work| work.bundle != REMOTE_LANE.2));
+                assert!(dispatched.iter().any(|work| work.bundle == LOCAL_LANE.2));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_admission_withdrawn_during_the_wake_keeps_the_local_refusal() {
+        for (gate, loaded) in [
+            ("model_loading", &[][..]),
+            ("provisioning", &["acme/hybrid-encode"][..]),
+        ] {
+            let gateway =
+                numerical_gateway_with_local(NUMERICAL_FALLBACK, loaded, ADMITTED_IDENTITY).await;
+            if gate == "provisioning" {
+                gateway.dispatcher.report_cold_local_lane();
+            }
+            let registry = Arc::clone(&gateway.state.registry);
+            gateway
+                .dispatcher
+                .on_model_load(Box::new(move || registry.health_subscription_started()));
+            let response = encode(&gateway, json!({"items":[{"text":"hello"}]})).await;
+            let dispatched = gateway.dispatcher.dispatched();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{gate}");
+            assert!(
+                !response.headers().contains_key("x-sie-fallback-reason"),
+                "{gate}"
+            );
+            assert!(
+                dispatched.iter().any(|work| work.endpoint == "load"),
+                "{gate}"
+            );
+            assert!(
+                dispatched.iter().all(|work| work.bundle != REMOTE_LANE.2),
+                "{gate}"
             );
         }
     }

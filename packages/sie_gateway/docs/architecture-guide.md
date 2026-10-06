@@ -970,14 +970,15 @@ gateway refuse a body-level `options.profile` selector, check the request
 against the admission and replay the body remotely. The bridge decision is made
 when the gateway is about to commit to the remote attempt:
 
-- The request sets no runtime option other than `is_query`, and every output it
-  asks for (`dense` when an encode names none, `score` for score) is listed in
-  the admission. Otherwise the remote process would refuse it, so the request
+- The request sets no instruction and no runtime option other than
+  `is_query`, and every output it asks for (`dense` when an encode names none,
+  `score` for score) is listed in the admission. Otherwise the remote process would refuse it, so the request
   stays local:
   - A request for an output that the model declares but the admission does not
     list stays local with the reason `unmeasured_request`.
-  - A request with another runtime option, or one that asks for an output the
-    model does not declare, is not a bridge candidate on a fallback route. The
+  - A request with an instruction or another runtime option, or one that asks
+    for an output the model does not declare, is not a bridge candidate on a
+    fallback route. The
     trigger leaves it on its ordinary local path instead of committing to the
     local refusal, and no decision is recorded. On a `threshold` route it stays
     local with the reason `unmeasured_request`.
@@ -1067,9 +1068,12 @@ lane. It is `false` by default and is a non-publishing hint.
   1. The gateway wakes the lane through `publish_model_load` with the lane's
      pool target, recording pending demand as for any cold lane.
   2. It waits up to 2 s for the transport to accept the wake.
-  3. It makes the single remote attempt with `fallback_reason: provisioning`.
-  - A wake that is not accepted leaves the caller with the local
-    `503 PROVISIONING`.
+  3. It admits the bridge again, and makes the single remote attempt with
+     `fallback_reason: provisioning`.
+  - A wake that is not accepted, or a bridge that is no longer admitted after
+    the wake, leaves the caller with the local `503 PROVISIONING`. A
+    `model_loading` bridge admits its plan again after its load-only wake in the
+    same way.
 - **No bridge.** A request that is not bridged dispatches as before.
 - **A remote attempt refused as `PROVISIONING`** received no answer. It
   restores the local refusal with `X-SIE-Fallback-Error: QUEUE_FULL`.
