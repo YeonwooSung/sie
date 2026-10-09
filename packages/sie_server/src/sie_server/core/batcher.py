@@ -9,7 +9,8 @@ Batch formation loop:
 3. Accumulate while: total_cost < max_batch_cost AND
                      num_requests < max_batch_requests AND
                      elapsed < max_batch_wait_ms
-4. Sort by cost (reduces padding waste for text)
+4. Sort by cost (reduces padding waste for text). A request that has waited
+   max_batch_wait_ms is taken before cheaper items
 5. Split into optimal sub-batches respecting max_batch_cost
 6. Return one sub-batch per get_batch() call
 
@@ -25,8 +26,13 @@ then the oldest flagged item, and so on. A batchable item never waits inside
 a long item's batch, and waits for at most one flagged item between two
 batches of its lane. A flagged item with k flagged items ahead of it waits
 for at most k + 1 batches of batchable items, however many keep arriving.
-When nothing pending is flagged, batch formation is exactly the cost-sorted
-greedy packing above.
+When nothing pending is flagged, requests younger than ``max_batch_wait_ms``
+are packed by that cost-sorted greedy algorithm. Once the oldest pending
+request has waited at least that long, it is taken before cheaper work fills
+the cost budget (#390); anything that does not fit in the remaining budget
+stays queued, and one request larger than ``max_batch_cost`` is still taken
+alone. Cheaper arrivals cannot skip that older request for longer than
+``max_batch_wait_ms`` plus one batch.
 
 Cost semantics vary by modality (modality-native units):
 - Text: cost = token count
@@ -322,11 +328,18 @@ class BatchFormer[I: HasCost, T]:
 
     def _append_item(self, item: I, metadata: T) -> None:
         """Append item to pending list (caller must hold lock)."""
-        request = PendingRequest(item=item, metadata=metadata, runs_alone=getattr(item, "runs_alone", False) is True)
+        # Call time.monotonic at enqueue. The dataclass default holds the
+        # function captured at import, so a patched clock would not apply.
+        now = time.monotonic()
+        request = PendingRequest(
+            item=item,
+            metadata=metadata,
+            arrival_time=now,
+            runs_alone=getattr(item, "runs_alone", False) is True,
+        )
         self._pending.append(request)
         self._total_cost += item.cost
 
-        now = time.monotonic()
         self._last_submit_time = now
 
         # Track first request time for timeout
@@ -437,6 +450,31 @@ class BatchFormer[I: HasCost, T]:
         if alone_turn:
             self._pending.insert(0, self._pending.pop(head_index))
 
+    def _promote_overdue_request(self) -> bool:
+        """Move the oldest pending request to the front once it has outwaited the batch window.
+
+        Cost-ascending order is unchanged while that request is younger than
+        ``max_batch_wait_ms``. After that, cheaper work must not keep filling
+        the cost budget ahead of it (#390). The caller has already sorted
+        ``_pending`` by cost. The existing take-loop then fills any remaining
+        budget, or takes this request alone when nothing else fits — including
+        a single request larger than ``max_batch_cost``.
+
+        Returns:
+            Whether the oldest request was moved to the front.
+        """
+        if len(self._pending) < 2:
+            return False
+        oldest = min(self._pending, key=lambda request: request.arrival_time)
+        waited_ms = (time.monotonic() - oldest.arrival_time) * 1000
+        if waited_ms < self._config.max_batch_wait_ms:
+            return False
+        oldest_index = next(index for index, request in enumerate(self._pending) if request is oldest)
+        if oldest_index == 0:
+            return False
+        self._pending.insert(0, self._pending.pop(oldest_index))
+        return True
+
     def _extract_batch(
         self,
         max_items: int | None = None,
@@ -446,11 +484,16 @@ class BatchFormer[I: HasCost, T]:
 
         Algorithm:
         1. Sort pending requests by cost (ascending)
-        2. Take requests until max_batch_cost would be exceeded
-        3. Keep remaining requests for next get_batch() call
+        2. If the oldest request has waited at least max_batch_wait_ms, move
+           it to the front so cheaper work cannot skip it (#390)
+        3. Take requests until max_batch_cost would be exceeded
+        4. Keep remaining requests for next get_batch() call
 
         This minimizes padding waste by grouping similar-cost sequences.
-        When a pending request is flagged ``runs_alone``, the order comes from
+        Young requests stay in cost order. An overdue oldest request is taken
+        before that fill; if it does not fit beside the cheaper items, the
+        take-loop keeps it alone instead of leaving it queued. When a pending
+        request is flagged ``runs_alone``, the order comes from
         ``_order_runs_alone_lane`` instead, and a flagged request is always
         taken on its own.
 
@@ -472,11 +515,15 @@ class BatchFormer[I: HasCost, T]:
         pending_before = len(self._pending)
         cost_before = self._total_cost
 
+        promoted_overdue = False
         if any(request.runs_alone for request in self._pending):
             self._order_runs_alone_lane()
         else:
-            # Sort pending by cost (ascending) for optimal batching
+            # Sort pending by cost (ascending) for optimal batching.
+            # Promote only after that sort, and only once the oldest request
+            # has outwaited the batch window (#390). runs_alone keeps its lane.
             self._pending.sort(key=lambda r: r.item.cost)
+            promoted_overdue = self._promote_overdue_request()
 
         # Greedily take items until we exceed max_batch_cost
         batch_items: list[I] = []
@@ -515,6 +562,15 @@ class BatchFormer[I: HasCost, T]:
             if take_count >= self._config.max_batch_requests:
                 hit_request_limit = True
                 break
+
+        # The overdue request was selected first so it could not be left behind
+        # a cheaper fill. Emit cost order so this batch still pads like any
+        # other cost-sorted sub-batch.
+        if promoted_overdue and take_count > 1:
+            pairs = list(zip(batch_items, batch_metadata, strict=True))
+            pairs.sort(key=lambda pair: pair[0].cost)
+            batch_items = [pair[0] for pair in pairs]
+            batch_metadata = [pair[1] for pair in pairs]
 
         lane = "alone" if take_count > 0 and self._pending[0].runs_alone else "batched"
         if take_count > 0:
