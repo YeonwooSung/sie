@@ -87,8 +87,10 @@ class UvLock:
     ``versions`` holds one constraint string per unambiguous package. Packages
     with two public versions are listed in ``ambiguous`` and omitted from
     ``versions`` so image builds skip them instead of aborting. ``dependencies``
-    and ``optional_dependencies`` are the lock's ``dependencies`` and
-    ``optional-dependencies`` tables, keyed by normalized name.
+    and ``optional_dependencies`` are the edges of the lock entries that the
+    constraint installs, keyed by normalized name. A shared public version is
+    emitted as ``2.9.1.*`` and takes edges from the public ``2.9.1`` entry
+    only, not from a local build such as ``2.9.1+cu129``.
     """
 
     versions: Mapping[str, str]
@@ -137,7 +139,7 @@ def parse_uv_lock(source: str | Path) -> UvLock:
             versions[normalized] = resolved
         base: set[LockEdge] = set()
         optional: dict[str, set[LockEdge]] = {}
-        for entry in entries:
+        for entry in _entries_for_emitted_constraint(entries, resolved):
             base.update(_lock_edges(entry.get("dependencies")))
             raw_optional = entry.get("optional-dependencies")
             if not isinstance(raw_optional, dict):
@@ -201,12 +203,13 @@ def lock_constraint_lines(requirements: Sequence[str], lock: UvLock) -> list[str
     other platforms. The file starts with a comment that ranged dependencies
     follow ``uv.lock`` and can therefore be older than an unconstrained install.
 
-    Exact ``==`` pins and URL or VCS specs stay out of the file. Their lock
-    neighbors are still pinned when that neighbor is not part of a dependency
-    the bundle moved off the lock: those edges describe a distribution pip will
-    not install (transformers 5 versus a 4.x lock's ``huggingface-hub`` and
-    ``safetensors``) and would make the override unsatisfiable. A package with
-    two public versions is skipped with a comment instead of aborting.
+    Exact ``==`` pins and URL or VCS specs stay out of the file. An exact pin
+    contributes lock neighbors only when it matches the locked version. A pin
+    that differs (``torch==2.11.0`` against a ``2.9.1`` lock) is an untrusted
+    root, same as a range that does not contain the lock: those edges describe
+    a distribution the bundle will not install. Neighbors reached only through
+    an untrusted root are not pinned. A package with two public versions is
+    skipped with a comment instead of aborting.
     """
     grouped = _requirement_groups(requirements)
     constrained: list[tuple[str, frozenset[str]]] = []
@@ -227,9 +230,9 @@ def lock_constraint_lines(requirements: Sequence[str], lock: UvLock) -> list[str
     constrained_reach = _reachable(constrained, lock)
     exact_reach = _reachable(exact, lock)
     untrusted_reach = _reachable(untrusted, lock)
-    # Exact-override neighbors are pinned unless a rejected lock distribution
-    # also reaches them. A constrained dependency still wins: that package is
-    # installed at the locked version.
+    # Neighbors of an exact pin that matches the lock stay pinned unless a
+    # moved-off distribution also reaches them. A constrained dependency still
+    # wins: that package is installed at the locked version.
     trusted = constrained_reach | (exact_reach - untrusted_reach)
 
     pins: list[str] = []
@@ -262,6 +265,24 @@ def _constraint_version(name: str, versions: set[str]) -> str | None:
     if len(public_versions) != 1:
         return None
     return f"{next(iter(public_versions))}.*"
+
+
+def _entries_for_emitted_constraint(
+    entries: Sequence[Mapping[str, object]],
+    constraint: str | None,
+) -> list[Mapping[str, object]]:
+    """Edges for the build ``constraint`` installs, not every lock entry.
+
+    A shared public version is emitted as ``2.9.1.*``. That installs the public
+    wheel (``2.9.1``), so a local build's edges (``2.9.1+cu129``) do not apply.
+    An exact version uses that build only. Ambiguous names keep every entry.
+    """
+    if constraint is None:
+        return list(entries)
+    if constraint.endswith(".*"):
+        public = constraint.removesuffix(".*")
+        return [entry for entry in entries if entry.get("version") == public]
+    return [entry for entry in entries if entry.get("version") == constraint]
 
 
 def _lock_edges(items: object) -> tuple[LockEdge, ...]:
@@ -305,17 +326,22 @@ def _requirement_groups(requirements: Sequence[str]) -> dict[str, list[Requireme
 def _root_kind(name: str, reqs: Sequence[Requirement], lock: UvLock) -> str | None:
     """Classify a direct requirement as constrained, exact override, or untrusted.
 
-    Untrusted roots are URL/VCS specs and ranges that do not contain the locked
-    version. Their lock edges belong to a distribution the bundle will not
-    install, so those edges must not become constraints.
+    Untrusted roots are URL/VCS specs, ranges that do not contain the locked
+    version, and exact pins of a different version. Their lock edges belong to
+    a distribution the bundle will not install, so those edges must not become
+    constraints. An exact pin that matches the locked version still contributes
+    its edges.
     """
     if name not in lock.versions and name not in lock.ambiguous:
         return None
     if any(req.url is not None for req in reqs):
         return "untrusted"
-    if any(_is_bundle_override(req) for req in reqs):
-        return "exact"
     version = lock.versions.get(name)
+    overrides = [req for req in reqs if _is_bundle_override(req)]
+    if overrides:
+        if version is not None and all(_locked_constraint_satisfies(req, version) for req in overrides):
+            return "exact"
+        return "untrusted"
     if version is not None and any(not _locked_constraint_satisfies(req, version) for req in reqs):
         return "untrusted"
     return "constrained"

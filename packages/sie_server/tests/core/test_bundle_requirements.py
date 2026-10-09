@@ -62,7 +62,6 @@ def test_default_bundle_ranges_pin_to_uv_lock_versions() -> None:
 
     assert "gliner>=0.2.26,<1" in original
     assert f"gliner=={locked['gliner']}" in merged
-    assert locked["gliner"] == "0.2.26"
     assert "gliner>=0.2.26,<1" not in merged
     assert f"torch=={locked['torch']}" in merged
     assert f"requests=={locked['requests']}" in merged
@@ -76,10 +75,10 @@ def test_exact_pins_and_url_specs_override_the_lock() -> None:
     url_specs = [requirement for requirement in original if " @" in requirement]
 
     assert url_specs
-    assert locked["gliner2"] == "1.3.2"
     assert "gliner2==2.0.0" in merged
-    assert "torchvision==0.24.1" in merged
-    assert locked["torchvision"] != "0.24.1"
+    # Exact bundle pin, not the lock's ``0.24.1.*`` prefix constraint.
+    torchvision_lines = [requirement for requirement in merged if requirement.startswith("torchvision==")]
+    assert torchvision_lines == ["torchvision==0.24.1"]
     for requirement in url_specs:
         assert requirement in merged
     # Ranges that do not contain the locked version stay as written.
@@ -87,16 +86,17 @@ def test_exact_pins_and_url_specs_override_the_lock() -> None:
     assert "sentence-transformers>=5.6,<6" in merged
     constraints = lock_constraint_lines(original, parsed)
     assert "gliner2==2.0.0" not in constraints
-    assert "gliner2==1.3.2" not in constraints
+    assert f"gliner2=={locked['gliner2']}" not in constraints
     assert not any(line.startswith("torchvision==") for line in constraints)
     assert all(" @" not in line for line in constraints)
-    assert "transformers==4.57.6" not in constraints
-    assert "sentence-transformers==5.4.1" not in constraints
+    assert f"transformers=={locked['transformers']}" not in constraints
+    assert f"sentence-transformers=={locked['sentence-transformers']}" not in constraints
     # The 4.x lock's huggingface-hub and safetensors do not satisfy transformers 5.
     assert f"huggingface-hub=={locked['huggingface-hub']}" not in constraints
     assert f"safetensors=={locked['safetensors']}" not in constraints
-    # Exact gliner2==2.0.0 still contributes lock neighbors that the moved line does not own.
-    assert f"peft=={locked['peft']}" in constraints
+    # gliner2==2.0.0 moves off the lock, so its 1.x edges are not pinned.
+    # torch stays because the bundle range still contains the locked version.
+    assert f"peft=={locked['peft']}" not in constraints
     assert f"torch=={locked['torch']}" in constraints
 
 
@@ -149,13 +149,13 @@ def test_default_bundle_constraints_pin_transitive_deps_and_name_the_downgrade()
     assert f"docling-core=={parsed.versions['docling-core']}" in constraints
     assert f"sentence-transformers=={parsed.versions['sentence-transformers']}" in constraints
     assert f"gliner=={parsed.versions['gliner']}" in constraints
-    assert parsed.versions["sentence-transformers"] == "5.4.1"
-    assert parsed.versions["gliner"] == "0.2.26"
     # Exact bundle pins stay requirements, not constraints.
     assert not any(line.startswith("pillow==") for line in constraints)
     assert not any(line.startswith("gliformer==") for line in constraints)
     assert all("[" not in line for line in constraints)
-    assert "chromadb==1.5.9" not in constraints
+    assert f"chromadb=={parsed.versions['chromadb']}" not in constraints
+    # The public torch pin must not import the cu129 wheel's nvidia stack.
+    assert not any(line.startswith("nvidia-cublas-cu12==") for line in constraints)
 
 
 def test_constraints_pin_transitive_closure_not_the_whole_lock() -> None:
@@ -235,7 +235,7 @@ version = "6.0.0"
     assert all(";" not in line for line in constraints)
 
 
-def test_exact_override_neighbors_stay_pinned_when_a_rejected_range_does_not() -> None:
+def test_exact_override_neighbors_stay_pinned_only_when_the_pin_matches_the_lock() -> None:
     lock = """
 version = 1
 [[package]]
@@ -243,6 +243,14 @@ name = "kept"
 version = "1.0.0"
 dependencies = [
     { name = "shared" },
+]
+
+[[package]]
+name = "matched"
+version = "1.0.0"
+dependencies = [
+    { name = "matched-neighbor" },
+    { name = "contested" },
 ]
 
 [[package]]
@@ -266,6 +274,10 @@ name = "neighbor"
 version = "2.0.0"
 
 [[package]]
+name = "matched-neighbor"
+version = "2.1.0"
+
+[[package]]
 name = "shared"
 version = "3.0.0"
 
@@ -278,16 +290,105 @@ name = "contested"
 version = "7.0.0"
 """
     constraints = lock_constraint_lines(
-        ["kept>=1,<2", "pinned-override==9.9.9", "moved>=5,<6"],
+        ["kept>=1,<2", "matched==1.0.0", "pinned-override==9.9.9", "moved>=5,<6"],
         parse_uv_lock(lock),
     )
     assert "kept==1.0.0" in constraints
     assert "shared==3.0.0" in constraints
-    assert "neighbor==2.0.0" in constraints
+    assert "matched-neighbor==2.1.0" in constraints
+    assert "neighbor==2.0.0" not in constraints
+    assert not any(line.startswith("matched==") for line in constraints)
     assert not any(line.startswith("pinned-override==") for line in constraints)
     assert not any(line.startswith("moved==") for line in constraints)
     assert "old-only==5.0.0" not in constraints
     assert "contested==7.0.0" not in constraints
+
+
+def test_public_prefix_constraint_ignores_local_build_edges() -> None:
+    lock = """
+version = 1
+[[package]]
+name = "torch"
+version = "2.9.1"
+dependencies = [
+    { name = "filelock" },
+]
+
+[[package]]
+name = "torch"
+version = "2.9.1+cu129"
+dependencies = [
+    { name = "filelock" },
+    { name = "nvidia-cublas-cu12" },
+]
+
+[[package]]
+name = "filelock"
+version = "3.0.0"
+
+[[package]]
+name = "nvidia-cublas-cu12"
+version = "12.9.1.4"
+
+[[package]]
+name = "torch-local-only"
+version = "2.9.1+cu129"
+dependencies = [
+    { name = "nvidia-cublas-cu12" },
+]
+
+[[package]]
+name = "torch-local-only"
+version = "2.9.1+cu130"
+dependencies = [
+    { name = "nvidia-cublas-cu13" },
+]
+
+[[package]]
+name = "nvidia-cublas-cu13"
+version = "13.0.0"
+"""
+    parsed = parse_uv_lock(lock)
+    assert parsed.versions["torch"] == "2.9.1.*"
+    assert parsed.versions["torch-local-only"] == "2.9.1.*"
+    public = lock_constraint_lines(["torch>=2.9,<2.10"], parsed)
+    assert "torch==2.9.1.*" in public
+    assert "filelock==3.0.0" in public
+    assert "nvidia-cublas-cu12==12.9.1.4" not in public
+    local_only = lock_constraint_lines(["torch-local-only>=2.9,<2.10"], parsed)
+    assert "torch-local-only==2.9.1.*" in local_only
+    assert "nvidia-cublas-cu12==12.9.1.4" not in local_only
+    assert "nvidia-cublas-cu13==13.0.0" not in local_only
+
+
+def test_sole_local_build_keeps_its_own_edges() -> None:
+    lock = """
+version = 1
+[[package]]
+name = "torch"
+version = "2.9.1+cu129"
+dependencies = [
+    { name = "nvidia-cublas-cu12" },
+]
+
+[[package]]
+name = "nvidia-cublas-cu12"
+version = "12.9.1.4"
+"""
+    constraints = lock_constraint_lines(["torch>=2.9,<2.10"], parse_uv_lock(lock))
+    assert "torch==2.9.1+cu129" in constraints
+    assert "nvidia-cublas-cu12==12.9.1.4" in constraints
+
+
+def test_moved_exact_pins_do_not_contribute_lock_edges() -> None:
+    parsed = parse_uv_lock(_REPO_ROOT / "uv.lock")
+    constraints = lock_constraint_lines(_bundle_requirements("tensorrt-llm"), parsed)
+
+    assert f"huggingface-hub=={parsed.versions['huggingface-hub']}" not in constraints
+    assert f"setuptools=={parsed.versions['setuptools']}" not in constraints
+    assert not any(line.startswith("nvidia-cublas-cu12==") for line in constraints)
+    assert not any(line.startswith("torch==") for line in constraints)
+    assert not any(line.startswith("transformers==") for line in constraints)
 
 
 def test_multiple_public_versions_are_skipped_without_raising() -> None:
