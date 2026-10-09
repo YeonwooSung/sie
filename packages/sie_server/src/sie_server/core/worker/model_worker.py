@@ -110,6 +110,53 @@ class _InFlightBatch:
         return owner is None or owner.done() or owner.cancelling() > 0
 
 
+def _has_releasable_memory(adapter: object) -> bool:
+    """Lock-free adapter predicate. False when release would free nothing."""
+    predicate = getattr(adapter, "has_releasable_memory", None)
+    if not callable(predicate):
+        return False
+    try:
+        return bool(predicate())
+    except Exception:
+        logger.exception("has_releasable_memory failed; treating the adapter as holding nothing")
+        return False
+
+
+def _released_bytes(value: object) -> int:
+    """Normalize an adapter release count. Non-positive or non-int is nothing."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return 0
+    return value
+
+
+def _lock_can_acquire_now(lock: asyncio.Lock) -> bool:
+    """Whether ``await lock.acquire()`` would return without suspending.
+
+    ``Lock.locked()`` is false in the window after ``release()`` where a
+    waiter has been woken but has not resumed and taken the lock.
+    ``acquire()`` still waits behind that waiter. asyncio has no public
+    try-acquire; this matches the fast path in CPython's ``Lock.acquire``.
+    """
+    if lock.locked():
+        return False
+    waiters = getattr(lock, "_waiters", None)
+    return waiters is None or all(waiter.cancelled() for waiter in waiters)
+
+
+def _slots_can_acquire_all(slots: asyncio.Semaphore, needed: int) -> bool:
+    """Whether ``needed`` semaphore permits can be taken without suspending.
+
+    ``Semaphore.locked()`` is true when the value is zero or a waiter is
+    queued, so it does not say that every permit is free. A positive value
+    with a waiter still blocks in ``acquire``.
+    """
+    waiters = getattr(slots, "_waiters", None)
+    if waiters and any(not waiter.cancelled() for waiter in waiters):
+        return False
+    available = getattr(slots, "_value", None)
+    return isinstance(available, int) and not isinstance(available, bool) and available >= needed
+
+
 def _dispatch_width(adapter: object) -> int:
     """Batches a worker may run at once through ``adapter`` (see ``BaseAdapter``)."""
     declared = getattr(adapter, "max_concurrent_dispatch", None)
@@ -499,30 +546,38 @@ class ModelWorker:
     async def release_optional_memory(self, *, block: bool = True) -> int:
         """Drop optional device memory on an inference thread.
 
-        Serialized with forwards the same way dispatch is: the adapter
-        dispatch lock when one batch runs at a time, and every dispatch slot
-        when several do. ``block=False`` returns 0 instead of waiting, so a
-        caller that already holds another model's lock cannot deadlock
-        against this one.
+        Returns before taking the dispatch lock when the adapter has nothing
+        to release, so a no-op adapter is never locked on a monitor tick.
+        Serialized with forwards once a release does run: the adapter dispatch
+        lock when one batch runs at a time, and every dispatch slot when
+        several do. ``block=False`` never waits. A busy model is skipped, so
+        a caller that already holds another model's lock cannot deadlock
+        against this one, and the memory monitor is not stalled behind an
+        in-flight batch.
 
         Returns:
             Best-effort bytes released, or 0 when there is nothing to drop,
             the worker is busy and ``block`` is false, or the executor has
             shut down.
         """
+        if not _has_releasable_memory(self._adapter):
+            return 0
         if self._dispatch_width > 1:
             return await self._release_optional_memory_with_slots(block=block)
-        if not block and self._adapter_dispatch_lock.locked():
+        if not block and not _lock_can_acquire_now(self._adapter_dispatch_lock):
             return 0
-        async with self._adapter_dispatch_lock:
+        await self._adapter_dispatch_lock.acquire()
+        try:
             return await self._invoke_release_optional_memory()
+        finally:
+            self._adapter_dispatch_lock.release()
 
     async def _release_optional_memory_with_slots(self, *, block: bool) -> int:
+        if not block and not _slots_can_acquire_all(self._dispatch_slots, self._dispatch_width):
+            return 0
         acquired = 0
         try:
             for _ in range(self._dispatch_width):
-                if not block and self._dispatch_slots.locked():
-                    return 0
                 await self._dispatch_slots.acquire()
                 acquired += 1
             return await self._invoke_release_optional_memory()
@@ -545,9 +600,7 @@ class ModelWorker:
                 self._model_name,
             )
             return 0
-        if isinstance(released, bool) or not isinstance(released, int) or released <= 0:
-            return 0
-        return released
+        return _released_bytes(released)
 
     def _fail_queued_requests(self) -> int:
         """Fail every request the worker still owes an answer. Returns the count.

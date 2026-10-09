@@ -72,6 +72,9 @@ _ERR_MODEL_NOT_LOADED = "Model '{name}' is not loaded"
 _ERR_MODEL_ALREADY_LOADED = "Model '{name}' is already loaded"
 
 _ENGINE_STABLE_UPTIME_S = 600.0
+# Same bound as ``evict_lru_excluding``'s load-lock wait. A graph drop finishes
+# well inside it; a stuck adapter must not pin the memory monitor past it.
+_OPTIONAL_MEMORY_RELEASE_TIMEOUT_S = 5.0
 
 
 class _ConfigChangedDuringLoadError(RuntimeError):
@@ -150,6 +153,22 @@ def _engine_exit_code(adapter: ModelAdapter) -> int | None:
     if isinstance(exit_code, bool) or not isinstance(exit_code, int):
         return None
     return exit_code
+
+
+def _adapter_has_releasable_memory(adapter: ModelAdapter) -> bool:
+    """Whether the adapter can drop optional memory without taking its lock."""
+    try:
+        return bool(adapter.has_releasable_memory())
+    except Exception:
+        logger.exception("has_releasable_memory failed; treating the adapter as holding nothing")
+        return False
+
+
+def _released_bytes(value: object) -> int:
+    """Normalize an adapter release count. Non-positive or non-int is nothing."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return 0
+    return value
 
 
 def _adapter_load_required_bytes(adapter: ModelAdapter, memory_manager: MemoryManager) -> int | None:
@@ -364,6 +383,10 @@ class ModelRegistry:
         # Background memory monitor
         self._monitor_task: asyncio.Task[None] | None = None
         self._monitor_running = False
+        # Optional-memory releases still running after the monitor stopped
+        # waiting. Unloading one of these would join the inference thread the
+        # release is on and pin the monitor, so eviction skips them.
+        self._optional_release_tasks: dict[str, asyncio.Task[int]] = {}
 
         # Background idle-evictor (proactive cold-model unload). None unless
         # ``engine_config.idle_evict_s`` is set.
@@ -2900,8 +2923,9 @@ class ModelRegistry:
         Used by OOM recovery while the caller still holds its own adapter
         lock, so that model is skipped and siblings are released without
         waiting: a peer recovery holding its lock cannot deadlock this one.
-        Least recently used first, on the caller's device. Zero means nothing
-        was released; ``EVICT_LRU`` must still run.
+        Adapters with nothing releasable are not locked. Least recently used
+        first, on the caller's device. Zero means nothing was released;
+        ``EVICT_LRU`` must still run.
         """
         manager = self._memory_manager_for_model(exclude_name)
         return await self._release_optional_memory_on(manager, exclude_name=exclude_name, block=False)
@@ -2918,6 +2942,9 @@ class ModelRegistry:
         When ``exclude_name`` is None (the memory monitor), stop once pressure
         has cleared. OOM recovery passes the caller and does not consult
         pressure: an allocation can fail below the monitor threshold.
+        ``block=False`` skips a model whose inference lock is busy instead of
+        waiting for its in-flight batches. Either way the wait for a release
+        that does start is bounded; timing out does not unload the model.
         """
         total = 0
         for name in list(manager.loaded_models):
@@ -2926,7 +2953,7 @@ class ModelRegistry:
             if name == exclude_name or name in self._unloading:
                 continue
             loaded = self._loaded.get(name)
-            if loaded is None:
+            if loaded is None or not _adapter_has_releasable_memory(loaded.adapter):
                 continue
             released = await self._release_loaded_optional_memory(name, loaded, block=block)
             if released <= 0:
@@ -2940,25 +2967,63 @@ class ModelRegistry:
             )
         return total
 
+    def _optional_release_inflight(self) -> frozenset[str]:
+        """Models whose optional-memory release is still running, lowercased."""
+        return frozenset(name.lower() for name, task in self._optional_release_tasks.items() if not task.done())
+
     async def _release_loaded_optional_memory(self, name: str, loaded: LoadedModel, *, block: bool) -> int:
         """Run one adapter's ``release_optional_memory`` off the event loop.
 
         Prefers the model worker so the call sits on the inference thread,
         under the same adapter lock dispatch uses. A worker-less adapter
         (tests, or a load that has not attached one) runs on the default
-        executor, matching ``adapter.unload()``.
+        executor only when ``block`` is true, matching ``adapter.unload()``.
+        ``block=False`` does not ``to_thread`` that call: the adapter can
+        block on a lock the inference thread still holds.
+
+        The wait is bounded. On timeout the release keeps the dispatch lock
+        until the adapter call returns, and this method returns 0 so the
+        caller can move on. A later eviction must skip ``name`` while that
+        task is running; joining the inference thread would pin the monitor.
         """
+        inflight = self._optional_release_tasks.get(name)
+        if inflight is not None and not inflight.done():
+            return 0
+        task = asyncio.create_task(
+            self._run_optional_memory_release(name, loaded, block=block),
+            name=f"optional-memory-{name}",
+        )
+        self._optional_release_tasks[name] = task
         try:
-            if loaded.worker is not None:
-                released = await loaded.worker.release_optional_memory(block=block)
-            else:
-                released = await asyncio.to_thread(loaded.adapter.release_optional_memory)
+            return await asyncio.wait_for(asyncio.shield(task), _OPTIONAL_MEMORY_RELEASE_TIMEOUT_S)
+        except TimeoutError:
+            logger.warning(
+                "Optional-memory release for '%s' timed out after %.1fs; continuing",
+                name,
+                _OPTIONAL_MEMORY_RELEASE_TIMEOUT_S,
+            )
+            return 0
         except Exception:
             logger.exception("release_optional_memory failed for '%s'; continuing", name)
             return 0
-        if isinstance(released, bool) or not isinstance(released, int) or released <= 0:
-            return 0
-        return released
+
+    async def _run_optional_memory_release(self, name: str, loaded: LoadedModel, *, block: bool) -> int:
+        released = 0
+        try:
+            if loaded.worker is not None:
+                released = await loaded.worker.release_optional_memory(block=block)
+            elif block:
+                # No worker to skip when its inference lock is busy. Blocking
+                # callers still run the adapter off the event loop.
+                released = await asyncio.to_thread(loaded.adapter.release_optional_memory)
+        except Exception:
+            logger.exception("release_optional_memory failed for '%s'; continuing", name)
+            released = 0
+        finally:
+            current = self._optional_release_tasks.get(name)
+            if current is asyncio.current_task():
+                self._optional_release_tasks.pop(name, None)
+        return _released_bytes(released)
 
     async def start_memory_monitor(self) -> None:
         """Start the background memory monitor task.
@@ -3188,8 +3253,13 @@ class ModelRegistry:
         """Reap exited engines, drop optional caches, then evict under pressure.
 
         Optional memory (CUDA graphs and similar) is released from loaded
-        models, least recently used first, before any model is unloaded. A
-        model is evicted only if pressure remains after those releases.
+        models that are actually holding some, least recently used first,
+        before any model is unloaded. Adapters with nothing to drop are not
+        locked. A busy model is skipped rather than draining its in-flight
+        batches. A model is evicted only if pressure remains after those
+        releases. A release that times out is not itself a reason to unload,
+        and a model whose release is still running is left resident so the
+        monitor does not join that inference thread.
         """
         while self._monitor_running:
             try:
@@ -3211,7 +3281,9 @@ class ModelRegistry:
                         await self._wait_for_unloads()
                         if not manager.check_pressure():
                             break
-                        await self._release_optional_memory_on(manager, exclude_name=None, block=True)
+                        # Adapters with nothing cached are not locked. A busy model is
+                        # skipped instead of draining its in-flight batches.
+                        await self._release_optional_memory_on(manager, exclude_name=None, block=False)
                         async with lock:
                             # Re-check under lock (may have resolved)
                             if not manager.check_pressure():
@@ -3225,7 +3297,12 @@ class ModelRegistry:
                                 )
                                 break
 
-                            lru_model = manager.get_lru_model(exclude=self._pinned_models)
+                            # A timed-out release still holds the inference thread.
+                            # Joining it from unload would pin the monitor, and
+                            # the timeout itself is not a reason to unload.
+                            lru_model = manager.get_lru_model(
+                                exclude=self._pinned_models | self._optional_release_inflight()
+                            )
                             if lru_model is None:
                                 break
 

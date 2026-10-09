@@ -982,6 +982,290 @@ class TestProactiveEviction:
         assert all("inference" in event[2] for event in released)
         assert order[first_unload][1] == "model-a"
 
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_memory_monitor_does_not_evict_when_release_clears_pressure(
+        self,
+        mock_load_adapter: MagicMock,
+        mock_adapter_factory: Callable[[], MagicMock],
+    ) -> None:
+        """A release that clears pressure leaves every model loaded."""
+        registry = ModelRegistry(
+            memory_config=MemoryConfig(
+                pressure_threshold=0.95,
+                memory_check_interval_s=0.005,
+            ),
+        )
+        for name in ("model-a", "model-b"):
+            registry.add_config(_make_config(name=name, hf_id=f"org/{name}"))
+
+        pressure = False
+        events: list[str] = []
+
+        def check_pressure() -> bool:
+            return pressure
+
+        def release() -> int:
+            nonlocal pressure
+            pressure = False
+            events.append("release")
+            return 4096
+
+        def unload() -> None:
+            events.append("unload")
+
+        adapters = [mock_adapter_factory(), mock_adapter_factory()]
+        for adapter in adapters:
+            adapter.has_releasable_memory.return_value = True
+            adapter.release_optional_memory.side_effect = release
+            adapter.unload.side_effect = unload
+        mock_load_adapter.side_effect = adapters
+
+        registry._memory_manager.check_pressure = MagicMock(side_effect=check_pressure)
+        await registry.load_async("model-a", "cpu")
+        await registry.load_async("model-b", "cpu")
+        pressure = True
+
+        await registry.start_memory_monitor()
+        try:
+            deadline = asyncio.get_running_loop().time() + 1
+            while events != ["release"]:
+                if asyncio.get_running_loop().time() > deadline:
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            await registry.stop_memory_monitor()
+
+        assert events == ["release"]
+        assert registry.is_loaded("model-a")
+        assert registry.is_loaded("model-b")
+
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_memory_monitor_does_not_lock_a_noop_adapter(
+        self,
+        mock_load_adapter: MagicMock,
+        mock_adapter_factory: Callable[[], MagicMock],
+    ) -> None:
+        """A no-op adapter is not locked, even while its inference lock is held."""
+        registry = ModelRegistry(
+            memory_config=MemoryConfig(
+                pressure_threshold=0.95,
+                memory_check_interval_s=0.005,
+            ),
+        )
+        for name in ("model-a", "model-b"):
+            registry.add_config(_make_config(name=name, hf_id=f"org/{name}"))
+
+        adapters = [mock_adapter_factory(), mock_adapter_factory()]
+        for adapter in adapters:
+            adapter.has_releasable_memory.return_value = False
+            adapter.release_optional_memory.side_effect = AssertionError("noop adapter was released")
+        mock_load_adapter.side_effect = adapters
+
+        registry._memory_manager.check_pressure = MagicMock(return_value=False)
+        await registry.load_async("model-a", "cpu")
+        await registry.load_async("model-b", "cpu")
+        registry._memory_manager.check_pressure = MagicMock(return_value=True)
+
+        worker = registry._loaded["model-a"].worker
+        assert worker is not None
+        await worker._adapter_dispatch_lock.acquire()
+        try:
+            await registry.start_memory_monitor()
+            try:
+                deadline = asyncio.get_running_loop().time() + 1
+                while registry.is_loaded("model-a"):
+                    if asyncio.get_running_loop().time() > deadline:
+                        break
+                    await asyncio.sleep(0.01)
+            finally:
+                await registry.stop_memory_monitor()
+            waiters = worker._adapter_dispatch_lock._waiters
+            assert waiters is None or all(waiter.cancelled() for waiter in waiters)
+        finally:
+            worker._adapter_dispatch_lock.release()
+
+        assert not registry.is_loaded("model-a")
+        assert registry.is_loaded("model-b")
+        for adapter in adapters:
+            adapter.release_optional_memory.assert_not_called()
+
+    @patch("sie_server.core.registry._OPTIONAL_MEMORY_RELEASE_TIMEOUT_S", 0.05)
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_memory_monitor_timeout_does_not_block_or_unload_for_the_timeout(
+        self,
+        mock_load_adapter: MagicMock,
+        mock_adapter_factory: Callable[[], MagicMock],
+    ) -> None:
+        """A stuck release is abandoned and is not itself a reason to unload."""
+        registry = ModelRegistry(
+            memory_config=MemoryConfig(
+                pressure_threshold=0.95,
+                memory_check_interval_s=0.005,
+            ),
+        )
+        for name in ("model-a", "model-b"):
+            registry.add_config(_make_config(name=name, hf_id=f"org/{name}"))
+
+        release_gate = threading.Event()
+        started = threading.Event()
+
+        def release_a() -> int:
+            started.set()
+            release_gate.wait()
+            return 4096
+
+        def release_b() -> int:
+            return 0
+
+        adapter_a = mock_adapter_factory()
+        adapter_b = mock_adapter_factory()
+        adapter_a.has_releasable_memory.return_value = True
+        adapter_b.has_releasable_memory.return_value = True
+        adapter_a.release_optional_memory.side_effect = release_a
+        adapter_b.release_optional_memory.side_effect = release_b
+        mock_load_adapter.side_effect = [adapter_a, adapter_b]
+
+        registry._memory_manager.check_pressure = MagicMock(return_value=False)
+        await registry.load_async("model-a", "cpu")
+        await registry.load_async("model-b", "cpu")
+        registry._memory_manager.check_pressure = MagicMock(return_value=True)
+
+        await registry.start_memory_monitor()
+        try:
+            deadline = asyncio.get_running_loop().time() + 1
+            while registry.is_loaded("model-b"):
+                if asyncio.get_running_loop().time() > deadline:
+                    break
+                await asyncio.sleep(0.01)
+            assert started.is_set()
+            assert registry.is_loaded("model-a")
+            assert not registry.is_loaded("model-b")
+            adapter_a.unload.assert_not_called()
+            adapter_b.unload.assert_called_once()
+        finally:
+            await registry.stop_memory_monitor()
+            release_gate.set()
+            pending = [task for task in registry._optional_release_tasks.values() if not task.done()]
+            if pending:
+                await asyncio.wait_for(asyncio.gather(*pending), 1)
+
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_memory_monitor_skips_a_busy_model_without_blocking(
+        self,
+        mock_load_adapter: MagicMock,
+        mock_adapter_factory: Callable[[], MagicMock],
+    ) -> None:
+        """A model whose inference lock is held is skipped, not drained."""
+        registry = ModelRegistry(
+            memory_config=MemoryConfig(
+                pressure_threshold=0.95,
+                memory_check_interval_s=0.005,
+            ),
+        )
+        for name in ("model-a", "model-b"):
+            registry.add_config(_make_config(name=name, hf_id=f"org/{name}"))
+
+        adapter_a = mock_adapter_factory()
+        adapter_b = mock_adapter_factory()
+        adapter_a.has_releasable_memory.return_value = True
+        adapter_b.has_releasable_memory.return_value = True
+        adapter_a.release_optional_memory.side_effect = AssertionError("busy adapter was released")
+        adapter_b.release_optional_memory.return_value = 0
+        mock_load_adapter.side_effect = [adapter_a, adapter_b]
+
+        registry._memory_manager.check_pressure = MagicMock(return_value=False)
+        await registry.load_async("model-a", "cpu")
+        await registry.load_async("model-b", "cpu")
+        registry._memory_manager.check_pressure = MagicMock(return_value=True)
+
+        worker = registry._loaded["model-a"].worker
+        assert worker is not None
+        await worker._adapter_dispatch_lock.acquire()
+        try:
+            await registry.start_memory_monitor()
+            try:
+                deadline = asyncio.get_running_loop().time() + 1
+                while registry.is_loaded("model-a"):
+                    if asyncio.get_running_loop().time() > deadline:
+                        break
+                    await asyncio.sleep(0.01)
+            finally:
+                await registry.stop_memory_monitor()
+        finally:
+            worker._adapter_dispatch_lock.release()
+            worker._inference_executor.shutdown(wait=False, cancel_futures=True)
+
+        assert not registry.is_loaded("model-a")
+        assert registry.is_loaded("model-b")
+        adapter_a.release_optional_memory.assert_not_called()
+
+    async def test_nonblocking_release_does_not_wait_behind_a_lock_waiter(self) -> None:
+        """``block=False`` returns when a waiter already owns the next turn of the lock."""
+        from sie_server.core.worker import ModelWorker
+
+        adapter = MagicMock()
+        adapter.has_releasable_memory.return_value = True
+        adapter.release_optional_memory.side_effect = AssertionError("release ran behind a waiter")
+        worker = ModelWorker(adapter, model_name="busy")
+        await worker._adapter_dispatch_lock.acquire()
+        release_waiter = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def waiter() -> None:
+            entered.set()
+            async with worker._adapter_dispatch_lock:
+                await release_waiter.wait()
+
+        queued = asyncio.create_task(waiter())
+        await entered.wait()
+        await asyncio.sleep(0)
+
+        async def release_after_unlock() -> int:
+            # Drop the lock without yielding, so ``locked()`` is false while the
+            # waiter is still queued. A blocking acquire would sit behind it.
+            worker._adapter_dispatch_lock.release()
+            return await worker.release_optional_memory(block=False)
+
+        try:
+            released = await asyncio.wait_for(release_after_unlock(), 0.5)
+            assert released == 0
+            adapter.release_optional_memory.assert_not_called()
+        finally:
+            release_waiter.set()
+            await asyncio.wait_for(queued, 1)
+            worker._inference_executor.shutdown(wait=False, cancel_futures=True)
+
+    async def test_nonblocking_release_skips_a_worker_with_a_busy_slot(self) -> None:
+        """Concurrent dispatch does not collect every slot when one batch is in flight."""
+        from sie_server.core.worker import ModelWorker
+
+        class _Wide:
+            def max_concurrent_dispatch(self) -> int:
+                return 2
+
+            def supports_lora(self) -> bool:
+                return False
+
+            def has_releasable_memory(self) -> bool:
+                return True
+
+            def release_optional_memory(self) -> int:
+                raise AssertionError("release ran while a slot was held")
+
+            def set_active_lora(self, _lora: object) -> None:
+                return None
+
+        adapter = _Wide()
+        worker = ModelWorker(adapter, model_name="wide")
+        await worker._dispatch_slots.acquire()
+        try:
+            released = await asyncio.wait_for(worker.release_optional_memory(block=False), 0.5)
+        finally:
+            worker._dispatch_slots.release()
+            worker._inference_executor.shutdown(wait=False, cancel_futures=True)
+
+        assert released == 0
+
     async def test_memory_monitor_starts_and_stops(self) -> None:
         """Memory monitor can be started and stopped cleanly."""
         from sie_server.core.memory import MemoryConfig

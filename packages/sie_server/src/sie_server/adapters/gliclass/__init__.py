@@ -1078,11 +1078,30 @@ class GLiClassAdapter(BaseAdapter):
                 self.release_optional_memory()
             raise
 
+    def has_releasable_memory(self) -> bool:
+        """True only when the graph runner is holding graphs or their buffers.
+
+        A missing runner, or one that has not recorded anything, has nothing
+        to drop. The counters are read without the runner lock: the monitor
+        calls this on the event loop and must not block behind a forward.
+        """
+        runner = self._graphs
+        if runner is None:
+            return False
+        try:
+            return runner.graph_count > 0 or runner.held_bytes > 0
+        except RuntimeError:
+            # The inference thread may be mutating the runner's tables.
+            # Skipping this tick is safer than taking the dispatch lock.
+            return False
+
     def release_optional_memory(self) -> int:
         """Drop recorded CUDA graphs and return their accounted bytes.
 
         Uses the runner's ``clear()`` path, then ``torch.cuda.empty_cache()``
         when CUDA is available, so the graph pool can return to the device.
+        ``empty_cache`` runs only after graphs or accounted bytes were
+        actually dropped. Nothing held means no ``clear`` and no CUDA call.
         The count is ``CudaGraphRunner.held_bytes`` from before the clear:
         the runner's own tally of pool growth and recorded graphs, not a
         driver query. Without a GPU the bytes actually freed are not
@@ -1090,7 +1109,7 @@ class GLiClassAdapter(BaseAdapter):
         0 when no runner exists, which does not touch CUDA.
         """
         runner = self._graphs
-        if runner is None:
+        if runner is None or not self.has_releasable_memory():
             return 0
         released = runner.held_bytes
         runner.clear()
@@ -1099,6 +1118,8 @@ class GLiClassAdapter(BaseAdapter):
                 torch.cuda.empty_cache()
             except Exception:
                 logger.exception("GLiClass CUDA graph release could not empty the CUDA cache")
+        if isinstance(released, bool) or not isinstance(released, int) or released <= 0:
+            return 0
         return released
 
     def _graph_runner(self, pipe: Any, tokenizer: PreTrainedTokenizerBase) -> CudaGraphRunner | None:
