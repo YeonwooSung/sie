@@ -43,13 +43,11 @@ MAX_RECORD_SPANS = 65536
 MAX_RECORD_WORDS = 262144
 # Characters of that field text (#378). The word cap counts every token as
 # one word, so it does not bound one very long token. Decoded text joins
-# tokens with spaces. Four characters a word, which is what 1_048_576 was,
-# rejects ordinary words while the word count is still under the cap.
-# 2048 is the document length in words from the measurements above, used
-# here as the most characters one ordinary token may take. A document of
-# shorter tokens reaches the word cap first. One token longer than that
-# is the case this bound exists for.
-MAX_RECORD_CHARS = MAX_RECORD_WORDS * 2048
+# tokens with spaces. 32 characters per word keeps normal text on the word
+# cap first. Many ordinary English words are longer than 16 characters, so
+# 32 is used instead of 16: it is the top of that range. A token longer
+# than 32 characters is what this bound is for.
+MAX_RECORD_CHARS = MAX_RECORD_WORDS * 32
 
 
 def make_structuring_decode(

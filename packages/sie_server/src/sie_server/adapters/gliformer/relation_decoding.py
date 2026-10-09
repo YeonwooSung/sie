@@ -33,11 +33,10 @@ MAX_RELATIONS = 65536
 # copies both endpoints' text, and endpoints can be long.
 MAX_RELATION_WORDS = 262144
 # Characters of that head and tail text (#378). Same rule as the record cap:
-# the word cap counts a token as one word, and four characters a word rejects
-# ordinary text first. 2048 is the measured document length in words, used as
-# the most characters one ordinary token may take. Shorter tokens reach the
-# word cap first.
-MAX_RELATION_CHARS = MAX_RELATION_WORDS * 2048
+# 32 characters per word, so ordinary text hits the word cap first while a
+# long token is bounded. Many ordinary English words are longer than 16
+# characters, so 32 is used instead of 16: it is the top of that range.
+MAX_RELATION_CHARS = MAX_RELATION_WORDS * 32
 # Allowance units per kept relation (building it) and per scored cell.
 RELATION_UNITS = 2
 _CELLS_PER_UNIT = 1024

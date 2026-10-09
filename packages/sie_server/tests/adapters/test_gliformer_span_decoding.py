@@ -511,7 +511,7 @@ def test_record_text_is_bounded_by_characters() -> None:
     short = span(start=1, end=1, entity_type="b", score=0.4)
     slots = [(0, [long]), (1, [short])]
     tokens = ["x" * 30, "ok"]
-    assert structuring_decoding.MAX_RECORD_CHARS == structuring_decoding.MAX_RECORD_WORDS * 2048
+    assert structuring_decoding.MAX_RECORD_CHARS == structuring_decoding.MAX_RECORD_WORDS * 32
     assert structuring_decoding._within_word_limit(slots, 10, tokens=tokens, max_chars=40) is slots
     # Best first is the 30-character token. It does not fit in 20, so taking stops
     # and the later short span is dropped too, as an over-word span would be.
@@ -530,12 +530,24 @@ def test_record_text_is_bounded_by_characters() -> None:
 
 
 def test_ordinary_words_reach_the_word_cap_before_the_character_cap() -> None:
-    """Eight-letter words are ordinary. A full word cap of them, plus the joining spaces, fits."""
+    """An 8-letter word still hits the word cap first (8 < 32).
+
+    A token longer than 32 characters is what the character cap is for.
+    """
     ordinary = 8
+    assert ordinary < 32
     words = structuring_decoding.MAX_RECORD_WORDS
+    # A full word cap of 8-letter words, plus the joining spaces, stays under the character cap.
     joined = words * ordinary + (words - 1)
     assert joined < structuring_decoding.MAX_RECORD_CHARS
-    assert relation_decoding.MAX_RELATION_CHARS == relation_decoding.MAX_RELATION_WORDS * 2048
+    assert (
+        relation_decoding.MAX_RELATION_WORDS * ordinary + (relation_decoding.MAX_RELATION_WORDS - 1)
+        < relation_decoding.MAX_RELATION_CHARS
+    )
+    # The same number of tokens, each longer than 32 characters, exceeds the character cap first.
+    assert words * (32 + 1) > structuring_decoding.MAX_RECORD_CHARS
+    assert relation_decoding.MAX_RELATION_WORDS * (32 + 1) > relation_decoding.MAX_RELATION_CHARS
+    assert relation_decoding.MAX_RELATION_CHARS == relation_decoding.MAX_RELATION_WORDS * 32
 
 
 class _TracingTokens(list[str]):
@@ -947,7 +959,7 @@ def test_relation_text_is_bounded_by_characters() -> None:
     short = span(start=1, end=1, entity_type="b", score=1.0)
     entities = [long, short]
     texts = [["y" * 30, "ok"]]
-    assert relation_decoding.MAX_RELATION_CHARS == relation_decoding.MAX_RELATION_WORDS * 2048
+    assert relation_decoding.MAX_RELATION_CHARS == relation_decoding.MAX_RELATION_WORDS * 32
 
     def rows(scores: list[float], *, max_chars: int, max_words: int = 10, row_texts: list[list[str]] = texts) -> list:
         return relation_decoding._row_relations(
