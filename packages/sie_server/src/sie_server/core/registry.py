@@ -26,7 +26,7 @@ from typing import Any
 from sie_sdk.storage import is_cloud_path
 
 from sie_server.adapters._generation_base import GenerationAdapter
-from sie_server.adapters.base import ModelAdapter
+from sie_server.adapters.base import ModelAdapter, released_bytes
 from sie_server.config.device_groups import resolve_device_group, validate_tensor_parallel_size
 from sie_server.config.engine import EngineConfig
 from sie_server.config.model import ModelConfig
@@ -162,13 +162,6 @@ def _adapter_has_releasable_memory(adapter: ModelAdapter) -> bool:
     except Exception:
         logger.exception("has_releasable_memory failed; treating the adapter as holding nothing")
         return False
-
-
-def _released_bytes(value: object) -> int:
-    """Normalize an adapter release count. Non-positive or non-int is nothing."""
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        return 0
-    return value
 
 
 def _adapter_load_required_bytes(adapter: ModelAdapter, memory_manager: MemoryManager) -> int | None:
@@ -2928,23 +2921,22 @@ class ModelRegistry:
         ``EVICT_LRU`` must still run.
         """
         manager = self._memory_manager_for_model(exclude_name)
-        return await self._release_optional_memory_on(manager, exclude_name=exclude_name, block=False)
+        return await self._release_optional_memory_on(manager, exclude_name=exclude_name)
 
     async def _release_optional_memory_on(
         self,
         manager: MemoryManager,
         *,
         exclude_name: str | None,
-        block: bool,
     ) -> int:
         """Release optional memory for ``manager``'s models, oldest first.
 
         When ``exclude_name`` is None (the memory monitor), stop once pressure
         has cleared. OOM recovery passes the caller and does not consult
         pressure: an allocation can fail below the monitor threshold.
-        ``block=False`` skips a model whose inference lock is busy instead of
-        waiting for its in-flight batches. Either way the wait for a release
-        that does start is bounded; timing out does not unload the model.
+        A model whose inference lock is busy is skipped instead of waiting
+        for its in-flight batches. The wait for a release that does start is
+        bounded; timing out does not unload the model.
         """
         total = 0
         for name in list(manager.loaded_models):
@@ -2955,7 +2947,7 @@ class ModelRegistry:
             loaded = self._loaded.get(name)
             if loaded is None or not _adapter_has_releasable_memory(loaded.adapter):
                 continue
-            released = await self._release_loaded_optional_memory(name, loaded, block=block)
+            released = await self._release_loaded_optional_memory(name, loaded)
             if released <= 0:
                 continue
             total += released
@@ -2971,15 +2963,14 @@ class ModelRegistry:
         """Models whose optional-memory release is still running, lowercased."""
         return frozenset(name.lower() for name, task in self._optional_release_tasks.items() if not task.done())
 
-    async def _release_loaded_optional_memory(self, name: str, loaded: LoadedModel, *, block: bool) -> int:
+    async def _release_loaded_optional_memory(self, name: str, loaded: LoadedModel) -> int:
         """Run one adapter's ``release_optional_memory`` off the event loop.
 
         Prefers the model worker so the call sits on the inference thread,
         under the same adapter lock dispatch uses. A worker-less adapter
-        (tests, or a load that has not attached one) runs on the default
-        executor only when ``block`` is true, matching ``adapter.unload()``.
-        ``block=False`` does not ``to_thread`` that call: the adapter can
-        block on a lock the inference thread still holds.
+        (tests, or a load that has not attached one) is skipped: running it
+        on the default executor can block on a lock the inference thread
+        still holds.
 
         The wait is bounded. On timeout the release keeps the dispatch lock
         until the adapter call returns, and this method returns 0 so the
@@ -2990,7 +2981,7 @@ class ModelRegistry:
         if inflight is not None and not inflight.done():
             return 0
         task = asyncio.create_task(
-            self._run_optional_memory_release(name, loaded, block=block),
+            self._run_optional_memory_release(name, loaded),
             name=f"optional-memory-{name}",
         )
         self._optional_release_tasks[name] = task
@@ -3007,15 +2998,11 @@ class ModelRegistry:
             logger.exception("release_optional_memory failed for '%s'; continuing", name)
             return 0
 
-    async def _run_optional_memory_release(self, name: str, loaded: LoadedModel, *, block: bool) -> int:
+    async def _run_optional_memory_release(self, name: str, loaded: LoadedModel) -> int:
         released = 0
         try:
             if loaded.worker is not None:
-                released = await loaded.worker.release_optional_memory(block=block)
-            elif block:
-                # No worker to skip when its inference lock is busy. Blocking
-                # callers still run the adapter off the event loop.
-                released = await asyncio.to_thread(loaded.adapter.release_optional_memory)
+                released = await loaded.worker.release_optional_memory()
         except Exception:
             logger.exception("release_optional_memory failed for '%s'; continuing", name)
             released = 0
@@ -3023,7 +3010,7 @@ class ModelRegistry:
             current = self._optional_release_tasks.get(name)
             if current is asyncio.current_task():
                 self._optional_release_tasks.pop(name, None)
-        return _released_bytes(released)
+        return released_bytes(released)
 
     async def start_memory_monitor(self) -> None:
         """Start the background memory monitor task.
@@ -3283,7 +3270,7 @@ class ModelRegistry:
                             break
                         # Adapters with nothing cached are not locked. A busy model is
                         # skipped instead of draining its in-flight batches.
-                        await self._release_optional_memory_on(manager, exclude_name=None, block=False)
+                        await self._release_optional_memory_on(manager, exclude_name=None)
                         async with lock:
                             # Re-check under lock (may have resolved)
                             if not manager.check_pressure():

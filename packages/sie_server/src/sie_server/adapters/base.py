@@ -15,6 +15,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def released_bytes(value: object) -> int:
+    """Normalize a ``release_optional_memory`` count. A bool is not a byte count.
+
+    ``bool`` is a subclass of ``int``, so ``True`` would otherwise count as one
+    byte. Non-integers and non-positive values release nothing.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return 0
+    return value
+
+
 class ModelCapabilities(BaseModel):
     """Capabilities supported by a model adapter."""
 

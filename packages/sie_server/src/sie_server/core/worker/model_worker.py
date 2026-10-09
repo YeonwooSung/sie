@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from sie_server.adapters.base import released_bytes
 from sie_server.core.adaptive_batching import (
     AdaptiveBatchController,
     AdaptiveBatchState,
@@ -120,13 +121,6 @@ def _has_releasable_memory(adapter: object) -> bool:
     except Exception:
         logger.exception("has_releasable_memory failed; treating the adapter as holding nothing")
         return False
-
-
-def _released_bytes(value: object) -> int:
-    """Normalize an adapter release count. Non-positive or non-int is nothing."""
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        return 0
-    return value
 
 
 def _lock_can_acquire_now(lock: asyncio.Lock) -> bool:
@@ -543,28 +537,26 @@ class ModelWorker:
                 await asyncio.shield(join)
             raise
 
-    async def release_optional_memory(self, *, block: bool = True) -> int:
+    async def release_optional_memory(self) -> int:
         """Drop optional device memory on an inference thread.
 
         Returns before taking the dispatch lock when the adapter has nothing
         to release, so a no-op adapter is never locked on a monitor tick.
         Serialized with forwards once a release does run: the adapter dispatch
         lock when one batch runs at a time, and every dispatch slot when
-        several do. ``block=False`` never waits. A busy model is skipped, so
-        a caller that already holds another model's lock cannot deadlock
-        against this one, and the memory monitor is not stalled behind an
-        in-flight batch.
+        several do. Never waits. A busy model is skipped, so a caller that
+        already holds another model's lock cannot deadlock against this one,
+        and the memory monitor is not stalled behind an in-flight batch.
 
         Returns:
             Best-effort bytes released, or 0 when there is nothing to drop,
-            the worker is busy and ``block`` is false, or the executor has
-            shut down.
+            the worker is busy, or the executor has shut down.
         """
         if not _has_releasable_memory(self._adapter):
             return 0
         if self._dispatch_width > 1:
-            return await self._release_optional_memory_with_slots(block=block)
-        if not block and not _lock_can_acquire_now(self._adapter_dispatch_lock):
+            return await self._release_optional_memory_with_slots()
+        if not _lock_can_acquire_now(self._adapter_dispatch_lock):
             return 0
         await self._adapter_dispatch_lock.acquire()
         try:
@@ -572,8 +564,8 @@ class ModelWorker:
         finally:
             self._adapter_dispatch_lock.release()
 
-    async def _release_optional_memory_with_slots(self, *, block: bool) -> int:
-        if not block and not _slots_can_acquire_all(self._dispatch_slots, self._dispatch_width):
+    async def _release_optional_memory_with_slots(self) -> int:
+        if not _slots_can_acquire_all(self._dispatch_slots, self._dispatch_width):
             return 0
         acquired = 0
         try:
@@ -600,7 +592,7 @@ class ModelWorker:
                 self._model_name,
             )
             return 0
-        return _released_bytes(released)
+        return released_bytes(released)
 
     def _fail_queued_requests(self) -> int:
         """Fail every request the worker still owes an answer. Returns the count.

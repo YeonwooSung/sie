@@ -1200,7 +1200,7 @@ class TestProactiveEviction:
         adapter_a.release_optional_memory.assert_not_called()
 
     async def test_nonblocking_release_does_not_wait_behind_a_lock_waiter(self) -> None:
-        """``block=False`` returns when a waiter already owns the next turn of the lock."""
+        """Release returns when a waiter already owns the next turn of the lock."""
         from sie_server.core.worker import ModelWorker
 
         adapter = MagicMock()
@@ -1222,9 +1222,9 @@ class TestProactiveEviction:
 
         async def release_after_unlock() -> int:
             # Drop the lock without yielding, so ``locked()`` is false while the
-            # waiter is still queued. A blocking acquire would sit behind it.
+            # waiter is still queued. Acquiring would sit behind that waiter.
             worker._adapter_dispatch_lock.release()
-            return await worker.release_optional_memory(block=False)
+            return await worker.release_optional_memory()
 
         try:
             released = await asyncio.wait_for(release_after_unlock(), 0.5)
@@ -1259,9 +1259,66 @@ class TestProactiveEviction:
         worker = ModelWorker(adapter, model_name="wide")
         await worker._dispatch_slots.acquire()
         try:
-            released = await asyncio.wait_for(worker.release_optional_memory(block=False), 0.5)
+            released = await asyncio.wait_for(worker.release_optional_memory(), 0.5)
         finally:
             worker._dispatch_slots.release()
+            worker._inference_executor.shutdown(wait=False, cancel_futures=True)
+
+        assert released == 0
+
+    async def test_idle_multi_slot_worker_releases_optional_memory(self) -> None:
+        """A wide worker drops optional memory once every dispatch slot is free."""
+        from sie_server.core.worker import ModelWorker
+
+        held_during_release: list[int] = []
+
+        class _Wide:
+            def max_concurrent_dispatch(self) -> int:
+                return 2
+
+            def supports_lora(self) -> bool:
+                return False
+
+            def has_releasable_memory(self) -> bool:
+                return True
+
+            def release_optional_memory(self) -> int:
+                held_during_release.append(worker._dispatch_slots._value)
+                return 4096
+
+            def set_active_lora(self, _lora: object) -> None:
+                return None
+
+        adapter = _Wide()
+        worker = ModelWorker(adapter, model_name="wide")
+        try:
+            released = await asyncio.wait_for(worker.release_optional_memory(), 0.5)
+        finally:
+            worker._inference_executor.shutdown(wait=False, cancel_futures=True)
+
+        assert worker._dispatch_width == 2
+        assert released == 4096
+        assert held_during_release == [0]
+        assert worker._dispatch_slots._value == 2
+
+    async def test_release_optional_memory_does_not_count_a_bool_as_bytes(self) -> None:
+        """``True`` is an ``int`` subclass and must not count as one released byte."""
+        from sie_server.core.worker import ModelWorker
+
+        class _BoolRelease:
+            def has_releasable_memory(self) -> bool:
+                return True
+
+            def release_optional_memory(self) -> bool:
+                return True
+
+            def set_active_lora(self, _lora: object) -> None:
+                return None
+
+        worker = ModelWorker(_BoolRelease(), model_name="bool-release")
+        try:
+            released = await asyncio.wait_for(worker.release_optional_memory(), 0.5)
+        finally:
             worker._inference_executor.shutdown(wait=False, cancel_futures=True)
 
         assert released == 0

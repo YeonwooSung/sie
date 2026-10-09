@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 
+from sie_server.adapters.base import released_bytes
 from sie_server.core.oom import (
     OomRecoveryAction,
     OomRecoveryConfig,
@@ -138,7 +139,7 @@ class BatchExecutor:
         self._stats = stats
         # The worker's own adapter. Called while recovery already excludes
         # other forwards (the adapter dispatch lock, or the inference thread
-        # is idle after the failed forward). None in tests that do not care.
+        # is idle after the failed forward).
         self._release_optional_memory = release_optional_memory
 
     async def run(
@@ -216,7 +217,6 @@ class BatchExecutor:
                 self._stats.cache_clears += 1
 
             elif action is OomRecoveryAction.EVICT_LRU:
-                # Same release as CACHE_CLEAR when that step did not run.
                 # A zero return must not skip eviction.
                 await self._release_sibling_optional_memory()
                 self._release_own_optional_memory()
@@ -464,11 +464,11 @@ class BatchExecutor:
         if release is None:
             return 0
         try:
-            released = release()
+            released = released_bytes(release())
         except Exception:
             logger.exception("OOM recovery: release_optional_memory raised; continuing")
             return 0
-        if isinstance(released, bool) or not isinstance(released, int) or released <= 0:
+        if released <= 0:
             return 0
         logger.info(
             "OOM recovery: released %d bytes of optional memory for model=%s",
@@ -489,14 +489,14 @@ class BatchExecutor:
         if registry is None:
             return 0
         try:
-            released = await registry.release_optional_memory(self._model_name)
+            released = released_bytes(await registry.release_optional_memory(self._model_name))
         except Exception:
             logger.exception(
                 "OOM recovery: release_optional_memory failed for siblings of %s; continuing",
                 self._model_name,
             )
             return 0
-        if isinstance(released, bool) or not isinstance(released, int) or released <= 0:
+        if released <= 0:
             return 0
         logger.info(
             "OOM recovery: released %d bytes of optional memory from siblings of %s",
