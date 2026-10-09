@@ -303,14 +303,16 @@ class EngineConfig(BaseSettings):
         Field(
             ge=0.0,
             description=(
-                "Tail window for a staggered burst that reaches an idle "
-                "worker (#2874, #373). A request that arrives alone is "
-                "dispatched immediately and is not held for this long. One "
-                "later item within this gap of the previous submit coalesces "
-                "with what follows it, and several items already pending "
-                "still form one batch. Bounded by max_batch_wait_ms. 0 "
-                "dispatches every idle arrival immediately, which shreds a "
-                "staggered burst."
+                "Tail window for a burst that reaches an idle worker "
+                "(#2874, #373). One request pending on a batcher is "
+                "dispatched immediately, however many items it carries, and "
+                "is not held for this long. A follow-up waits only while "
+                "another request on that same batcher is still pending. A "
+                "finished request does not hold the next one, and another "
+                "LoRA's arrival does not hold this batcher. Several requests "
+                "already pending still form one batch. Bounded by "
+                "max_batch_wait_ms. 0 dispatches every idle arrival "
+                "immediately."
             ),
         ),
     ] = 3.0

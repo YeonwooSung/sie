@@ -199,14 +199,13 @@ class WorkerConfig:
     # instead of being shredded into several half-full ones.
     coalesce_ms: float = 15.0
     coalesce_ratio: float = 0.5
-    # Idle-dispatch tail window (#2874, #373). A request that arrives alone
-    # is dispatched immediately — it is not held for this long. One later
-    # item that arrives within this gap of the previous submit is the tail
-    # of a staggered burst and coalesces (the head of that burst may already
-    # have run alone). Several items already pending when a batch is
-    # selected still form one batch. ``0`` disables the tail window and
-    # dispatches every idle arrival immediately, which shreds a staggered
-    # burst into one forward per request.
+    # Idle-dispatch tail window (#2874, #373). One request pending on an
+    # idle batcher is dispatched immediately, however many items it carries,
+    # and is not held for this long. A follow-up waits only while another
+    # request on that same batcher is still pending. A finished request does
+    # not hold the next one, and another LoRA's arrival does not hold this
+    # batcher. Several requests already pending when a batch is selected
+    # still form one batch. ``0`` dispatches every idle arrival immediately.
     idle_coalesce_ms: float = 3.0
     max_queue_size: int = 1000  # Maximum pending items in queue (0 = unlimited)
     instrumentation: bool = False

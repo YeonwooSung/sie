@@ -285,14 +285,8 @@ class ModelWorker:
         self._running = False
         self._stopping = False  # True when graceful stop has begun
         self._process_task: asyncio.Task[None] | None = None
-        # Wakes ``_get_next_batch_fcfs`` when a direct submit lands, instead of
-        # polling every 1 ms. ``stop()`` sets it too so an idle loop unblocks.
+        # ``stop()`` sets this too so an idle ``_get_next_batch_fcfs`` unblocks.
         self._work_available = asyncio.Event()
-        # Previous and latest direct-submit times (monotonic seconds). 0 means
-        # no arrival yet. The gap decides whether an idle one-item arrival is
-        # the tail of a staggered burst (#373) or a request that stays alone.
-        self._prev_arrival_at = 0.0
-        self._last_arrival_at = 0.0
         self._stats = WorkerStats()
 
         # Batches currently between "extracted from a batcher" and
@@ -992,10 +986,6 @@ class ModelWorker:
         """
         batcher = self._get_batcher(lora)
         await batcher.submit_many([(item, metadata) for item in prepared_items])
-        now = time.monotonic()
-        if self._last_arrival_at > 0.0:
-            self._prev_arrival_at = self._last_arrival_at
-        self._last_arrival_at = now
         self._work_available.set()
         self._ensure_process_loop_started()
         return metadata.future
@@ -1096,20 +1086,22 @@ class ModelWorker:
         Selects the batcher whose first pending request has waited the longest.
         This ensures fairness across LoRAs - no LoRA starves even with low traffic.
 
-        When the worker was idle, a request that is still alone is dispatched
-        immediately (#373). It is not held for ``idle_coalesce_ms``. One new
-        item whose previous arrival is inside that window is the tail of a
-        staggered burst and still coalesces, so the first of the burst may run
-        alone and the rest fuse behind it. Several items already pending when
-        a batch is selected form one batch. ``idle_coalesce_ms=0`` disables
-        the tail window and dispatches every idle arrival immediately.
+        When the worker was idle, one pending request is dispatched immediately
+        (#373), however many items it carries. It is not held for
+        ``idle_coalesce_ms``. A follow-up is a tail only while another request
+        on that same batcher is still pending (arrived and not yet dispatched);
+        the idle window can then catch a straggler. A finished request is no
+        longer pending, so it does not hold the next one, and another LoRA's
+        arrival does not hold this batcher. Several requests already pending
+        when a batch is selected form one batch. ``idle_coalesce_ms=0``
+        disables the tail window and dispatches every idle arrival immediately.
 
         Args:
             was_idle: Whether the worker was idle before this call. When True,
-                a lone request with no recent peer dispatches immediately;
-                a staggered tail uses the capped idle window. When False, uses
-                the normal timeout/coalesce mechanism to accumulate a proper
-                batch.
+                one pending request dispatches immediately and two or more on
+                the selected batcher use the capped idle window. When False,
+                uses the normal timeout/coalesce mechanism to accumulate a
+                proper batch.
 
         Returns:
             Tuple of (lora_name, batch, was_idle) where lora_name is None for
@@ -1136,18 +1128,11 @@ class ModelWorker:
                 selected_lora = oldest_lora if oldest_lora is not None else None
                 selected = self._batchers[selected_lora]
                 idle_window_ms = self._config.idle_coalesce_ms
-                # A request that stays alone must not sleep the idle window.
-                # Holding is only for a one-item tail after a recent peer, or
-                # for several items already queued (they fuse, and the cap
-                # can still catch a straggler). ``idle_coalesce_ms=0`` skips
-                # both and dispatches immediately.
-                lone_without_peer = (
-                    was_idle
-                    and idle_window_ms > 0
-                    and selected.pending_count == 1
-                    and not self._follows_recent_arrival(idle_window_ms)
-                )
-                if was_idle and idle_window_ms > 0 and not lone_without_peer:
+                # Alone is one request, not one item: ``submit_many`` queues
+                # an entry per item. A second request still sitting on this
+                # batcher is the only tail. ``idle_coalesce_ms=0`` skips it.
+                alone = selected.pending_request_count == 1
+                if was_idle and idle_window_ms > 0 and not alone:
                     batch = await selected.get_batch(coalesce_cap_ms=idle_window_ms)
                 else:
                     batch = await selected.get_batch(immediate=was_idle)
@@ -1157,19 +1142,6 @@ class ModelWorker:
             was_idle = True
             await self._work_available.wait()
             self._work_available.clear()
-
-    def _follows_recent_arrival(self, idle_window_ms: float) -> bool:
-        """True when the latest direct submit is inside the idle tail window.
-
-        ``_prev_arrival_at`` is the arrival before the one that woke this
-        selection. A first arrival, or one that shows up after the window has
-        gone quiet, is not a tail and must dispatch without waiting (#373).
-        """
-        previous = self._prev_arrival_at
-        latest = self._last_arrival_at
-        if previous <= 0.0 or latest < previous:
-            return False
-        return (latest - previous) * 1000.0 <= idle_window_ms
 
     async def _drain_active_batcher(self, active_lora: str | None) -> bool:
         """Continuous-batching drain of ``active_lora``'s batcher.
@@ -1224,10 +1196,10 @@ class ModelWorker:
             await self._process_loop_concurrent()
             return
 
-        # Track idle state across iterations. An idle worker dispatches a
-        # request that stays alone immediately (#373); a staggered tail still
-        # uses the idle window. After a busy batch, BatchFormer's
-        # timeout/coalesce mechanism accumulates the next batch.
+        # Track idle state across iterations. An idle worker dispatches one
+        # pending request immediately (#373). Two or more still pending on
+        # the selected batcher use the idle window. After a busy batch,
+        # BatchFormer's timeout/coalesce mechanism accumulates the next batch.
         was_idle = True
 
         while self._running:
