@@ -9,6 +9,7 @@ from sie_server.bundle_requirements import (
     locked_versions_from_uv_lock,
     merge_locked_requirements,
     normalized_bundle_requirements,
+    parse_uv_lock,
     resolve_bundle_requirements,
 )
 
@@ -68,7 +69,8 @@ def test_default_bundle_ranges_pin_to_uv_lock_versions() -> None:
 
 
 def test_exact_pins_and_url_specs_override_the_lock() -> None:
-    locked = locked_versions_from_uv_lock(_REPO_ROOT / "uv.lock")
+    parsed = parse_uv_lock(_REPO_ROOT / "uv.lock")
+    locked = parsed.versions
     original = _bundle_requirements("transformers5")
     merged = merge_locked_requirements(original, locked)
     url_specs = [requirement for requirement in original if " @" in requirement]
@@ -83,11 +85,19 @@ def test_exact_pins_and_url_specs_override_the_lock() -> None:
     # Ranges that do not contain the locked version stay as written.
     assert "transformers>=5.14,<6" in merged
     assert "sentence-transformers>=5.6,<6" in merged
-    constraints = lock_constraint_lines(original, locked)
+    constraints = lock_constraint_lines(original, parsed)
     assert "gliner2==2.0.0" not in constraints
-    assert "torchvision==0.24.1" not in constraints
+    assert "gliner2==1.3.2" not in constraints
+    assert not any(line.startswith("torchvision==") for line in constraints)
     assert all(" @" not in line for line in constraints)
     assert "transformers==4.57.6" not in constraints
+    assert "sentence-transformers==5.4.1" not in constraints
+    # The 4.x lock's huggingface-hub and safetensors do not satisfy transformers 5.
+    assert f"huggingface-hub=={locked['huggingface-hub']}" not in constraints
+    assert f"safetensors=={locked['safetensors']}" not in constraints
+    # Exact gliner2==2.0.0 still contributes lock neighbors that the moved line does not own.
+    assert f"peft=={locked['peft']}" in constraints
+    assert f"torch=={locked['torch']}" in constraints
 
 
 def test_merge_leaves_url_specs_and_unlocked_packages_unchanged() -> None:
@@ -122,3 +132,195 @@ version = "2.9.1+cu129"
 """
     assert locked_versions_from_uv_lock(lock) == {"torch": "2.9.1.*"}
     assert merge_locked_requirements(["torch>=2.9,<2.10"], {"torch": "2.9.1.*"}) == ["torch==2.9.1.*"]
+    constraints = lock_constraint_lines(["torch>=2.9,<2.10"], parse_uv_lock(lock))
+    assert "torch==2.9.1.*" in constraints
+    assert not any("skipped:" in line for line in constraints)
+
+
+def test_default_bundle_constraints_pin_transitive_deps_and_name_the_downgrade() -> None:
+    parsed = parse_uv_lock(_REPO_ROOT / "uv.lock")
+    constraints = lock_constraint_lines(_bundle_requirements("default"), parsed)
+
+    assert constraints[0] == "# Ranged dependencies are pinned to uv.lock. This can install an older"
+    assert "older" in constraints[0]
+    assert "release than an unconstrained build" in constraints[1]
+    assert any(line.startswith("# For example, sentence-transformers and gliner ") for line in constraints)
+    assert f"onnxruntime=={parsed.versions['onnxruntime']}" in constraints
+    assert f"docling-core=={parsed.versions['docling-core']}" in constraints
+    assert f"sentence-transformers=={parsed.versions['sentence-transformers']}" in constraints
+    assert f"gliner=={parsed.versions['gliner']}" in constraints
+    assert parsed.versions["sentence-transformers"] == "5.4.1"
+    assert parsed.versions["gliner"] == "0.2.26"
+    # Exact bundle pins stay requirements, not constraints.
+    assert not any(line.startswith("pillow==") for line in constraints)
+    assert not any(line.startswith("gliformer==") for line in constraints)
+    assert all("[" not in line for line in constraints)
+    assert "chromadb==1.5.9" not in constraints
+
+
+def test_constraints_pin_transitive_closure_not_the_whole_lock() -> None:
+    lock = """
+version = 1
+[[package]]
+name = "direct"
+version = "1.2.0"
+dependencies = [
+    { name = "onnxruntime" },
+    { name = "docling-core" },
+]
+
+[[package]]
+name = "onnxruntime"
+version = "1.25.0"
+
+[[package]]
+name = "docling-core"
+version = "2.79.0"
+dependencies = [
+    { name = "leaf" },
+]
+
+[[package]]
+name = "leaf"
+version = "8.0.0"
+
+[[package]]
+name = "outside"
+version = "9.0.0"
+"""
+    constraints = lock_constraint_lines(["direct>=1,<2"], parse_uv_lock(lock))
+    assert "direct==1.2.0" in constraints
+    assert "onnxruntime==1.25.0" in constraints
+    assert "docling-core==2.79.0" in constraints
+    assert "leaf==8.0.0" in constraints
+    assert "outside==9.0.0" not in constraints
+
+
+def test_constraint_lines_strip_extras() -> None:
+    lock = """
+version = 1
+[[package]]
+name = "demo"
+version = "1.2.3"
+dependencies = [
+    { name = "base" },
+]
+
+[package.optional-dependencies]
+extra = [
+    { name = "optional-dep" },
+]
+
+[[package]]
+name = "base"
+version = "4.0.0"
+
+[[package]]
+name = "optional-dep"
+version = "5.0.0"
+
+[[package]]
+name = "not-requested"
+version = "6.0.0"
+"""
+    constraints = lock_constraint_lines(
+        ["demo[extra]>=1,<2 ; sys_platform == 'linux'"],
+        parse_uv_lock(lock),
+    )
+    assert "demo==1.2.3" in constraints
+    assert "base==4.0.0" in constraints
+    assert "optional-dep==5.0.0" in constraints
+    assert "not-requested==6.0.0" not in constraints
+    assert all("[" not in line for line in constraints)
+    assert all(";" not in line for line in constraints)
+
+
+def test_exact_override_neighbors_stay_pinned_when_a_rejected_range_does_not() -> None:
+    lock = """
+version = 1
+[[package]]
+name = "kept"
+version = "1.0.0"
+dependencies = [
+    { name = "shared" },
+]
+
+[[package]]
+name = "pinned-override"
+version = "1.0.0"
+dependencies = [
+    { name = "neighbor" },
+    { name = "contested" },
+]
+
+[[package]]
+name = "moved"
+version = "4.0.0"
+dependencies = [
+    { name = "old-only" },
+    { name = "contested" },
+]
+
+[[package]]
+name = "neighbor"
+version = "2.0.0"
+
+[[package]]
+name = "shared"
+version = "3.0.0"
+
+[[package]]
+name = "old-only"
+version = "5.0.0"
+
+[[package]]
+name = "contested"
+version = "7.0.0"
+"""
+    constraints = lock_constraint_lines(
+        ["kept>=1,<2", "pinned-override==9.9.9", "moved>=5,<6"],
+        parse_uv_lock(lock),
+    )
+    assert "kept==1.0.0" in constraints
+    assert "shared==3.0.0" in constraints
+    assert "neighbor==2.0.0" in constraints
+    assert not any(line.startswith("pinned-override==") for line in constraints)
+    assert not any(line.startswith("moved==") for line in constraints)
+    assert "old-only==5.0.0" not in constraints
+    assert "contested==7.0.0" not in constraints
+
+
+def test_multiple_public_versions_are_skipped_without_raising() -> None:
+    lock = """
+version = 1
+[[package]]
+name = "direct"
+version = "1.0.0"
+dependencies = [
+    { name = "split" },
+    { name = "stable" },
+]
+
+[[package]]
+name = "split"
+version = "1.0.0"
+dependencies = [
+    { name = "stable" },
+]
+
+[[package]]
+name = "split"
+version = "2.0.0"
+
+[[package]]
+name = "stable"
+version = "3.1.0"
+"""
+    parsed = parse_uv_lock(lock)
+    assert locked_versions_from_uv_lock(lock) == {"direct": "1.0.0", "stable": "3.1.0"}
+    assert "split" in parsed.ambiguous
+    constraints = lock_constraint_lines(["direct>=1,<2"], parsed)
+    assert "direct==1.0.0" in constraints
+    assert "stable==3.1.0" in constraints
+    assert not any(line.startswith("split==") for line in constraints)
+    assert "# split skipped: uv.lock has multiple public versions" in constraints

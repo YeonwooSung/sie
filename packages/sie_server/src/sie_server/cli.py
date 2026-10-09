@@ -211,7 +211,7 @@ def resolve_deps(
     constraints_output: Path | None = typer.Option(  # noqa: B008
         None,
         "--constraints-output",
-        help="Write lock constraints for ranged dependencies to this file",
+        help="Write uv.lock constraints for the bundle's locked transitive closure",
     ),
 ) -> None:
     """Resolve and print dependencies for a bundle or model list.
@@ -223,10 +223,14 @@ def resolve_deps(
     and other CUDA-only dependencies.
 
     ``--lock`` and ``--constraints-output`` together write a constraints file
-    that pins ranged dependencies to ``uv.lock``. Exact pins and URL/VCS specs
-    are not tightened. Stdout stays the bundle requirements.
+    that pins ranged dependencies and their locked transitive closure to
+    ``uv.lock``. Lines are ``name==version`` only (pip rejects extras). Exact
+    pins, URL/VCS specs, and ranges that do not contain the locked version are
+    not tightened. The file starts with a comment that the pins can install an
+    older release than an unconstrained build of the same commit. Stdout stays
+    the bundle requirements.
     """
-    from sie_server.bundle_requirements import lock_constraint_lines, locked_versions_from_uv_lock
+    from sie_server.bundle_requirements import lock_constraint_lines, parse_uv_lock
     from sie_server.core.deps import collect_bundle_deps
 
     if (lock is None) != (constraints_output is None):
@@ -274,11 +278,11 @@ def resolve_deps(
 
     if constraints_output is not None and lock is not None:
         try:
-            locked = locked_versions_from_uv_lock(lock)
+            parsed_lock = parse_uv_lock(lock)
         except (OSError, ValueError) as exc:
             typer.echo(f"Error: {exc}", err=True)
             raise typer.Exit(1) from exc
-        body = "\n".join(lock_constraint_lines(result.requirements, locked))
+        body = "\n".join(lock_constraint_lines(result.requirements, parsed_lock))
         constraints_output.write_text(f"{body}\n" if body else "", encoding="utf-8")
 
     if output_json:
