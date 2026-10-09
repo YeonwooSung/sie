@@ -511,7 +511,7 @@ def test_record_text_is_bounded_by_characters() -> None:
     short = span(start=1, end=1, entity_type="b", score=0.4)
     slots = [(0, [long]), (1, [short])]
     tokens = ["x" * 30, "ok"]
-    assert structuring_decoding.MAX_RECORD_CHARS == 1_048_576
+    assert structuring_decoding.MAX_RECORD_CHARS == structuring_decoding.MAX_RECORD_WORDS * 2048
     assert structuring_decoding._within_word_limit(slots, 10, tokens=tokens, max_chars=40) is slots
     # Best first is the 30-character token. It does not fit in 20, so taking stops
     # and the later short span is dropped too, as an over-word span would be.
@@ -527,6 +527,37 @@ def test_record_text_is_bounded_by_characters() -> None:
     spaced = [(0, [span(start=0, end=1, entity_type="a", score=0.9)])]
     assert structuring_decoding._within_word_limit(spaced, 10, tokens=["abcd", "ef"], max_chars=6) == [(0, [])]
     assert structuring_decoding._within_word_limit(spaced, 10, tokens=["abcd", "ef"], max_chars=7) is spaced
+
+
+def test_ordinary_words_reach_the_word_cap_before_the_character_cap() -> None:
+    """Eight-letter words are ordinary. A full word cap of them, plus the joining spaces, fits."""
+    ordinary = 8
+    words = structuring_decoding.MAX_RECORD_WORDS
+    joined = words * ordinary + (words - 1)
+    assert joined < structuring_decoding.MAX_RECORD_CHARS
+    assert relation_decoding.MAX_RELATION_CHARS == relation_decoding.MAX_RELATION_WORDS * 2048
+
+
+class _TracingTokens(list[str]):
+    def __init__(self, items: list[str]) -> None:
+        super().__init__(items)
+        self.reads: list[object] = []
+
+    def __getitem__(self, item: object) -> object:
+        self.reads.append(item)
+        return super().__getitem__(item)  # type: ignore[index]
+
+
+def test_word_cap_rejection_does_not_read_the_rejected_tail() -> None:
+    span = upstream.Span
+    tokens = _TracingTokens(["ok", "z" * 100_000])
+    slots = [
+        (0, [span(start=0, end=0, entity_type="a", score=0.9)]),
+        (1, [span(start=1, end=1, entity_type="b", score=0.1)]),
+    ]
+    kept = structuring_decoding._within_word_limit(slots, 1, tokens=tokens, max_chars=10**9)
+    assert [(slot, [(item.start, item.end) for item in spans]) for slot, spans in kept] == [(0, [(0, 0)]), (1, [])]
+    assert not any(isinstance(read, slice) and read.start == 1 for read in tokens.reads)
 
 
 def _record_fields(records: list) -> list[dict]:
@@ -916,7 +947,7 @@ def test_relation_text_is_bounded_by_characters() -> None:
     short = span(start=1, end=1, entity_type="b", score=1.0)
     entities = [long, short]
     texts = [["y" * 30, "ok"]]
-    assert relation_decoding.MAX_RELATION_CHARS == 1_048_576
+    assert relation_decoding.MAX_RELATION_CHARS == relation_decoding.MAX_RELATION_WORDS * 2048
 
     def rows(scores: list[float], *, max_chars: int, max_words: int = 10, row_texts: list[list[str]] = texts) -> list:
         return relation_decoding._row_relations(
@@ -982,6 +1013,33 @@ def test_relation_text_is_bounded_by_characters() -> None:
     )
     assert fitting[0]["head"]["text"] == "abcd ef"
     assert len(fitting[0]["head"]["text"]) + len(fitting[0]["tail"]["text"]) == 14
+
+
+def test_relation_word_cap_does_not_read_the_rejected_endpoint() -> None:
+    span = upstream.Span
+    tokens = _TracingTokens(["ok", "z" * 100_000])
+    entities = [
+        span(start=0, end=0, entity_type="a", score=1.0),
+        span(start=1, end=1, entity_type="b", score=1.0),
+    ]
+    rows = relation_decoding._row_relations(
+        _RELATIONS,
+        torch.tensor([[0.9], [0.6]], dtype=torch.float32),
+        torch.tensor([[0, 0], [1, 1]]),
+        None,
+        0.5,
+        {0: "links"},
+        None,
+        entities,
+        [tokens],
+        0,
+        allowance=None,
+        max_relations=10,
+        max_words=2,
+        max_chars=10**9,
+    )
+    assert [(item["head"]["text"], item["tail"]["text"]) for item in rows] == [("ok", "ok")]
+    assert not any(isinstance(read, slice) and read.start == 1 for read in tokens.reads)
 
 
 def test_relations_within_an_allowance_keep_the_best_first_prefix() -> None:

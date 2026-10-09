@@ -41,10 +41,15 @@ MAX_RECORD_SPANS = 65536
 # the text alone grows with spans x document length. Flat single-label
 # removal keeps disjoint spans per slot: at most 100 slots x 2048 words.
 MAX_RECORD_WORDS = 262144
-# Characters of field text one document's records may hold after overlap
-# removal. This bounds one document's decoded text when a single token is
-# very long (#378): the word cap counts that token as one word.
-MAX_RECORD_CHARS = 1_048_576
+# Characters of that field text (#378). The word cap counts every token as
+# one word, so it does not bound one very long token. Decoded text joins
+# tokens with spaces. Four characters a word, which is what 1_048_576 was,
+# rejects ordinary words while the word count is still under the cap.
+# 2048 is the document length in words from the measurements above, used
+# here as the most characters one ordinary token may take. A document of
+# shorter tokens reaches the word cap first. One token longer than that
+# is the case this bound exists for.
+MAX_RECORD_CHARS = MAX_RECORD_WORDS * 2048
 
 
 def make_structuring_decode(
@@ -318,11 +323,16 @@ def _within_word_limit(
     then position. Taking stops at the first field that would exceed
     ``max_words`` words or ``max_chars`` characters of decoded text. The ones
     taken stay in their original order.
+
+    When the word total is already over ``max_words``, token text is read
+    only for the best-first prefix that still fits in that word budget. The
+    tail the word cap rejects is not walked.
     """
     words = sum(span.end - span.start + 1 for _, spans in slots for span in spans)
-    chars = sum(_span_chars(tokens, span.start, span.end) for _, spans in slots for span in spans)
-    if words <= max_words and chars <= max_chars:
-        return slots
+    if words <= max_words:
+        chars = sum(_span_chars(tokens, span.start, span.end) for _, spans in slots for span in spans)
+        if chars <= max_chars:
+            return slots
     ranked = sorted(
         ((slot, index, span) for slot, (_, spans) in enumerate(slots) for index, span in enumerate(spans)),
         key=lambda entry: -entry[2].score,
@@ -332,8 +342,10 @@ def _within_word_limit(
     used_chars = 0
     for slot, index, span in ranked:
         width = span.end - span.start + 1
+        if used_words + width > max_words:
+            break
         span_chars = _span_chars(tokens, span.start, span.end)
-        if used_words + width > max_words or used_chars + span_chars > max_chars:
+        if used_chars + span_chars > max_chars:
             break
         used_words += width
         used_chars += span_chars

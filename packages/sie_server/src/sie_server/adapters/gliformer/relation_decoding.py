@@ -32,9 +32,12 @@ MAX_RELATIONS = 65536
 # Words of head and tail text across one document's relations. Each relation
 # copies both endpoints' text, and endpoints can be long.
 MAX_RELATION_WORDS = 262144
-# Characters of head and tail text across one document's relations. This
-# bounds one document's decoded text when a single token is very long (#378).
-MAX_RELATION_CHARS = 1_048_576
+# Characters of that head and tail text (#378). Same rule as the record cap:
+# the word cap counts a token as one word, and four characters a word rejects
+# ordinary text first. 2048 is the measured document length in words, used as
+# the most characters one ordinary token may take. Shorter tokens reach the
+# word cap first.
+MAX_RELATION_CHARS = MAX_RELATION_WORDS * 2048
 # Allowance units per kept relation (building it) and per scored cell.
 RELATION_UNITS = 2
 _CELLS_PER_UNIT = 1024
@@ -203,25 +206,43 @@ def _row_relations(
     if pairs.size == 0:
         return []
 
-    # Endpoint word and character widths, for the text bounds. Ids outside the
-    # decoded list resolve to empty endpoints, as in the package.
+    # Endpoint word widths are arithmetic on the span bounds. Character widths
+    # read token text, so they are filled for every endpoint only when the
+    # word total still fits. When the word cap already rejects the row, text
+    # is read only for the best-first prefix that fits in the word budget.
     tokens = None if texts is None or source_batch_idx >= len(texts) else texts[source_batch_idx]
     widths = np.asarray([span.end - span.start + 1 for span in entities] + [0], dtype=np.int64)
-    char_widths = np.asarray(
-        [_span_chars(tokens, span.start, span.end) for span in entities] + [0],
-        dtype=np.int64,
-    )
     head_at = np.where((heads >= 0) & (heads < len(entities)), heads, len(entities))
     tail_at = np.where((tails >= 0) & (tails < len(entities)), tails, len(entities))
+    word_cost = widths[head_at] + widths[tail_at]
     limit = max_relations if allowance is None else min(max_relations, allowance.affordable(RELATION_UNITS))
-    keep = _best_first(
-        scores,
-        widths[head_at] + widths[tail_at],
-        limit,
-        max_words,
-        char_widths[head_at] + char_widths[tail_at],
-        max_chars,
-    )
+    word_total = int(word_cost.sum()) if word_cost.size else 0
+    chars: np.ndarray | None = None
+    char_of: Callable[[int], int] | None = None
+    if pairs.size <= limit and word_total <= max_words:
+        char_widths = np.asarray(
+            [_span_chars(tokens, span.start, span.end) for span in entities] + [0],
+            dtype=np.int64,
+        )
+        chars = char_widths[head_at] + char_widths[tail_at]
+    else:
+        cache: dict[int, int] = {}
+
+        def char_of(index: int) -> int:
+            total = 0
+            for entity_id in (int(heads[index]), int(tails[index])):
+                cached = cache.get(entity_id)
+                if cached is None:
+                    if 0 <= entity_id < len(entities):
+                        entity = entities[entity_id]
+                        cached = _span_chars(tokens, entity.start, entity.end)
+                    else:
+                        cached = 0
+                    cache[entity_id] = cached
+                total += cached
+            return total
+
+    keep = _best_first(scores, word_cost, limit, max_words, chars, max_chars, char_of=char_of)
     if allowance is not None:
         allowance.spend(RELATION_UNITS * int(keep.size))
 
@@ -277,18 +298,49 @@ def _best_first(
     words: np.ndarray,
     limit: int,
     max_words: int,
-    chars: np.ndarray,
+    chars: np.ndarray | None,
     max_chars: int,
+    *,
+    char_of: Callable[[int], int] | None = None,
 ) -> np.ndarray:
     """Positions of the kept relations, in their original order.
 
     Relations are taken best score first (stable), and taking stops at the
     first one that would exceed ``limit`` relations, ``max_words`` words, or
     ``max_chars`` characters of decoded text.
+
+    ``chars`` is the per-relation character cost when it is already known.
+    When the word total is over the cap, pass ``chars=None`` and ``char_of``
+    so token text is read only for the prefix that still fits in the word
+    budget.
     """
-    if scores.size <= limit and int(words.sum()) <= max_words and int(chars.sum()) <= max_chars:
-        return np.arange(scores.size)
+    count = int(scores.size)
+    if count == 0:
+        return np.arange(0)
+    word_total = int(words.sum())
+    if count <= limit and word_total <= max_words:
+        if chars is None:
+            if char_of is None:
+                msg = "char_of is required when chars is omitted"
+                raise ValueError(msg)
+            chars = np.fromiter((char_of(index) for index in range(count)), dtype=np.int64, count=count)
+        if int(chars.sum()) <= max_chars:
+            return np.arange(count)
     ranked = np.argsort(-scores, kind="stable")[:limit]
-    fits = (np.cumsum(words[ranked]) <= max_words) & (np.cumsum(chars[ranked]) <= max_chars)
-    taken = ranked[: int(np.argmin(fits)) if not fits.all() else ranked.size]
-    return np.sort(taken)
+    if ranked.size == 0:
+        return ranked
+    word_fits = np.cumsum(words[ranked]) <= max_words
+    word_count = int(np.argmin(word_fits)) if not bool(word_fits.all()) else int(ranked.size)
+    if word_count == 0:
+        return np.empty(0, dtype=ranked.dtype)
+    prefix = ranked[:word_count]
+    if chars is None:
+        if char_of is None:
+            msg = "char_of is required when chars is omitted"
+            raise ValueError(msg)
+        prefix_chars = np.fromiter((char_of(int(index)) for index in prefix), dtype=np.int64, count=word_count)
+    else:
+        prefix_chars = chars[prefix]
+    char_fits = np.cumsum(prefix_chars) <= max_chars
+    kept = int(np.argmin(char_fits)) if not bool(char_fits.all()) else word_count
+    return np.sort(prefix[:kept])
