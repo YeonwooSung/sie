@@ -199,15 +199,14 @@ class WorkerConfig:
     # instead of being shredded into several half-full ones.
     coalesce_ms: float = 15.0
     coalesce_ratio: float = 0.5
-    # Idle-dispatch accumulation window (#2874). An idle worker used to
-    # dispatch IMMEDIATELY with whatever was pending, so a burst arriving at
-    # an idle worker degenerated into a train of small serialized forwards
-    # (many batch-of-1 dispatches instead of one fused batch). With this
-    # window, the first batch after idleness coalesces arrivals until the
-    # queue has been quiet for ``idle_coalesce_ms`` (or the batch fills, or
-    # ``max_batch_wait_ms`` elapses since the first request). A lone request
-    # therefore waits at most this window — single-digit ms — before
-    # dispatch, and ``0`` restores the legacy immediate dispatch.
+    # Idle-dispatch tail window (#2874, #373). A request that arrives alone
+    # is dispatched immediately — it is not held for this long. One later
+    # item that arrives within this gap of the previous submit is the tail
+    # of a staggered burst and coalesces (the head of that burst may already
+    # have run alone). Several items already pending when a batch is
+    # selected still form one batch. ``0`` disables the tail window and
+    # dispatches every idle arrival immediately, which shreds a staggered
+    # burst into one forward per request.
     idle_coalesce_ms: float = 3.0
     max_queue_size: int = 1000  # Maximum pending items in queue (0 = unlimited)
     instrumentation: bool = False

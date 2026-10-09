@@ -303,13 +303,14 @@ class EngineConfig(BaseSettings):
         Field(
             ge=0.0,
             description=(
-                "Accumulation window for the FIRST batch after a worker was "
-                "idle (#2874). An idle worker used to dispatch immediately "
-                "with whatever was pending, shredding bursty arrivals into a "
-                "train of small serialized forwards. With this window the "
-                "batcher coalesces until arrivals have been quiet for this "
-                "long (bounded by max_batch_wait_ms), so a lone request waits "
-                "at most this window. 0 restores immediate idle dispatch."
+                "Tail window for a staggered burst that reaches an idle "
+                "worker (#2874, #373). A request that arrives alone is "
+                "dispatched immediately and is not held for this long. One "
+                "later item within this gap of the previous submit coalesces "
+                "with what follows it, and several items already pending "
+                "still form one batch. Bounded by max_batch_wait_ms. 0 "
+                "dispatches every idle arrival immediately, which shreds a "
+                "staggered burst."
             ),
         ),
     ] = 3.0

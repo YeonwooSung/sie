@@ -46,9 +46,10 @@ def _parked_config() -> WorkerConfig:
     """Config whose batcher never yields a batch during a test.
 
     Every dispatch trigger (cost limit, request limit, first-request timeout,
-    coalesce window, idle accumulation window) is pushed far out of reach, so
-    submitted items stay queued in the ``BatchFormer`` for the whole test and
-    the drain is the only thing that can complete them. This is the state a
+    coalesce window, idle tail window) is pushed far out of reach.
+    ``_submit`` seeds a prior arrival so a one-item submit takes the tail
+    path (#373) and stays queued in the ``BatchFormer`` for the whole test.
+    The drain is the only thing that can complete it. This is the state a
     real worker is in whenever it is evicted with a backlog.
     """
     return WorkerConfig(
@@ -128,7 +129,14 @@ async def _submit(
     count: int = 1,
     options: dict[str, Any] | None = None,
 ) -> asyncio.Future[WorkerResult]:
-    """Queue one request of ``count`` items and let the process loop park."""
+    """Queue one request of ``count`` items and let the process loop park.
+
+    A lone idle request is dispatched without waiting ``idle_coalesce_ms``
+    (#373). Seeding a just-prior arrival makes this submit a staggered tail
+    (or, when ``count > 1``, several items already queued) so the parked
+    window still holds it inside ``get_batch``.
+    """
+    worker._last_arrival_at = time.monotonic()
     future = await worker.submit(
         [_item(i) for i in range(count)],
         [Item(text=f"hello-{i}") for i in range(count)],
