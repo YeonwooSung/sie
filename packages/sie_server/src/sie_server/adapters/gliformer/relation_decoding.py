@@ -10,14 +10,15 @@ also copies its head and tail text.
 passing cells with array operations and returns the same relations, in the
 same order, with the same scores. It also bounds each document's relations:
 at most ``max_relations`` of them, whose heads and tails together span at
-most ``max_words`` words, and no more than the document's allowance affords.
+most ``max_words`` words and ``max_chars`` characters, and no more than the
+document's allowance affords.
 Past a bound, a document keeps the best-first prefix: the highest scores
 first, and among equal scores the package's own order.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import numpy as np
@@ -31,6 +32,9 @@ MAX_RELATIONS = 65536
 # Words of head and tail text across one document's relations. Each relation
 # copies both endpoints' text, and endpoints can be long.
 MAX_RELATION_WORDS = 262144
+# Characters of head and tail text across one document's relations. This
+# bounds one document's decoded text when a single token is very long (#378).
+MAX_RELATION_CHARS = 1_048_576
 # Allowance units per kept relation (building it) and per scored cell.
 RELATION_UNITS = 2
 _CELLS_PER_UNIT = 1024
@@ -42,6 +46,7 @@ def make_relation_decode(
     *,
     max_relations: int = MAX_RELATIONS,
     max_words: int = MAX_RELATION_WORDS,
+    max_chars: int = MAX_RELATION_CHARS,
 ) -> Callable[..., Any]:
     """A replacement for ``gliformer.tasks.joint_relex.decoder.JointRelexDecoder.decode``.
 
@@ -50,6 +55,7 @@ def make_relation_decode(
         unflatten_by_batch_origin: The package's helper of that name.
         max_relations: Most relations per document.
         max_words: Most head and tail words across a document's relations.
+        max_chars: Most characters of decoded head and tail text per document.
 
     Returns:
         The ``decode`` method.
@@ -128,6 +134,7 @@ def make_relation_decode(
                     allowance=row_allowance(bn),
                     max_relations=max_relations,
                     max_words=max_words,
+                    max_chars=max_chars,
                 )
             )
 
@@ -156,6 +163,7 @@ def _row_relations(
     allowance: Allowance | None,
     max_relations: int,
     max_words: int,
+    max_chars: int = MAX_RELATION_CHARS,
 ) -> list[dict]:
     """One document row's relation triples, in the package's order (pair, then type).
 
@@ -195,13 +203,25 @@ def _row_relations(
     if pairs.size == 0:
         return []
 
-    # Endpoint widths, for the text bound; ids outside the decoded list
-    # resolve to empty endpoints, as in the package.
+    # Endpoint word and character widths, for the text bounds. Ids outside the
+    # decoded list resolve to empty endpoints, as in the package.
+    tokens = None if texts is None or source_batch_idx >= len(texts) else texts[source_batch_idx]
     widths = np.asarray([span.end - span.start + 1 for span in entities] + [0], dtype=np.int64)
-    head_words = widths[np.where((heads >= 0) & (heads < len(entities)), heads, len(entities))]
-    tail_words = widths[np.where((tails >= 0) & (tails < len(entities)), tails, len(entities))]
+    char_widths = np.asarray(
+        [_span_chars(tokens, span.start, span.end) for span in entities] + [0],
+        dtype=np.int64,
+    )
+    head_at = np.where((heads >= 0) & (heads < len(entities)), heads, len(entities))
+    tail_at = np.where((tails >= 0) & (tails < len(entities)), tails, len(entities))
     limit = max_relations if allowance is None else min(max_relations, allowance.affordable(RELATION_UNITS))
-    keep = _best_first(scores, head_words + tail_words, limit, max_words)
+    keep = _best_first(
+        scores,
+        widths[head_at] + widths[tail_at],
+        limit,
+        max_words,
+        char_widths[head_at] + char_widths[tail_at],
+        max_chars,
+    )
     if allowance is not None:
         allowance.spend(RELATION_UNITS * int(keep.size))
 
@@ -238,15 +258,37 @@ def _row_relations(
     return triples
 
 
-def _best_first(scores: np.ndarray, words: np.ndarray, limit: int, max_words: int) -> np.ndarray:
+def _span_chars(tokens: Sequence[str] | None, start: int, end: int) -> int:
+    """Characters of one span's decoded text.
+
+    The package copies ``" ".join(tokens[start:end + 1])``. With no tokens it
+    copies nothing, so the character cap does not apply.
+    """
+    if not tokens or start >= len(tokens):
+        return 0
+    span = tokens[start : end + 1]
+    if not span:
+        return 0
+    return sum(len(token) for token in span) + len(span) - 1
+
+
+def _best_first(
+    scores: np.ndarray,
+    words: np.ndarray,
+    limit: int,
+    max_words: int,
+    chars: np.ndarray,
+    max_chars: int,
+) -> np.ndarray:
     """Positions of the kept relations, in their original order.
 
     Relations are taken best score first (stable), and taking stops at the
-    first one that would exceed ``limit`` relations or ``max_words`` words.
+    first one that would exceed ``limit`` relations, ``max_words`` words, or
+    ``max_chars`` characters of decoded text.
     """
-    if scores.size <= limit and int(words.sum()) <= max_words:
+    if scores.size <= limit and int(words.sum()) <= max_words and int(chars.sum()) <= max_chars:
         return np.arange(scores.size)
     ranked = np.argsort(-scores, kind="stable")[:limit]
-    fits = np.cumsum(words[ranked]) <= max_words
+    fits = (np.cumsum(words[ranked]) <= max_words) & (np.cumsum(chars[ranked]) <= max_chars)
     taken = ranked[: int(np.argmin(fits)) if not fits.all() else ranked.size]
     return np.sort(taken)
