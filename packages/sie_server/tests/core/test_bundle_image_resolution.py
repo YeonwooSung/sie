@@ -140,6 +140,10 @@ def _resolver_env() -> dict[str, str]:
     return env
 
 
+@pytest.mark.skipif(
+    os.environ.get("SIE_RUN_IMAGE_RESOLUTION") != "1",
+    reason="needs network access to package indexes",
+)
 @pytest.mark.parametrize(
     ("platform", "bundle"),
     _TARGETS,
