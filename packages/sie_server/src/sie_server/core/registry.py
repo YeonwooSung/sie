@@ -2856,6 +2856,10 @@ class ModelRegistry:
         adapter teardown takes it again, so an eviction does not stall other
         models' requests or registry operations for the drain.
 
+        A sibling whose optional-memory release is still running is not
+        chosen. Unload waits for that inference thread with no deadline, so
+        evicting it after a timed-out release would hang recovery.
+
         Args:
             exclude_name: The calling worker's own model. Never evicted, even
                 if it happens to be the LRU entry — the caller still needs
@@ -2892,6 +2896,7 @@ class ModelRegistry:
                 is_pinned=self._is_pinned,
                 loaded=self._loaded,
                 unloading=self._unloading,
+                releasing=self._optional_release_inflight(),
             )
             if candidate is None:
                 return EvictionResult.NO_CANDIDATE

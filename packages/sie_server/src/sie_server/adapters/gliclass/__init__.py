@@ -75,7 +75,6 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
-from sie_server.adapters.base import released_bytes
 from sie_server.adapters.errors import InputTooLongError
 from sie_server.adapters.gliclass.cuda_graphs import GRAPH_MODES, CudaGraphRunner, GraphMode, unsupported_reason
 from sie_server.adapters.gliclass.modernbert_flash import ModernBertFlashEncoder
@@ -1119,7 +1118,10 @@ class GLiClassAdapter(BaseAdapter):
                 torch.cuda.empty_cache()
             except Exception:
                 logger.exception("GLiClass CUDA graph release could not empty the CUDA cache")
-        return released_bytes(released)
+        # bool is an int, so True would otherwise count as one byte.
+        if isinstance(released, bool) or not isinstance(released, int) or released <= 0:
+            return 0
+        return released
 
     def _graph_runner(self, pipe: Any, tokenizer: PreTrainedTokenizerBase) -> CudaGraphRunner | None:
         """The CUDA graph runner for a loaded model; None when graphs are off or unsupported."""
