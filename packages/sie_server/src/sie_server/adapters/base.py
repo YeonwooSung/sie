@@ -61,6 +61,11 @@ class ModelAdapter(ABC):
         Non-PyTorch adapters (e.g., SGLang) should use their own cleanup
         mechanism (e.g., engine.shutdown()) that fully releases memory.
 
+        Replay caches such as CUDA graphs are not weights. They keep device
+        memory that ``gc.collect()`` and ``empty_cache()`` cannot reclaim
+        while the graphs are alive. ``release_optional_memory()`` drops those
+        caches without unloading the model. The default returns 0.
+
     Main Thread Requirement:
         Some adapters may use parent-process signal handlers that only work in
         the main thread. Set requires_main_thread = True for these adapters.
@@ -228,6 +233,19 @@ class ModelAdapter(ABC):
         """
         _ = (device_type, device_total_bytes)
         return None
+
+    def release_optional_memory(self) -> int:
+        """Release device memory that can be dropped without unloading weights.
+
+        Called under memory pressure and during OOM recovery, before a model
+        is evicted. Adapters with nothing to release must return 0 so callers
+        still evict when pressure remains. Must not require a GPU when the
+        adapter has nothing cached.
+
+        Returns:
+            Best-effort count of bytes released. Zero means nothing was released.
+        """
+        return 0
 
     def engine_exit_code(self) -> int | None:
         """Return the exit code of this adapter's engine process once it has exited.

@@ -2894,6 +2894,72 @@ class ModelRegistry:
             return EvictionResult.UNLOAD_FAILED
         return EvictionResult.EVICTED
 
+    async def release_optional_memory(self, exclude_name: str) -> int:
+        """Release optional memory of models other than ``exclude_name``.
+
+        Used by OOM recovery while the caller still holds its own adapter
+        lock, so that model is skipped and siblings are released without
+        waiting: a peer recovery holding its lock cannot deadlock this one.
+        Least recently used first, on the caller's device. Zero means nothing
+        was released; ``EVICT_LRU`` must still run.
+        """
+        manager = self._memory_manager_for_model(exclude_name)
+        return await self._release_optional_memory_on(manager, exclude_name=exclude_name, block=False)
+
+    async def _release_optional_memory_on(
+        self,
+        manager: MemoryManager,
+        *,
+        exclude_name: str | None,
+        block: bool,
+    ) -> int:
+        """Release optional memory for ``manager``'s models, oldest first.
+
+        When ``exclude_name`` is None (the memory monitor), stop once pressure
+        has cleared. OOM recovery passes the caller and does not consult
+        pressure: an allocation can fail below the monitor threshold.
+        """
+        total = 0
+        for name in list(manager.loaded_models):
+            if exclude_name is None and not manager.check_pressure():
+                break
+            if name == exclude_name or name in self._unloading:
+                continue
+            loaded = self._loaded.get(name)
+            if loaded is None:
+                continue
+            released = await self._release_loaded_optional_memory(name, loaded, block=block)
+            if released <= 0:
+                continue
+            total += released
+            logger.info(
+                "Released %d bytes of optional memory from '%s' on %s",
+                released,
+                name,
+                manager.device,
+            )
+        return total
+
+    async def _release_loaded_optional_memory(self, name: str, loaded: LoadedModel, *, block: bool) -> int:
+        """Run one adapter's ``release_optional_memory`` off the event loop.
+
+        Prefers the model worker so the call sits on the inference thread,
+        under the same adapter lock dispatch uses. A worker-less adapter
+        (tests, or a load that has not attached one) runs on the default
+        executor, matching ``adapter.unload()``.
+        """
+        try:
+            if loaded.worker is not None:
+                released = await loaded.worker.release_optional_memory(block=block)
+            else:
+                released = await asyncio.to_thread(loaded.adapter.release_optional_memory)
+        except Exception:
+            logger.exception("release_optional_memory failed for '%s'; continuing", name)
+            return 0
+        if isinstance(released, bool) or not isinstance(released, int) or released <= 0:
+            return 0
+        return released
+
     async def start_memory_monitor(self) -> None:
         """Start the background memory monitor task.
 
@@ -3119,7 +3185,12 @@ class ModelRegistry:
                 logger.exception("Unloading model '%s' after its engine exited failed", name)
 
     async def _memory_monitor_loop(self) -> None:
-        """Background task that reaps exited engines and evicts LRU models under memory pressure."""
+        """Reap exited engines, drop optional caches, then evict under pressure.
+
+        Optional memory (CUDA graphs and similar) is released from loaded
+        models, least recently used first, before any model is unloaded. A
+        model is evicted only if pressure remains after those releases.
+        """
         while self._monitor_running:
             try:
                 await asyncio.sleep(self._memory_config.memory_check_interval_s)
@@ -3130,13 +3201,17 @@ class ModelRegistry:
                 if not pressured_managers:
                     continue
 
-                # Pressure detected - decide under the lock, evict outside it
+                # Pressure detected - release outside the lock, evict outside it.
+                # Decide which model to unload under the lock.
                 lock = self._get_load_lock()
                 for manager in pressured_managers:
                     while True:
                         # Memory an in-flight unload is about to free may
                         # already resolve the pressure.
                         await self._wait_for_unloads()
+                        if not manager.check_pressure():
+                            break
+                        await self._release_optional_memory_on(manager, exclude_name=None, block=True)
                         async with lock:
                             # Re-check under lock (may have resolved)
                             if not manager.check_pressure():

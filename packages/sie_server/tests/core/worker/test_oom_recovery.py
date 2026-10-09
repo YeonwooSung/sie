@@ -186,16 +186,38 @@ async def test_managed_oom_records_one_outcome_per_attempt(monkeypatch: pytest.M
 
 @pytest.mark.asyncio
 async def test_eviction_path() -> None:
-    """cache_clear fails; evict_lru frees a sibling; retry succeeds."""
+    """cache_clear fails; evict_lru frees a sibling; retry succeeds.
+
+    Optional-memory release runs before eviction. Returning 0 must not skip
+    ``EVICT_LRU`` — models with nothing to drop still need the sibling gone.
+    """
     config = OomRecoveryConfig(
         strategy=(OomRecoveryAction.CACHE_CLEAR, OomRecoveryAction.EVICT_LRU),
     )
     stats = OomRecoveryStats()
 
-    registry = AsyncMock()
-    registry.evict_lru_excluding = AsyncMock(return_value=EvictionResult.EVICTED)
+    events: list[str] = []
 
-    executor = BatchExecutor(model_name="m", registry=registry, config=config, stats=stats)
+    def release_optional_memory() -> int:
+        events.append("release")
+        return 0
+
+    async def evict(exclude_name: str, *, timeout_s: float) -> EvictionResult:
+        events.append("evict")
+        assert exclude_name == "m"
+        assert timeout_s == 5.0
+        return EvictionResult.EVICTED
+
+    registry = AsyncMock()
+    registry.evict_lru_excluding = AsyncMock(side_effect=evict)
+
+    executor = BatchExecutor(
+        model_name="m",
+        registry=registry,
+        config=config,
+        stats=stats,
+        release_optional_memory=release_optional_memory,
+    )
 
     group, metas = _make_group(3)
     handler = _FakeHandler()
@@ -215,6 +237,9 @@ async def test_eviction_path() -> None:
     assert stats.cache_clears == 1
     assert stats.evictions_triggered == 1
     assert stats.recoveries_succeeded == 1
+    # CACHE_CLEAR releases before its retry; EVICT_LRU releases again, then
+    # evicts. Nothing was freed, and the sibling is still unloaded.
+    assert events == ["release", "release", "evict"]
     registry.evict_lru_excluding.assert_awaited_once_with("m", timeout_s=5.0)
     for m in metas:
         assert m._partial_results is not None

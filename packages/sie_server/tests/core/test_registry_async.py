@@ -927,6 +927,61 @@ class TestProactiveEviction:
         adapter_pinned.unload.assert_not_called()
         adapter_other.unload.assert_called_once()
 
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_memory_monitor_releases_optional_memory_before_eviction(
+        self,
+        mock_load_adapter: MagicMock,
+        mock_adapter_factory: Callable[[], MagicMock],
+    ) -> None:
+        """Under pressure, optional memory is released LRU-first before any unload."""
+        registry = ModelRegistry(
+            memory_config=MemoryConfig(
+                pressure_threshold=0.95,
+                memory_check_interval_s=0.005,
+            ),
+        )
+        names = ("model-a", "model-b", "model-c")
+        for name in names:
+            registry.add_config(_make_config(name=name, hf_id=f"org/{name}"))
+
+        order: list[tuple[str, str, str]] = []
+        adapters: list[MagicMock] = []
+        for name in names:
+            adapter = mock_adapter_factory()
+
+            def release(model_name: str = name) -> int:
+                order.append(("release", model_name, threading.current_thread().name))
+                return 4096
+
+            def unload(model_name: str = name) -> None:
+                order.append(("unload", model_name, threading.current_thread().name))
+
+            adapter.release_optional_memory.side_effect = release
+            adapter.unload.side_effect = unload
+            adapters.append(adapter)
+        mock_load_adapter.side_effect = adapters
+
+        registry._memory_manager.check_pressure = MagicMock(return_value=False)
+        for name in names:
+            await registry.load_async(name, "cpu")
+        registry._memory_manager.check_pressure = MagicMock(return_value=True)
+
+        await registry.start_memory_monitor()
+        try:
+            deadline = asyncio.get_running_loop().time() + 2
+            while not any(event[0] == "unload" for event in order):
+                if asyncio.get_running_loop().time() > deadline:
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            await registry.stop_memory_monitor()
+
+        first_unload = next(index for index, event in enumerate(order) if event[0] == "unload")
+        released = [event for event in order[:first_unload] if event[0] == "release"]
+        assert [event[1] for event in released] == list(names)
+        assert all("inference" in event[2] for event in released)
+        assert order[first_unload][1] == "model-a"
+
     async def test_memory_monitor_starts_and_stops(self) -> None:
         """Memory monitor can be started and stopped cleanly."""
         from sie_server.core.memory import MemoryConfig

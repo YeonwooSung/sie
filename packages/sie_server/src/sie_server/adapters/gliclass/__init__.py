@@ -1075,8 +1075,31 @@ class GLiClassAdapter(BaseAdapter):
             # Graph memory is held until its graphs go; drop them so the
             # worker's OOM recovery can reuse it.
             if self._graphs is not None and is_oom_error(exc):
-                self._graphs.clear()
+                self.release_optional_memory()
             raise
+
+    def release_optional_memory(self) -> int:
+        """Drop recorded CUDA graphs and return their accounted bytes.
+
+        Uses the runner's ``clear()`` path, then ``torch.cuda.empty_cache()``
+        when CUDA is available, so the graph pool can return to the device.
+        The count is ``CudaGraphRunner.held_bytes`` from before the clear:
+        the runner's own tally of pool growth and recorded graphs, not a
+        driver query. Without a GPU the bytes actually freed are not
+        measurable; after a successful clear the runner accounts 0. Returns
+        0 when no runner exists, which does not touch CUDA.
+        """
+        runner = self._graphs
+        if runner is None:
+            return 0
+        released = runner.held_bytes
+        runner.clear()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                logger.exception("GLiClass CUDA graph release could not empty the CUDA cache")
+        return released
 
     def _graph_runner(self, pipe: Any, tokenizer: PreTrainedTokenizerBase) -> CudaGraphRunner | None:
         """The CUDA graph runner for a loaded model; None when graphs are off or unsupported."""

@@ -300,6 +300,11 @@ class ModelWorker:
             registry=self._registry_callbacks,
             config=self._config.oom_recovery,
             stats=self._stats.oom_recoveries,
+            # Recovery already holds the dispatch lock (or the forward that
+            # just failed has left the inference thread idle), so the adapter
+            # method itself is the right call — re-entering release_optional_memory()
+            # here would wait on that same lock.
+            release_optional_memory=adapter.release_optional_memory,
         )
 
     # =========================================================================
@@ -490,6 +495,59 @@ class ModelWorker:
             with contextlib.suppress(BaseException):
                 await asyncio.shield(join)
             raise
+
+    async def release_optional_memory(self, *, block: bool = True) -> int:
+        """Drop optional device memory on an inference thread.
+
+        Serialized with forwards the same way dispatch is: the adapter
+        dispatch lock when one batch runs at a time, and every dispatch slot
+        when several do. ``block=False`` returns 0 instead of waiting, so a
+        caller that already holds another model's lock cannot deadlock
+        against this one.
+
+        Returns:
+            Best-effort bytes released, or 0 when there is nothing to drop,
+            the worker is busy and ``block`` is false, or the executor has
+            shut down.
+        """
+        if self._dispatch_width > 1:
+            return await self._release_optional_memory_with_slots(block=block)
+        if not block and self._adapter_dispatch_lock.locked():
+            return 0
+        async with self._adapter_dispatch_lock:
+            return await self._invoke_release_optional_memory()
+
+    async def _release_optional_memory_with_slots(self, *, block: bool) -> int:
+        acquired = 0
+        try:
+            for _ in range(self._dispatch_width):
+                if not block and self._dispatch_slots.locked():
+                    return 0
+                await self._dispatch_slots.acquire()
+                acquired += 1
+            return await self._invoke_release_optional_memory()
+        finally:
+            for _ in range(acquired):
+                self._dispatch_slots.release()
+
+    async def _invoke_release_optional_memory(self) -> int:
+        loop = asyncio.get_running_loop()
+        try:
+            released = await loop.run_in_executor(
+                self._inference_executor,
+                self._adapter.release_optional_memory,
+            )
+        except RuntimeError as exc:
+            if "shutdown" not in str(exc).lower():
+                raise
+            logger.warning(
+                "Skipping optional-memory release for %s; inference executor is shut down",
+                self._model_name,
+            )
+            return 0
+        if isinstance(released, bool) or not isinstance(released, int) or released <= 0:
+            return 0
+        return released
 
     def _fail_queued_requests(self) -> int:
         """Fail every request the worker still owes an answer. Returns the count.
