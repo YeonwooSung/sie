@@ -32,10 +32,11 @@ MAX_RELATIONS = 65536
 # Words of head and tail text across one document's relations. Each relation
 # copies both endpoints' text, and endpoints can be long.
 MAX_RELATION_WORDS = 262144
-# Characters of that head and tail text (#378). Same rule as the record cap:
-# 32 characters per word, so ordinary text hits the word cap first while a
-# long token is bounded. Many ordinary English words are longer than 16
-# characters, so 32 is used instead of 16: it is the top of that range.
+# Characters of that head and tail text (#378). Same rule as the record cap.
+# The constant is MAX_RELATION_WORDS * 32: 32 characters per counted word,
+# including the joining space. The bound is per document, so text averaging
+# under 31 characters a word reaches the word cap first, and text made of
+# very long tokens reaches this cap.
 MAX_RELATION_CHARS = MAX_RELATION_WORDS * 32
 # Allowance units per kept relation (building it) and per scored cell.
 RELATION_UNITS = 2

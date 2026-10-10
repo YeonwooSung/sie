@@ -530,12 +530,13 @@ def test_record_text_is_bounded_by_characters() -> None:
 
 
 def test_ordinary_words_reach_the_word_cap_before_the_character_cap() -> None:
-    """An 8-letter word still hits the word cap first (8 < 32).
+    """A document of short words reaches the word cap before the character cap.
 
-    A token longer than 32 characters is what the character cap is for.
+    Eight letters plus the joining space average under 31 characters a word,
+    so that document stays under the character cap. Words averaging more than
+    32 characters hit the character cap first.
     """
     ordinary = 8
-    assert ordinary < 32
     words = structuring_decoding.MAX_RECORD_WORDS
     # A full word cap of 8-letter words, plus the joining spaces, stays under the character cap.
     joined = words * ordinary + (words - 1)
@@ -544,7 +545,7 @@ def test_ordinary_words_reach_the_word_cap_before_the_character_cap() -> None:
         relation_decoding.MAX_RELATION_WORDS * ordinary + (relation_decoding.MAX_RELATION_WORDS - 1)
         < relation_decoding.MAX_RELATION_CHARS
     )
-    # The same number of tokens, each longer than 32 characters, exceeds the character cap first.
+    # The same number of words, averaging more than 32 characters, exceeds the character cap first.
     assert words * (32 + 1) > structuring_decoding.MAX_RECORD_CHARS
     assert relation_decoding.MAX_RELATION_WORDS * (32 + 1) > relation_decoding.MAX_RELATION_CHARS
     assert relation_decoding.MAX_RELATION_CHARS == relation_decoding.MAX_RELATION_WORDS * 32

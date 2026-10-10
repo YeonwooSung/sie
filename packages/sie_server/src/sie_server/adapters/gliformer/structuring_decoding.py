@@ -41,12 +41,10 @@ MAX_RECORD_SPANS = 65536
 # the text alone grows with spans x document length. Flat single-label
 # removal keeps disjoint spans per slot: at most 100 slots x 2048 words.
 MAX_RECORD_WORDS = 262144
-# Characters of that field text (#378). The word cap counts every token as
-# one word, so it does not bound one very long token. Decoded text joins
-# tokens with spaces. 32 characters per word keeps normal text on the word
-# cap first. Many ordinary English words are longer than 16 characters, so
-# 32 is used instead of 16: it is the top of that range. A token longer
-# than 32 characters is what this bound is for.
+# Characters of that field text (#378). The constant is MAX_RECORD_WORDS * 32:
+# 32 characters per counted word, including the joining space. The bound is
+# per document, so text averaging under 31 characters a word reaches the word
+# cap first, and text made of very long tokens reaches this cap.
 MAX_RECORD_CHARS = MAX_RECORD_WORDS * 32
 
 
