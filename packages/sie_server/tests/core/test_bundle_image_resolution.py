@@ -62,7 +62,9 @@ def _uv_executable() -> str:
     found = shutil.which("uv")
     if found:
         return found
-    pytest.skip("uv is not installed, so the image resolver cannot run")
+    pytest.fail(
+        "SIE_RUN_IMAGE_RESOLUTION=1 but uv is not installed; the resolution job must not pass without resolving"
+    )
 
 
 def _image_requirements(platform: str, bundle: str) -> list[str]:
@@ -138,6 +140,13 @@ def _resolver_env() -> dict[str, str]:
     for key in _SCRUBBED_ENV:
         env.pop(key, None)
     return env
+
+
+def test_missing_uv_fails_the_opt_in(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "python"))
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    with pytest.raises(pytest.fail.Exception, match="uv is not installed"):
+        _uv_executable()
 
 
 @pytest.mark.skipif(

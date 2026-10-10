@@ -277,9 +277,17 @@ def test_bundle_image_installs_are_constrained_to_the_lock(dockerfile: str) -> N
     ]
     assert installs
     constraints_file = "/tmp/bundle-constraints.txt"  # noqa: S108
-    for line in installs:
-        assert constraints_file in line
-        assert f"-c {constraints_file}" in line or f"--constraint {constraints_file}" in line
+    # A case/if arm ends at `;;`. One logical RUN can hold both CUDA 12
+    # branches, so each install command is checked on its own.
+    commands = [
+        part.strip()
+        for line in installs
+        for part in line.split(";;")
+        if "-r /tmp/bundle-requirements.txt" in part and ("pip install" in part or "uv pip install" in part)
+    ]
+    assert commands
+    for command in commands:
+        assert f"-c {constraints_file}" in command or f"--constraint {constraints_file}" in command
 
 
 def test_expected_release_set_has_sixteen_tags_and_six_names(complete_source):

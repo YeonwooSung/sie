@@ -295,10 +295,11 @@ def _lock_edges(items: object) -> tuple[LockEdge, ...]:
             continue
         if not isinstance(item, dict):
             continue
-        raw_name = item.get("name")
+        fields = cast("Mapping[str, object]", item)
+        raw_name = fields.get("name")
         if not isinstance(raw_name, str):
             continue
-        extras = _lock_extras(item.get("extra", item.get("extras")))
+        extras = _lock_extras(fields.get("extra", fields.get("extras")))
         edges.append(LockEdge(_normalize_package_name(raw_name), extras))
     return tuple(edges)
 
