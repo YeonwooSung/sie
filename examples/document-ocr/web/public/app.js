@@ -25,7 +25,9 @@ let donutBuf = { entities: [], data: null };
 let glinerBuf = [];
 let modelConfig = null;
 let registeredSet = new Set();
-let cudaAvailable = false;
+let cudaAvailable = null;
+let catalogKnown = false;
+let availabilityUnavailable = false;
 
 function setBadge(text, cls) {
   els.badge.textContent = text;
@@ -94,28 +96,60 @@ function updateSnippets() {
   els.snippetNer.innerHTML = snippetNer(els.selectNer.value, activeSample);
 }
 
+function clearAvailability() {
+  registeredSet = new Set();
+  cudaAvailable = null;
+  catalogKnown = false;
+  availabilityUnavailable = true;
+}
+
+function optionAvailable(opt) {
+  if (availabilityUnavailable) {
+    return { inCatalog: false, blockedByCuda: false, available: false };
+  }
+  // Empty successful catalogs are known. A failed fetch leaves catalogKnown false.
+  const serverKnown = catalogKnown;
+  const inCatalog = !serverKnown || registeredSet.has(opt.id);
+  const blockedByCuda = Boolean(opt.gpuRequired) && cudaAvailable === false;
+  return { inCatalog, blockedByCuda, available: inCatalog && !blockedByCuda };
+}
+
+function enabledValue(selectEl) {
+  const option = selectEl.selectedOptions && selectEl.selectedOptions[0];
+  if (!option || option.disabled) return "";
+  return option.value;
+}
+
 function populateDropdown(selectEl, options, defaultId) {
+  const previous = selectEl.value;
   selectEl.innerHTML = "";
+  const entries = [];
   for (const opt of options) {
     const node = document.createElement("option");
     node.value = opt.id;
-    const inCatalog = registeredSet.size === 0 || registeredSet.has(opt.id);
-    const blockedByCuda = opt.gpuRequired && !cudaAvailable;
-    const available = inCatalog && !blockedByCuda;
+    const { blockedByCuda, available } = optionAvailable(opt);
     const labelSuffix = !available
-      ? blockedByCuda
+      ? blockedByCuda || opt.gpuRequired
         ? " (GPU image needed)"
-        : opt.gpuRequired
-          ? " (GPU image needed)"
-          : " (not registered)"
+        : " (not registered)"
       : "";
     node.textContent = opt.label + labelSuffix;
     if (!available) node.disabled = true;
-    if (opt.id === defaultId) node.selected = true;
     node.title = opt.description;
     selectEl.appendChild(node);
+    entries.push({ node, available, id: opt.id });
   }
-  selectEl.addEventListener("change", updateSnippets);
+  const preferred = previous || defaultId;
+  const pick =
+    entries.find((entry) => entry.available && entry.id === preferred) ||
+    entries.find((entry) => entry.available && entry.id === defaultId) ||
+    entries.find((entry) => entry.available);
+  if (pick) pick.node.selected = true;
+  else selectEl.selectedIndex = -1;
+  if (!selectEl.dataset.bound) {
+    selectEl.addEventListener("change", updateSnippets);
+    selectEl.dataset.bound = "1";
+  }
 }
 
 function renderSamples(samples, onClick) {
@@ -179,11 +213,51 @@ function renderExtraction() {
     html += "</div>";
   }
 
-  if (!html) html = '<p class="hint">running...</p>';
+  if (!html) html = '<p class="hint">nothing extracted on this image</p>';
   els.extraction.innerHTML = html;
 }
 
-function runSample(sampleId) {
+async function syncAvailability() {
+  try {
+    const r = await fetch("/api/health");
+    const j = await r.json();
+    els.sieUrl.textContent = j.sieUrl;
+    if (j.catalogKnown !== true) {
+      clearAvailability();
+      els.sieState.textContent =
+        j.sie === true
+          ? "model catalog unavailable"
+          : "SIE not reachable yet (still preloading models?)";
+      return false;
+    }
+    registeredSet = new Set(j.registered ?? []);
+    cudaAvailable = j.cuda === true ? true : j.cuda === false ? false : null;
+    catalogKnown = true;
+    availabilityUnavailable = false;
+    els.sieState.textContent = `SIE healthy · ${j.registeredModels} models registered`;
+    return true;
+  } catch {
+    clearAvailability();
+    els.sieState.textContent = "could not reach the local server";
+    return false;
+  }
+}
+
+function applyModelMenus() {
+  if (!modelConfig) return;
+  populateDropdown(els.selectRecognition, modelConfig.recognition, modelConfig.defaults.recognition);
+  populateDropdown(els.selectStructured, modelConfig.structured, modelConfig.defaults.structured);
+  populateDropdown(els.selectNer, modelConfig.ner, modelConfig.defaults.ner);
+  updateSnippets();
+}
+
+async function runSample(sampleId) {
+  const availabilityOk = await syncAvailability();
+  applyModelMenus();
+  if (!availabilityOk) {
+    setBadge("error", "red");
+    return;
+  }
   activeSampleId = sampleId;
   setBadge("running", "running");
   els.recognition.innerHTML = '<p class="hint">running recognition...</p>';
@@ -195,9 +269,9 @@ function runSample(sampleId) {
   glinerBuf = [];
   updateTimings();
 
-  const recognition = els.selectRecognition.value;
-  const structured = els.selectStructured.value;
-  const ner = els.selectNer.value;
+  const recognition = enabledValue(els.selectRecognition);
+  const structured = enabledValue(els.selectStructured);
+  const ner = enabledValue(els.selectNer);
   const url = `/api/run?id=${encodeURIComponent(sampleId)}&recognition=${encodeURIComponent(recognition)}&structured=${encodeURIComponent(structured)}&ner=${encodeURIComponent(ner)}`;
   const es = new EventSource(url);
 
@@ -257,32 +331,13 @@ function runSample(sampleId) {
 }
 
 async function init() {
-  // Fetch SIE health (and registered models)
-  let registered = [];
-  try {
-    const r = await fetch("/api/health");
-    const j = await r.json();
-    els.sieUrl.textContent = j.sieUrl;
-    if (!j.sie) {
-      els.sieState.textContent = "SIE not reachable yet (still preloading models?)";
-    } else {
-      els.sieState.textContent = `SIE healthy · ${j.registeredModels} models registered`;
-      registered = j.registered ?? [];
-      cudaAvailable = !!j.cuda;
-    }
-  } catch {
-    els.sieState.textContent = "could not reach the local server";
-  }
-  registeredSet = new Set(registered);
+  await syncAvailability();
 
   // Fetch model menus (config-side)
   try {
     const r = await fetch("/api/models");
     modelConfig = await r.json();
-    populateDropdown(els.selectRecognition, modelConfig.recognition, modelConfig.defaults.recognition);
-    populateDropdown(els.selectStructured, modelConfig.structured, modelConfig.defaults.structured);
-    populateDropdown(els.selectNer, modelConfig.ner, modelConfig.defaults.ner);
-    updateSnippets();
+    applyModelMenus();
   } catch (e) {
     console.error("failed to load model config", e);
   }
