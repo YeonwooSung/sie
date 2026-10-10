@@ -81,6 +81,15 @@ default). The returned `markdown` entity preserves raw decoded text, including
 grounding markers and whitespace; margin filtering or Markdown cleanup must
 be applied separately. Each image is metered as one page.
 
+The catalog's `lightonai/LightOnOCR-3-4B` default profile serves the same
+contract through `SGLangVisionExtractAdapter` in the `sglang-vision-extract`
+bundle, with continuous batching. Its loadtime options set `temperature: 0.1`,
+`top_p: 1.0`, `chat_template_kwargs: {enable_thinking: false}`, no system
+prompt and `allowed_instructions: [grounding]`. That adapter trims leading and
+trailing whitespace from the decoded text. The `transformers` profile keeps
+`LightOnOCR3Adapter`. Other `SGLangVisionExtractAdapter` profiles keep greedy
+decoding (`temperature: 0.0`) and accept any instruction.
+
 See the [official LightOnOCR-3 model card](https://huggingface.co/lightonai/LightOnOCR-3-4B)
 for the trained input and output formats. The existing `LightOnOCRAdapter`
 continues to serve LightOnOCR-2 with its own processor and generation behavior.
@@ -789,6 +798,15 @@ auto-retries; see `packages/sie_sdk/README.md` for client-side controls.
 |--|--|--|
 | `SIE_DEFAULT_COMPUTE_PRECISION` | `float16` | One of `float16`, `bfloat16`, `float32`. |
 | `SIE_ATTENTION_BACKEND` | `auto` | One of `auto`, `flash_attention_2`, `sdpa`, `eager`. |
+| `SIE_DISABLE_CUDNN_SDP` | unset (off) | Set `1` to disable cuDNN for Torch scaled dot-product attention at Python worker startup. Unset or `0` leaves the current backend policy alone. |
+
+This startup policy applies throughout the Python worker process, across all
+models that use Torch SDPA. Other eligible SDPA backends remain available; it
+does not guarantee Flash attention or better performance and does not disable
+cuDNN generally. The policy is applied before model loading and readiness and
+is not restored at shutdown. Start a fresh worker process with the variable
+unset or `0` to restore Torch's defaults; unset or `0` does not reset a backend
+already changed in the same interpreter.
 
 ### Diagnostics
 

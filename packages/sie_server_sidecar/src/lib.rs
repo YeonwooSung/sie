@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use futures_util::StreamExt;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep, timeout};
 use tracing::{debug, info, warn};
@@ -456,6 +456,7 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
 
     let config_apply_state = Arc::new(ConfigApplyState::new(config.bundle_config_hash.clone()));
     let loaded_models = config_apply_state.loaded_models();
+    let health_publish_now = Arc::new(Notify::new());
     let batch_cancel_state = BatchCancelState::default();
     let request_cancel_state = RequestCancelState::new(work_cancel_tombstone_ttl());
 
@@ -536,6 +537,7 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
         Arc::clone(&readiness),
         Arc::clone(&config_apply_state),
         Arc::clone(&loaded_models),
+        Arc::clone(&health_publish_now),
         shutdown.clone(),
     );
 
@@ -570,6 +572,8 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
             bundle_config_hash: config_apply_state.bundle_config_hash(),
             unsupported_models: config_apply_state.unsupported_models(),
             loaded_models: Arc::clone(&loaded_models),
+            loading_models: config_apply_state.loading_models(),
+            publish_now: Arc::clone(&health_publish_now),
             numerical_process_inventory,
             execution_authority_v1: worker_pool.execution_authority_v1(),
             numerical_admission_v1: worker_pool.numerical_admission_v1(),
@@ -849,6 +853,7 @@ pub async fn run_local(config: WorkerConfig) -> anyhow::Result<()> {
         ));
     let config_apply_state = Arc::new(ConfigApplyState::new(config.bundle_config_hash.clone()));
     let loaded_models = config_apply_state.loaded_models();
+    let health_publish_now = Arc::new(Notify::new());
     let latency_tracker = Arc::new(Mutex::new(LatencyTracker::new(200, 10)));
 
     let dispatcher = Arc::new(Dispatcher::new(
@@ -879,6 +884,7 @@ pub async fn run_local(config: WorkerConfig) -> anyhow::Result<()> {
         Arc::clone(&readiness),
         Arc::clone(&config_apply_state),
         Arc::clone(&loaded_models),
+        health_publish_now,
         shutdown.clone(),
     );
 
@@ -1508,11 +1514,164 @@ fn request_id_from_cancel_subject(subject: &str) -> Option<String> {
     }
 }
 
+/// Gateway `WorkerRegistry` heartbeat timeout (`packages/sie_gateway/src/main.rs`).
+/// Health publication continues while IPC pings fail, so a child's loading list
+/// older than this is cleared instead of holding the lane until liveness restarts it.
+const GATEWAY_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Published in-progress loads after one IPC ping round.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LoadingSetUpdate {
+    Replace(Vec<String>),
+    Keep,
+}
+
+/// Last loading list from one adapter child, and when that child last reported it.
+#[derive(Clone, Debug)]
+struct ChildLoadingMemory {
+    models: Vec<String>,
+    reported_at: Instant,
+}
+
+/// Last successful loading report from one adapter child, aged at decision time.
+/// An age equal to the heartbeat timeout is still fresh; only an older report expires.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChildLoadingSnapshot {
+    models: Vec<String>,
+    age: Duration,
+}
+
+/// One child's ping in this round.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ChildPingRound {
+    /// The child responded. An empty list clears only this child.
+    Reported(Vec<String>),
+    /// The ping failed. `None` means this child has never reported.
+    Failed(Option<ChildLoadingSnapshot>),
+}
+
+fn loading_report_expired(age: Duration, heartbeat_timeout: Duration) -> bool {
+    age > heartbeat_timeout
+}
+
+/// Models this child still contributes. A report replaces only that child's
+/// list, including when the list is empty. A failed ping contributes the stored
+/// list until that child's own report expires.
+fn retained_loading_models(
+    round: &ChildPingRound,
+    heartbeat_timeout: Duration,
+) -> Option<&[String]> {
+    match round {
+        ChildPingRound::Reported(models) => Some(models.as_slice()),
+        ChildPingRound::Failed(Some(snapshot))
+            if !loading_report_expired(snapshot.age, heartbeat_timeout) =>
+        {
+            Some(snapshot.models.as_slice())
+        }
+        ChildPingRound::Failed(_) => None,
+    }
+}
+
+/// Merge per-child loading reports.
+///
+/// Another child's success does not clear a child whose ping failed. A round
+/// where every ping fails keeps each unexpired list (`Keep` when nothing
+/// expired). A stored report older than `heartbeat_timeout` is dropped on its
+/// own clock, including when some other child answered.
+fn loading_set_after_ping_round(
+    children: &[ChildPingRound],
+    heartbeat_timeout: Duration,
+) -> LoadingSetUpdate {
+    let every_ping_failed = children
+        .iter()
+        .all(|child| matches!(child, ChildPingRound::Failed(_)));
+    let any_expired = children.iter().any(|child| {
+        matches!(
+            child,
+            ChildPingRound::Failed(Some(snapshot))
+                if loading_report_expired(snapshot.age, heartbeat_timeout)
+        )
+    });
+    if every_ping_failed && !any_expired {
+        return LoadingSetUpdate::Keep;
+    }
+    let mut merged = Vec::new();
+    for child in children {
+        if let Some(models) = retained_loading_models(child, heartbeat_timeout) {
+            merged.extend(models.iter().cloned());
+        }
+    }
+    LoadingSetUpdate::Replace(merged)
+}
+
+fn store_child_loading_report(
+    memory: &mut Option<ChildLoadingMemory>,
+    round: &ChildPingRound,
+    now: Instant,
+    heartbeat_timeout: Duration,
+) {
+    match round {
+        ChildPingRound::Reported(models) => {
+            *memory = Some(ChildLoadingMemory {
+                models: models.clone(),
+                reported_at: now,
+            });
+        }
+        ChildPingRound::Failed(_) => {
+            if retained_loading_models(round, heartbeat_timeout).is_none() {
+                *memory = None;
+            }
+        }
+    }
+}
+
+/// Record this round's per-child reports and return the set to publish.
+/// A missing ping result is a failure for that child and keeps its stored list
+/// until that list's own age exceeds `heartbeat_timeout`.
+fn apply_loading_ping_round<E>(
+    child_count: usize,
+    ping_results: &[(usize, Result<crate::ipc_types::PingResponse, E>)],
+    memory: &mut Vec<Option<ChildLoadingMemory>>,
+    now: Instant,
+    heartbeat_timeout: Duration,
+) -> LoadingSetUpdate {
+    if memory.len() < child_count {
+        memory.resize_with(child_count, || None);
+    }
+    let mut reported: Vec<Option<Vec<String>>> = vec![None; child_count];
+    for (index, result) in ping_results {
+        if let Some(slot) = reported.get_mut(*index) {
+            *slot = result
+                .as_ref()
+                .ok()
+                .map(|response| response.loading_models.clone());
+        }
+    }
+    let mut rounds = Vec::with_capacity(child_count);
+    for (index, reported_models) in reported.into_iter().enumerate() {
+        rounds.push(match reported_models {
+            Some(models) => ChildPingRound::Reported(models),
+            None => {
+                ChildPingRound::Failed(memory[index].as_ref().map(|stored| ChildLoadingSnapshot {
+                    models: stored.models.clone(),
+                    age: now.saturating_duration_since(stored.reported_at),
+                }))
+            }
+        });
+    }
+    let update = loading_set_after_ping_round(&rounds, heartbeat_timeout);
+    for (index, round) in rounds.iter().enumerate() {
+        store_child_loading_report(&mut memory[index], round, now, heartbeat_timeout);
+    }
+    update
+}
+
 /// Ping every adapter IPC server on a ticker. A failure is logged but
 /// non-fatal — the consumer loop will surface real problems via
 /// EnsureModelReady / Process* errors.
 ///
 /// Each successful ready ping refreshes the [`Readiness`] heartbeat timestamp.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct dependency
 fn spawn_heartbeat(
     worker_pool: Arc<AdapterWorkerPool>,
     runtime_state: Arc<RuntimeState>,
@@ -1520,6 +1679,7 @@ fn spawn_heartbeat(
     readiness: Arc<Readiness>,
     config_apply_state: Arc<ConfigApplyState>,
     loaded_models: crate::health_publisher::SharedLoadedModels,
+    health_publish_now: Arc<Notify>,
     shutdown: Arc<Shutdown>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1529,6 +1689,7 @@ fn spawn_heartbeat(
         // (0 -> 1 "heartbeat broke", N -> 0 "heartbeat recovered")
         // without spamming once per tick while the backend is down.
         let mut consecutive_failures: u64 = 0;
+        let mut last_loading_by_child: Vec<Option<ChildLoadingMemory>> = Vec::new();
         loop {
             let wait = shutdown.wait();
             tokio::select! {
@@ -1542,11 +1703,33 @@ fn spawn_heartbeat(
                     let ping_results = worker_pool.ping_all(ts).await;
                     let ready_children = worker_pool.ready_child_count();
                     crate::health_publisher::record_runtime_telemetry(&runtime_state);
-                    let successful_ready: Vec<_> = ping_results
+                    let successful: Vec<_> = ping_results
                         .iter()
                         .filter_map(|(_index, result)| result.as_ref().ok())
+                        .collect();
+                    let successful_ready: Vec<_> = successful
+                        .iter()
+                        .copied()
                         .filter(|resp| resp.ready)
                         .collect();
+                    // A child's list is replaced only when that child responds,
+                    // including with an empty list. A failed ping keeps that
+                    // child's list until its own report is older than the
+                    // gateway heartbeat timeout. Another child's success must
+                    // not clear it. Heartbeats continue, so the gateway would
+                    // not age the lane out on its own.
+                    let update = apply_loading_ping_round(
+                        worker_pool.child_count(),
+                        &ping_results,
+                        &mut last_loading_by_child,
+                        Instant::now(),
+                        GATEWAY_HEARTBEAT_TIMEOUT,
+                    );
+                    if let LoadingSetUpdate::Replace(models) = update {
+                        if config_apply_state.set_loading_models(models) {
+                            health_publish_now.notify_one();
+                        }
+                    }
                     if let Some(resp) = (ready_children > 0).then(|| successful_ready.first()).flatten() {
                         config_apply_state.adopt_backend_hash_if_unset(&resp.bundle_config_hash);
                         let mut merged_loaded_models = Vec::new();
@@ -1947,6 +2130,92 @@ async fn run_pull_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failed_at(models: Vec<String>, age: Duration) -> ChildPingRound {
+        ChildPingRound::Failed(Some(ChildLoadingSnapshot { models, age }))
+    }
+
+    #[test]
+    fn failed_ping_round_keeps_loading_models_until_heartbeat_timeout() {
+        let timeout = GATEWAY_HEARTBEAT_TIMEOUT;
+        let loading = vec!["org/loading".to_string()];
+        let other = vec!["org/other".to_string()];
+        assert_eq!(
+            loading_set_after_ping_round(
+                &[
+                    ChildPingRound::Reported(loading.clone()),
+                    ChildPingRound::Reported(other.clone()),
+                ],
+                timeout,
+            ),
+            LoadingSetUpdate::Replace(vec!["org/loading".into(), "org/other".into()])
+        );
+        assert_eq!(
+            loading_set_after_ping_round(&[ChildPingRound::Reported(Vec::new())], timeout),
+            LoadingSetUpdate::Replace(vec![])
+        );
+        assert_eq!(
+            loading_set_after_ping_round(&[failed_at(loading.clone(), timeout)], timeout),
+            LoadingSetUpdate::Keep
+        );
+        assert_eq!(
+            loading_set_after_ping_round(
+                &[failed_at(loading.clone(), Duration::from_secs(1))],
+                timeout,
+            ),
+            LoadingSetUpdate::Keep
+        );
+        assert_eq!(
+            loading_set_after_ping_round(&[ChildPingRound::Failed(None)], timeout),
+            LoadingSetUpdate::Keep
+        );
+        assert_eq!(
+            loading_set_after_ping_round(
+                &[failed_at(
+                    loading.clone(),
+                    timeout + Duration::from_nanos(1)
+                )],
+                timeout,
+            ),
+            LoadingSetUpdate::Replace(vec![])
+        );
+        assert_eq!(
+            loading_set_after_ping_round(
+                &[
+                    failed_at(loading, Duration::from_secs(1)),
+                    failed_at(other, timeout + Duration::from_nanos(1)),
+                ],
+                timeout,
+            ),
+            LoadingSetUpdate::Replace(vec!["org/loading".into()])
+        );
+    }
+
+    #[test]
+    fn sibling_ping_does_not_clear_a_child_whose_ping_failed() {
+        let timeout = GATEWAY_HEARTBEAT_TIMEOUT;
+        let loading = vec!["org/loading".to_string()];
+        assert_eq!(
+            loading_set_after_ping_round(
+                &[
+                    failed_at(loading.clone(), Duration::from_secs(1)),
+                    ChildPingRound::Reported(Vec::new()),
+                ],
+                timeout,
+            ),
+            LoadingSetUpdate::Replace(loading.clone())
+        );
+        assert_eq!(
+            loading_set_after_ping_round(
+                &[
+                    failed_at(loading, timeout + Duration::from_nanos(1)),
+                    ChildPingRound::Reported(Vec::new()),
+                ],
+                timeout,
+            ),
+            LoadingSetUpdate::Replace(Vec::new())
+        );
+    }
 
     #[test]
     fn pull_loop_inflight_defaults_are_positive() {
