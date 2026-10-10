@@ -304,6 +304,36 @@ version = "7.0.0"
     assert "contested==7.0.0" not in constraints
 
 
+def test_untrusted_root_unpins_a_transitive_also_reached_by_a_constrained_root() -> None:
+    lock = """
+version = 1
+[[package]]
+name = "sentence-transformers"
+version = "5.4.1"
+dependencies = [
+    { name = "huggingface-hub" },
+]
+
+[[package]]
+name = "transformers"
+version = "4.57.6"
+dependencies = [
+    { name = "huggingface-hub" },
+]
+
+[[package]]
+name = "huggingface-hub"
+version = "0.36.2"
+"""
+    constraints = lock_constraint_lines(
+        ["sentence-transformers>=5.4.1,<6", "transformers>=5.14,<6"],
+        parse_uv_lock(lock),
+    )
+    assert "sentence-transformers==5.4.1" in constraints
+    assert "huggingface-hub==0.36.2" not in constraints
+    assert not any(line.startswith("transformers==") for line in constraints)
+
+
 def test_public_prefix_constraint_ignores_local_build_edges() -> None:
     lock = """
 version = 1

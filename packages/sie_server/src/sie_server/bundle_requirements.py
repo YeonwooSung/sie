@@ -207,8 +207,12 @@ def lock_constraint_lines(requirements: Sequence[str], lock: UvLock) -> list[str
     contributes lock neighbors only when it matches the locked version. A pin
     that differs (``torch==2.11.0`` against a ``2.9.1`` lock) is an untrusted
     root, same as a range that does not contain the lock: those edges describe
-    a distribution the bundle will not install. Neighbors reached only through
-    an untrusted root are not pinned. A package with two public versions is
+    a distribution the bundle will not install. A neighbor an untrusted root
+    can reach is not pinned, even when a constrained root reaches it too.
+    Pinning that shared package to the lock can contradict the untrusted
+    distribution (``huggingface-hub`` 0.36 from ``sentence-transformers``
+    versus ``huggingface-hub>=1`` from transformers 5). The constrained
+    requirement itself stays pinned. A package with two public versions is
     skipped with a comment instead of aborting.
     """
     grouped = _requirement_groups(requirements)
@@ -230,10 +234,13 @@ def lock_constraint_lines(requirements: Sequence[str], lock: UvLock) -> list[str
     constrained_reach = _reachable(constrained, lock)
     exact_reach = _reachable(exact, lock)
     untrusted_reach = _reachable(untrusted, lock)
-    # Neighbors of an exact pin that matches the lock stay pinned unless a
-    # moved-off distribution also reaches them. A constrained dependency still
-    # wins: that package is installed at the locked version.
-    trusted = constrained_reach | (exact_reach - untrusted_reach)
+    # A transitive package an untrusted root can reach stays unpinned, even
+    # when a constrained root reaches it too. The image installs the untrusted
+    # distribution, and the lock pin can make that solve fail. Direct
+    # constrained requirements stay pinned: dropping ``torch`` because
+    # transformers 5 also depends on it would float the bundle's own torch.
+    constrained_names = {name for name, _extras in constrained}
+    trusted = ((constrained_reach | exact_reach) - untrusted_reach) | constrained_names
 
     pins: list[str] = []
     skips: list[str] = []
