@@ -20,10 +20,10 @@ import functools
 import logging
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from sie_server.adapters.base import released_bytes
 from sie_server.core.adaptive_batching import (
@@ -121,6 +121,18 @@ def _has_releasable_memory(adapter: object) -> bool:
     except Exception:
         logger.exception("has_releasable_memory failed; treating the adapter as holding nothing")
         return False
+
+
+def _optional_memory_release_hook(adapter: object) -> Callable[[], int] | None:
+    """Bound ``release_optional_memory``, or None when the adapter has none.
+
+    Duck-typed adapters are not all ``ModelAdapter`` subclasses. A missing
+    hook means there is nothing to release, and callers must not call it.
+    """
+    hook = getattr(adapter, "release_optional_memory", None)
+    if not callable(hook):
+        return None
+    return cast("Callable[[], int]", hook)
 
 
 def _lock_can_acquire_now(lock: asyncio.Lock) -> bool:
@@ -344,8 +356,8 @@ class ModelWorker:
             # Recovery already holds the dispatch lock (or the forward that
             # just failed has left the inference thread idle), so the adapter
             # method itself is the right call — re-entering release_optional_memory()
-            # here would wait on that same lock.
-            release_optional_memory=adapter.release_optional_memory,
+            # here would wait on that same lock. No hook means nothing to release.
+            release_optional_memory=_optional_memory_release_hook(adapter),
         )
 
     # =========================================================================
@@ -578,11 +590,14 @@ class ModelWorker:
                 self._dispatch_slots.release()
 
     async def _invoke_release_optional_memory(self) -> int:
+        hook = _optional_memory_release_hook(self._adapter)
+        if hook is None:
+            return 0
         loop = asyncio.get_running_loop()
         try:
             released = await loop.run_in_executor(
                 self._inference_executor,
-                self._adapter.release_optional_memory,
+                hook,
             )
         except RuntimeError as exc:
             if "shutdown" not in str(exc).lower():

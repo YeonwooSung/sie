@@ -1323,6 +1323,132 @@ class TestProactiveEviction:
 
         assert released == 0
 
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_inflight_release_that_finishes_in_time_returns_its_bytes(
+        self,
+        mock_load_adapter: MagicMock,
+        mock_adapter_factory: Callable[[], MagicMock],
+    ) -> None:
+        """Joining a release that is already running returns its bytes.
+
+        Eviction skips a model only while that release is still running. A
+        join that finishes inside the timeout must leave the model evictable,
+        and must not start a second release.
+        """
+        registry = ModelRegistry()
+        registry.add_config(_make_config(name="sibling", hf_id="org/sibling"))
+        registry.add_config(_make_config(name="caller", hf_id="org/caller"))
+        started = threading.Event()
+        release_gate = threading.Event()
+
+        def release_sibling() -> int:
+            started.set()
+            release_gate.wait(timeout=2)
+            return 4096
+
+        sibling = mock_adapter_factory()
+        caller = mock_adapter_factory()
+        sibling.has_releasable_memory.return_value = True
+        caller.has_releasable_memory.return_value = False
+        sibling.release_optional_memory.side_effect = release_sibling
+        mock_load_adapter.side_effect = [sibling, caller]
+        await registry.load_async("sibling", "cpu")
+        await registry.load_async("caller", "cpu")
+        loaded = registry._loaded["sibling"]
+        monitor: asyncio.Task[int] | None = None
+        joined_task: asyncio.Task[int] | None = None
+        original_unload = registry._do_unload
+        try:
+            monitor = asyncio.create_task(registry._release_loaded_optional_memory("sibling", loaded))
+            deadline = asyncio.get_running_loop().time() + 2
+            while not started.is_set():
+                if asyncio.get_running_loop().time() > deadline:
+                    raise AssertionError("release did not start")
+                await asyncio.sleep(0.01)
+            joined_task = asyncio.create_task(registry._release_loaded_optional_memory("sibling", loaded))
+            await asyncio.sleep(0)
+            assert sibling.release_optional_memory.call_count == 1
+            assert not registry._optional_release_tasks["sibling"].done()
+            release_gate.set()
+            joined = await asyncio.wait_for(joined_task, 2)
+            first = await asyncio.wait_for(monitor, 2)
+            assert joined == 4096
+            assert first == 4096
+            assert sibling.release_optional_memory.call_count == 1
+            assert "sibling" not in registry._optional_release_inflight()
+            registry._do_unload = AsyncMock()
+            assert await registry.evict_lru_excluding("caller") is EvictionResult.EVICTED
+            registry._do_unload.assert_awaited_once_with("sibling", reason="oom_recovery")
+        finally:
+            release_gate.set()
+            registry._do_unload = original_unload
+            pending = [task for task in registry._optional_release_tasks.values() if not task.done()]
+            for waiter in (monitor, joined_task):
+                if waiter is not None and not waiter.done():
+                    pending.append(waiter)
+            if pending:
+                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), 2)
+            await registry.unload_all_async()
+
+    @patch("sie_server.core.registry._OPTIONAL_MEMORY_RELEASE_TIMEOUT_S", 0.05)
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_stuck_inflight_release_stays_excluded_from_eviction(
+        self,
+        mock_load_adapter: MagicMock,
+        mock_adapter_factory: Callable[[], MagicMock],
+    ) -> None:
+        """A release still running after the join timeout is not evicted.
+
+        Waiting does not cancel the in-flight task. The LRU sibling stays
+        excluded, and a later sibling can still be evicted.
+        """
+        registry = ModelRegistry()
+        for name in ("sibling", "free", "caller"):
+            registry.add_config(_make_config(name=name, hf_id=f"org/{name}"))
+        started = threading.Event()
+        release_gate = threading.Event()
+
+        def release_sibling() -> int:
+            started.set()
+            release_gate.wait(timeout=2)
+            return 4096
+
+        sibling = mock_adapter_factory()
+        free = mock_adapter_factory()
+        caller = mock_adapter_factory()
+        sibling.has_releasable_memory.return_value = True
+        sibling.release_optional_memory.side_effect = release_sibling
+        mock_load_adapter.side_effect = [sibling, free, caller]
+        await registry.load_async("sibling", "cpu")
+        await registry.load_async("free", "cpu")
+        await registry.load_async("caller", "cpu")
+        loaded = registry._loaded["sibling"]
+        monitor: asyncio.Task[int] | None = None
+        original_unload = registry._do_unload
+        try:
+            monitor = asyncio.create_task(registry._release_loaded_optional_memory("sibling", loaded))
+            deadline = asyncio.get_running_loop().time() + 2
+            while not started.is_set():
+                if asyncio.get_running_loop().time() > deadline:
+                    raise AssertionError("release did not start")
+                await asyncio.sleep(0.01)
+            joined = await registry._release_loaded_optional_memory("sibling", loaded)
+            assert joined == 0
+            assert sibling.release_optional_memory.call_count == 1
+            assert "sibling" in registry._optional_release_inflight()
+            registry._do_unload = AsyncMock()
+            assert await registry.evict_lru_excluding("caller") is EvictionResult.EVICTED
+            registry._do_unload.assert_awaited_once_with("free", reason="oom_recovery")
+        finally:
+            release_gate.set()
+            registry._do_unload = original_unload
+            pending = [task for task in registry._optional_release_tasks.values() if not task.done()]
+            if monitor is not None and not monitor.done():
+                pending.append(monitor)
+            if pending:
+                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), 2)
+            await registry.unload_all_async()
+
     async def test_memory_monitor_starts_and_stops(self) -> None:
         """Memory monitor can be started and stopped cleanly."""
         from sie_server.core.memory import MemoryConfig

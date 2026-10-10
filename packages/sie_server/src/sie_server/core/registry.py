@@ -2945,8 +2945,9 @@ class ModelRegistry:
         has cleared. OOM recovery passes the caller and does not consult
         pressure: an allocation can fail below the monitor threshold.
         A model whose inference lock is busy is skipped instead of waiting
-        for its in-flight batches. The wait for a release that does start is
-        bounded; timing out does not unload the model.
+        for its in-flight batches. A release already running is joined within
+        the same bound; its bytes count when that wait finishes. Timing out
+        does not unload the model.
         """
         total = 0
         for name in list(manager.loaded_models):
@@ -2982,19 +2983,25 @@ class ModelRegistry:
         on the default executor can block on a lock the inference thread
         still holds.
 
-        The wait is bounded. On timeout the release keeps the dispatch lock
-        until the adapter call returns, and this method returns 0 so the
-        caller can move on. A later eviction must skip ``name`` while that
-        task is running; joining the inference thread would pin the monitor.
+        A release already running for ``name`` is joined instead of started
+        again. The wait, for that task or a new one, is bounded. Finishing
+        inside the bound returns its byte count and leaves ``name`` evictable.
+        On timeout the release keeps the dispatch lock until the adapter call
+        returns, and this method returns 0 so the caller can move on. A later
+        eviction must skip ``name`` while that task is still running; joining
+        the inference thread would pin the monitor.
         """
         inflight = self._optional_release_tasks.get(name)
-        if inflight is not None and not inflight.done():
-            return 0
-        task = asyncio.create_task(
-            self._run_optional_memory_release(name, loaded),
-            name=f"optional-memory-{name}",
-        )
-        self._optional_release_tasks[name] = task
+        if inflight is None or inflight.done():
+            inflight = asyncio.create_task(
+                self._run_optional_memory_release(name, loaded),
+                name=f"optional-memory-{name}",
+            )
+            self._optional_release_tasks[name] = inflight
+        return await self._await_optional_release(name, inflight)
+
+    async def _await_optional_release(self, name: str, task: asyncio.Task[int]) -> int:
+        """Wait out ``task`` up to the release bound. A timeout leaves it running."""
         try:
             return await asyncio.wait_for(asyncio.shield(task), _OPTIONAL_MEMORY_RELEASE_TIMEOUT_S)
         except TimeoutError:
