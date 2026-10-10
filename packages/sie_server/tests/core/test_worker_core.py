@@ -711,11 +711,14 @@ class TestModelWorker:
 
     @pytest.mark.asyncio
     async def test_staggered_burst_shreds_without_idle_window(self, mock_adapter: MagicMock) -> None:
-        """``idle_coalesce_ms=0`` does not coalesce a staggered tail.
+        """``idle_coalesce_ms=0`` does not hold the queued tail the window fuses.
 
-        Every idle arrival dispatches immediately, so the same stagger as
-        ``test_staggered_burst_fuses_with_idle_window`` cannot land in one
-        forward. This is the escape hatch, not the default.
+        Same shape as ``test_staggered_burst_fuses_with_idle_window``: the
+        head runs alone, two requests are already queued before the loop
+        selects, and one more arrives 10ms later. With the window off that
+        pair is dispatched immediately, so the later arrival does not join
+        it (``[1, 2, 1]``). With the window on the same tail is held and
+        fuses (``[1, 3]``). This is the escape hatch, not the default.
         """
         call_sizes: list[int] = []
 
@@ -732,30 +735,50 @@ class TestModelWorker:
             max_batch_tokens=1000,
             max_batch_requests=64,
             max_batch_wait_ms=500,
-            coalesce_ms=200,
-            coalesce_ratio=0.5,
+            coalesce_ms=400,
+            coalesce_ratio=1.0,
             idle_coalesce_ms=0,
         )
         worker = ModelWorker(mock_adapter, config)
         await worker.start()
 
         try:
-            futures = []
-            for i in range(4):
-                future = await worker.submit(
-                    [make_text_item([1, 2], 0)],
-                    [Item(text=f"text {i}")],
-                    ["dense"],
-                )
-                futures.append(future)
-                await asyncio.sleep(0.005)
+            started = time.monotonic()
+            first = await worker.submit(
+                [make_text_item([1, 2], 0)],
+                [Item(text="text 0")],
+                ["dense"],
+            )
+            await asyncio.wait_for(first, timeout=2.0)
+            head_ms = (time.monotonic() - started) * 1000
+            assert head_ms < 50, f"lone head waited {head_ms:.1f}ms"
+            assert call_sizes == [1], f"expected the head to run alone, got: {call_sizes}"
 
-            await asyncio.gather(*futures)
+            # Same already-queued tail as the fusing test. The window is 0,
+            # so the pair must leave before the later arrival instead of being held.
+            second = await worker.submit(
+                [make_text_item([1, 2], 0)],
+                [Item(text="text 1")],
+                ["dense"],
+            )
+            third = await worker.submit(
+                [make_text_item([1, 2], 0)],
+                [Item(text="text 2")],
+                ["dense"],
+            )
+            assert worker.pending_count == 2
+            await asyncio.sleep(0.01)
+            assert worker.pending_count == 0, "tail was held instead of dispatched"
+            fourth = await worker.submit(
+                [make_text_item([1, 2], 0)],
+                [Item(text="text 3")],
+                ["dense"],
+            )
+
+            await asyncio.gather(second, third, fourth)
 
             assert sum(call_sizes) == 4
-            # The first arrival dispatches alone (immediate idle dispatch), so
-            # the burst cannot land in a single forward.
-            assert len(call_sizes) >= 2, f"expected shredded batches without the window, got: {call_sizes}"
+            assert call_sizes == [1, 2, 1], f"expected the queued tail to shred, got: {call_sizes}"
 
         finally:
             await worker.stop()

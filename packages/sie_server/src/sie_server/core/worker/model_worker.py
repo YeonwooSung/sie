@@ -1129,10 +1129,10 @@ class ModelWorker:
                 selected = self._batchers[selected_lora]
                 idle_window_ms = self._config.idle_coalesce_ms
                 # Alone is one request, not one item: ``submit_many`` queues
-                # an entry per item. A second request still sitting on this
-                # batcher is the only tail. ``idle_coalesce_ms=0`` skips it.
-                alone = selected.pending_request_count == 1
-                if was_idle and idle_window_ms > 0 and not alone:
+                # an entry per item. The distinct-request count is only the
+                # idle tail check. A busy worker, and ``idle_coalesce_ms=0``,
+                # dispatch without consulting it.
+                if was_idle and idle_window_ms > 0 and selected.pending_request_count > 1:
                     batch = await selected.get_batch(coalesce_cap_ms=idle_window_ms)
                 else:
                     batch = await selected.get_batch(immediate=was_idle)
