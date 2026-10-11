@@ -33,6 +33,10 @@ tasks:
 # untrimmed. The upstream client repairs escaped math dollars by default. Upstream's published
 # olmOCR-bench scores also drop header/footer/page-number blocks and apply its Markdown
 # post-processing.
+# The explicit `markdown` profile defaults to `grounding` and applies that published conversion:
+# omit margin/aside blocks and leading unmarked text, repair escaped math dollars, then PP3.
+# This is a lossy output policy; footnotes remain and all-margin pages can return empty text.
+# Native opt-in: set loadtime `output_postprocess: lightonocr3_markdown` and send `grounding`.
 #
 # Serving: the default profile runs the checkpoint on SGLang (sglang-vision-extract bundle) with
 # continuous batching, no system prompt, the chat template's enable_thinking=False, and only the
@@ -50,7 +54,7 @@ profiles:
     compute_precision: bfloat16
     adapter_path: sie_server.adapters.sglang_vision_extract.adapter:SGLangVisionExtractAdapter
     adapter_options:
-      loadtime:
+      loadtime: &sglang_loadtime
         mem_fraction_static: 0.85
         served_model_name: lightonai/LightOnOCR-3-4B
         trust_remote_code: false
@@ -69,6 +73,14 @@ profiles:
       runtime:
         max_new_tokens: 12288
         num_beams: 1
+  markdown:
+    extends: default
+    adapter_options:
+      # Profile inheritance replaces loadtime, so retain every engine/sampling option.
+      loadtime:
+        <<: *sglang_loadtime
+        default_prompt: grounding
+        output_postprocess: lightonocr3_markdown
   transformers:
     max_batch_tokens: 16384
     compute_precision: bfloat16
