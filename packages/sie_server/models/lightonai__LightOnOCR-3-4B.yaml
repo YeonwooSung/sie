@@ -54,7 +54,7 @@ profiles:
     compute_precision: bfloat16
     adapter_path: sie_server.adapters.sglang_vision_extract.adapter:SGLangVisionExtractAdapter
     adapter_options:
-      loadtime: &sglang_loadtime
+      loadtime:
         mem_fraction_static: 0.85
         served_model_name: lightonai/LightOnOCR-3-4B
         trust_remote_code: false
@@ -78,7 +78,21 @@ profiles:
     adapter_options:
       # Profile inheritance replaces loadtime, so retain every engine/sampling option.
       loadtime:
-        <<: *sglang_loadtime
+        mem_fraction_static: 0.85
+        served_model_name: lightonai/LightOnOCR-3-4B
+        trust_remote_code: false
+        max_concurrent_requests: 128
+        meter_pages: true
+        max_new_tokens: 12288
+        temperature: 0.1
+        top_p: 1.0
+        chat_template_kwargs:
+          enable_thinking: false
+        allowed_instructions:
+          - grounding
+        attention_backend: flashinfer
+        extra_launch_args:
+          - --disable-radix-cache
         default_prompt: grounding
         output_postprocess: lightonocr3_markdown
   transformers:

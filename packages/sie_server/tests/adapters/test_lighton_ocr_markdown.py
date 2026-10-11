@@ -24,6 +24,7 @@ from sie_server.adapters.lighton_ocr._markdown import lightonocr3_markdown
             id="block-omission-and-retained-footnote",
         ),
         pytest.param(r"We use \$x^2\$ here. Price \$5.", r"We use $x^2$ here. Price \$5.", id="math-and-currency"),
+        pytest.param(r"$x\$\$x\$", "$x$$x$", id="successive-dollar-repair-stages"),
         pytest.param(
             "```tex\n\\$x^2\\$\n```\n\nInline `\\$y^2\\$` stays.\n\nMath \\$z^2\\$.",
             "```tex\n\\$x^2\\$\n```\n\nInline `\\$y^2\\$` stays.\n\nMath $z^2$.",

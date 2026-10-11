@@ -980,5 +980,7 @@ def lightonocr3_markdown(raw_response: str) -> str:
     Footnotes remain; a page containing only omitted blocks becomes empty.
     """
     markdown = _join([LoocrGroundingProvider.omit_margins(raw_response)])
+    # The pinned runner applies POSTPROCESS before FOLDER_POSTPROCESS (PP3).
+    # Preserve both stages even though PP3 also calls dollar repair.
     markdown = fix_escaped_dollars(markdown)
     return _pp3(markdown)
