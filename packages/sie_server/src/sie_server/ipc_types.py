@@ -90,6 +90,10 @@ class PingResponse(msgspec.Struct):
     ready: bool = False
     bundle_config_hash: str = ""
     loaded_models: list[str] = msgspec.field(default_factory=list)
+    # In-progress registry loads. Defaulted so an older peer that omits the
+    # field still decodes; Ready, Failed, and Cancelled clear it because the
+    # registry drops the id from ``_loading`` in ``finally``.
+    loading_models: list[str] = msgspec.field(default_factory=list)
 
 
 # -----------------------------------------------------------------------------
@@ -158,6 +162,13 @@ class ModelDescriptor(msgspec.Struct):
     # contract as ``default_query_template`` but selected when
     # ``is_query=False``.
     default_doc_template: str | None = None
+    # Batches the worker runs through this model's adapter at once (the
+    # adapter's ``max_concurrent_dispatch()`` as the worker honours it).
+    # Above 1 the engine behind the adapter batches continuously (SGLang):
+    # the sidecar then sends each extract item in a ``RunBatch`` of its own
+    # and keeps up to this many in flight, as the worker does for direct
+    # requests. ``None`` (older servers) and 1 keep sidecar batching.
+    max_concurrent_dispatch: int | None = None
 
 
 class EnsureModelReadyResponse(msgspec.Struct):
@@ -589,6 +600,9 @@ class UnitCounts(msgspec.Struct):
     # tokenized alone), excluding prompt-template tokens. Never above
     # ``input_tokens``. Additive tail field, like ``pairs``.
     content_input_tokens: int | None = None
+    # Extract only: tokens a generative extractor decoded for the item (the
+    # SGLang vision OCR adapter's completion tokens). Additive tail field.
+    output_tokens: int | None = None
 
 
 class ItemOutcome(msgspec.Struct):

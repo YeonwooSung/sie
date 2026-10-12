@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -12,7 +13,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 import yaml
-from sie_server.adapters._generation_base import GenerationChunk
+from sie_server.adapters._generation_base import GenerationChunk, GenerationResult
 from sie_server.adapters.sglang.generation import SGLangGenerationAdapter
 from sie_server.adapters.sglang_vision_extract.adapter import SGLangVisionExtractAdapter
 from sie_server.config.model import ModelConfig
@@ -402,7 +403,9 @@ def test_page_metering_replaces_image_units_and_stamps_successes() -> None:
     instance._request_loop = MagicMock()
     items = [Item(images=[_image("page")])]
     future = MagicMock()
-    future.result.return_value = [MagicMock(text="# page")]
+    future.result.return_value = [
+        GenerationResult(text="# page", finish_reason="stop", prompt_tokens=2590, completion_tokens=836)
+    ]
 
     def submit(coroutine: Any, loop: Any) -> MagicMock:
         del loop
@@ -418,6 +421,38 @@ def test_page_metering_replaces_image_units_and_stamps_successes() -> None:
     assert instance.count_input_images(items) is None
     assert out.pages == [1]
     assert out.entities[0][0]["text"] == "# page"
+    # Token counts ride alongside the unchanged page meter.
+    assert out.input_token_counts == [2590]
+    assert out.output_token_counts == [836]
+
+
+def test_image_metering_reports_engine_prompt_and_completion_tokens_per_item() -> None:
+    instance = SGLangVisionExtractAdapter("zai-org/GLM-OCR")
+    instance._processor = _FakeProcessor()
+    instance._request_loop = MagicMock()
+    items = [Item(images=[_image("receipt")]), Item(images=[_image("note")])]
+    future = MagicMock()
+    future.result.return_value = [
+        GenerationResult(text="TOTAL 9.99", finish_reason="stop", prompt_tokens=1835, completion_tokens=203),
+        GenerationResult(text="call mum", finish_reason="length", prompt_tokens=264, completion_tokens=12),
+    ]
+
+    def submit(coroutine: Any, loop: Any) -> MagicMock:
+        del loop
+        coroutine.close()
+        return future
+
+    with patch(
+        "sie_server.adapters.sglang_vision_extract.adapter.asyncio.run_coroutine_threadsafe",
+        side_effect=submit,
+    ):
+        out = instance.extract(items)
+
+    # The image meter is unchanged; the per-item token counts stay aligned.
+    assert instance.count_input_images(items) == [1, 1]
+    assert out.pages is None
+    assert out.input_token_counts == [1835, 264]
+    assert out.output_token_counts == [203, 12]
 
 
 def test_load_resolves_processor_to_pinned_snapshot() -> None:
@@ -614,3 +649,97 @@ def test_a_new_request_loop_gets_a_new_request_bound(adapter: SGLangVisionExtrac
         loop = adapter._request_loop
         assert loop is not None
         loop.call_soon_threadsafe(loop.stop)
+
+
+class _KwargsProcessor(_FakeProcessor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.template_kwargs: dict[str, Any] = {}
+
+    def apply_chat_template(  # ty: ignore[invalid-method-override]
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        add_generation_prompt: bool,
+        tokenize: bool,
+        **kwargs: Any,
+    ) -> str:
+        self.template_kwargs = kwargs
+        return super().apply_chat_template(messages, add_generation_prompt=add_generation_prompt, tokenize=tokenize)
+
+
+_LIGHTONOCR3 = "lightonai/LightOnOCR-3-4B"
+
+
+def _lightonocr3_default_adapter() -> SGLangVisionExtractAdapter:
+    model_path = Path(__file__).resolve().parents[2] / "models" / "lightonai__LightOnOCR-3-4B.yaml"
+    config = ModelConfig.model_validate(yaml.safe_load(model_path.read_text()))
+    profile = config.resolve_profile("default")
+    assert profile.adapter_path == "sie_server.adapters.sglang_vision_extract.adapter:SGLangVisionExtractAdapter"
+    loadtime: dict[str, Any] = dict(profile.loadtime)
+    instance = SGLangVisionExtractAdapter(_LIGHTONOCR3, revision=config.hf_revision, **loadtime)
+    instance._processor = _KwargsProcessor()
+    instance._server_url = "http://sglang.test"
+    return instance
+
+
+@pytest.mark.parametrize("instruction", [None, "", "grounding"])
+def test_lightonocr3_profile_uses_trained_prompts_without_system_or_thinking(instruction: str | None) -> None:
+    instance = _lightonocr3_default_adapter()
+    prompt, label = instance._resolve_prompt_and_label(instruction, {})
+    assert label == "markdown"
+    instance._build_prompt(prompt)
+    assert instance._processor.template_kwargs == {"enable_thinking": False}
+    assert instance._processor.messages == [
+        {
+            "role": "user",
+            "content": [{"type": "image"}] + ([{"type": "text", "text": "grounding"}] if instruction else []),
+        }
+    ]
+
+
+@pytest.mark.parametrize("instruction", ["Grounding", "Text Recognition:", "Extract tables only"])
+def test_lightonocr3_profile_rejects_untrained_instructions(instruction: str) -> None:
+    instance = _lightonocr3_default_adapter()
+    instance._request_loop = MagicMock()
+    with pytest.raises(ValueError, match="instruction must be omitted or one of"):
+        instance.extract([Item(images=[_image("page")])], instruction=instruction)
+
+
+@pytest.mark.asyncio
+async def test_lightonocr3_profile_sampling_reaches_sglang_request() -> None:
+    instance = _lightonocr3_default_adapter()
+    bodies: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            content=(
+                b'data: {"text": "page", "meta_info": {"prompt_tokens": 10, '
+                b'"completion_tokens": 1, "finish_reason": {"type": "stop"}}}\n\n'
+            ),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    instance._http_client = client
+    await instance._extract_async("rendered prompt", [_image("page")], max_new_tokens=12288)
+    await client.aclose()
+
+    sampling = bodies[0]["sampling_params"]
+    assert sampling["temperature"] == 0.1
+    assert sampling["top_p"] == 1.0
+    assert sampling["max_new_tokens"] == 12288
+
+
+def test_sampling_defaults_stay_greedy(adapter: SGLangVisionExtractAdapter) -> None:
+    assert (adapter._temperature, adapter._top_p, adapter._chat_template_kwargs) == (0.0, 1.0, {})
+    assert adapter._allowed_instructions is None
+
+
+@pytest.mark.parametrize(
+    "options", [{"temperature": -0.1}, {"temperature": float("nan")}, {"top_p": 0.0}, {"top_p": 1.5}]
+)
+def test_invalid_sampling_options_rejected(options: dict[str, Any]) -> None:
+    with pytest.raises(ValueError, match=r"temperature|top_p"):
+        SGLangVisionExtractAdapter("lightonai/LightOnOCR-3-4B", **options)

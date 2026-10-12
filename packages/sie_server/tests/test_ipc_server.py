@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import hashlib
 import os
+import socket
 import struct
 import tempfile
 import threading
@@ -613,6 +614,7 @@ def _make_executor() -> tuple[QueueExecutor, MagicMock]:
     reg.model_names = ["test/model"]
     reg.device = "cpu"
     reg.loaded_model_names = ["test/model"]
+    reg.loading_model_names = []
     reg.is_loaded.return_value = True
     reg.is_loading.return_value = False
     reg._config_version = 0
@@ -972,6 +974,7 @@ class TestFraming:
             assert resp["body"]["ready"] is False
             assert resp["body"]["bundle_config_hash"] == ""
             assert resp["body"]["loaded_models"] == ["test/model"]
+            assert resp["body"]["loading_models"] == []
             assert srv.is_heartbeat_fresh()
         finally:
             await client.close()
@@ -1045,6 +1048,24 @@ class TestFraming:
             health.assert_awaited_once_with()
         finally:
             await client.close()
+
+    @pytest.mark.asyncio
+    async def test_ping_reports_models_in_loading_and_omits_them_after_clear(self) -> None:
+        registry = ModelRegistry(enable_hot_reload=False)
+        registry._loading.add("org/loading-model")
+        executor = QueueExecutor(registry)
+        sock = _short_sock_path()
+        async with IpcServer(sock, executor, worker_id="w"):
+            client = await _Client.connect(sock)
+            try:
+                loading = await client.rpc("Ping", {"timestamp_ms": 1.0}, request_id="load")
+                assert loading["ok"] is True
+                assert loading["body"]["loading_models"] == ["org/loading-model"]
+                registry._loading.discard("org/loading-model")
+                cleared = await client.rpc("Ping", {"timestamp_ms": 2.0}, request_id="clear")
+                assert cleared["body"]["loading_models"] == []
+            finally:
+                await client.close()
 
     @pytest.mark.asyncio
     async def test_multiple_requests_on_one_connection(self, server_and_path) -> None:
@@ -3310,6 +3331,39 @@ class TestDrainDeadline:
             assert srv._drain_deadline_s == pytest.approx(1.0)
         finally:
             await client.close()
+
+
+# -----------------------------------------------------------------------------
+# Listen backlog
+# -----------------------------------------------------------------------------
+
+
+def _somaxconn() -> int:
+    try:
+        return int(Path("/proc/sys/net/core/somaxconn").read_text())
+    except (OSError, ValueError):
+        return 0
+
+
+@pytest.mark.skipif(_somaxconn() < 300, reason="needs Linux with net.core.somaxconn >= 300")
+@pytest.mark.asyncio
+async def test_burst_of_connects_fits_the_listen_backlog(server_and_path) -> None:
+    """The sidecar opens one connection per generation stream, so a burst of
+    streams connects before the event loop can accept any of them. asyncio's
+    default backlog (100) refuses the 101st such connect with EAGAIN.
+    """
+    _srv, sock = server_and_path
+    clients: list[socket.socket] = []
+    try:
+        # No await between connects: the server cannot accept during the burst.
+        for _ in range(300):
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.setblocking(False)
+            clients.append(client)
+            client.connect(str(sock))
+    finally:
+        for client in clients:
+            client.close()
 
 
 # -----------------------------------------------------------------------------

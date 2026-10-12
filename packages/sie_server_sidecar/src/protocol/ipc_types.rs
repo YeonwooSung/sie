@@ -187,6 +187,10 @@ pub struct PingResponse {
     pub bundle_config_hash: String,
     #[serde(default)]
     pub loaded_models: Vec<String>,
+    /// Models whose load is still in progress. Omitted by an older engine;
+    /// an empty list is the steady state after Ready, Failed, or Cancelled.
+    #[serde(default)]
+    pub loading_models: Vec<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -286,6 +290,15 @@ pub struct ModelDescriptor {
     /// `is_query=false`.
     #[serde(default)]
     pub default_doc_template: Option<String>,
+    /// Batches the backend runs through this model's adapter at once
+    /// (Python: the worker's honoured `max_concurrent_dispatch()`). Above 1
+    /// the engine behind the adapter batches continuously (SGLang), so the
+    /// dispatcher sends each extract item in a `RunBatch` of its own and
+    /// keeps up to this many in flight for the model, matching the
+    /// worker's direct path. `None` (older backends) and 1 keep scheduler
+    /// batching and the default pipeline depth.
+    #[serde(default)]
+    pub max_concurrent_dispatch: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -944,6 +957,10 @@ pub struct UnitCounts {
     /// excluding prompt-template tokens. Never above `input_tokens`.
     #[serde(default)]
     pub content_input_tokens: Option<u64>,
+    /// Extract only: tokens a generative extractor decoded for the item. The
+    /// gateway's `UnitCounts` already carries `output_tokens` by name.
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1620,6 +1637,23 @@ mod tests {
         assert!(!back.ready);
         assert_eq!(back.bundle_config_hash, "");
         assert!(back.loaded_models.is_empty());
+        assert!(back.loading_models.is_empty());
+    }
+
+    #[test]
+    fn ping_response_roundtrips_loading_models() {
+        let response = PingResponse {
+            timestamp_ms: 1.0,
+            worker_id: "w-1".into(),
+            ready: true,
+            bundle_config_hash: String::new(),
+            loaded_models: vec!["org/ready".into()],
+            loading_models: vec!["org/loading".into()],
+        };
+        let bytes = rmp_serde::to_vec_named(&response).unwrap();
+        let back: PingResponse = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(back.loading_models, ["org/loading".to_string()]);
+        assert_eq!(back.loaded_models, ["org/ready".to_string()]);
     }
 
     #[test]

@@ -256,6 +256,15 @@ data:
             ignoreNullValues: "false"
             threshold: "1"
             activationThreshold: "0"
+        - type: prometheus
+          metadata:
+            serverAddress: {{ $promAddr }}
+            # Appended last so existing HPA metric indexes stay stable. See #293.
+            metricName: sie_gateway_model_loads_in_progress_{{ $poolName }}_{{ $bundleName }}
+            query: (max(sie_gateway_model_loads_in_progress{ {{- $gatewayTarget -}}, pool="{{ $queuePool }}", machine_profile="{{ $machineProfile }}", bundle="{{ $bundle }}"} and on(producer_instance,collector_generation) {{ $freshGatewayInstances }}) and on() {{ $controlReady }})
+            ignoreNullValues: "false"
+            threshold: "1"
+            activationThreshold: "0"
 {{- $_ := set $manifestState "laneIndex" (add1 $laneIndex) }}
 {{- end }}
 {{- end }}

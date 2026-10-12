@@ -1,17 +1,18 @@
 services:
   sie:
-    # GPU compose uses the transformers5 bundle so we can serve LightOnOCR /
-    # GLM-OCR / Paddle (their adapters need transformers>=5). Florence-2 is
-    # in the catalog but its tokenizer relies on a transformers<5 API and is
-    # therefore unavailable on this image. The CPU compose covers Florence-2
-    # through the default bundle.
-    image: ghcr.io/superlinked/sie-server:latest-cuda12-transformers5
+    # GPU compose uses the sglang-vision-extract bundle. LightOnOCR-2-1B and
+    # GLM-OCR use that adapter. Donut, GLiNER, and PaddleOCR-VL's transformers
+    # profile are not in this bundle — use compose.yml for those.
+    # Preload only LightOnOCR-2-1B. GLM-OCR stays selectable and loads on
+    # demand; it is not preloaded with LightOnOCR because the two do not fit
+    # on one GPU.
+    image: ghcr.io/superlinked/sie-server:latest-cuda12-sglang-vision-extract
     command:
       - serve
       - --port
       - "8080"
       - --preload
-      - lightonai/LightOnOCR-2-1B,naver-clova-ix/donut-base-finetuned-cord-v2,urchade/gliner_multi-v2.1,zai-org/GLM-OCR,PaddlePaddle/PaddleOCR-VL-1.6
+      - lightonai/LightOnOCR-2-1B
     ports:
       - "8080:8080"
     restart: unless-stopped
