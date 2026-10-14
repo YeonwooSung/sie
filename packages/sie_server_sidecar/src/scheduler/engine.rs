@@ -48,7 +48,7 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use crate::latency::LatencyTracker;
 
 use super::adaptive::AdaptiveBatchController;
-use super::batch_config::BatchConfig;
+use super::batch_config::{process_env, BatchConfig, EnvLookup};
 use super::batch_former::{BatchFormer, FormattedBatch, HasCost};
 use super::lane::{Lane, Verdict};
 use super::trackers::BatchEfficiencyTracker;
@@ -204,6 +204,17 @@ pub struct Scheduler<I: HasCost, T> {
     /// after each controller step. Kept behind an async `RwLock`
     /// because readers are rare (new-batcher creation only).
     config: RwLock<BatchConfig>,
+    /// Caps the scheduler was built with, before any controller step.
+    /// [`Scheduler::adopt_cost_budget`] re-bases from these so a new
+    /// budget starts from the configured wait, not a stepped one.
+    initial_config: BatchConfig,
+    /// The batch cost budget (`max_batch_tokens`) the static cost cap and
+    /// the adaptive cost range currently derive from. Written only while
+    /// the controller lock is held; read lock-free on the hot path.
+    cost_budget: AtomicU64,
+    /// Where the `SIE_ADAPTIVE_BATCH_*` overrides are read when the
+    /// controller is derived from a budget, at build time and on re-base.
+    env: EnvLookup,
     /// Fired on every submit, and on every batch return reported through
     /// [`Scheduler::note_return`]. [`Scheduler::consume_next`] and
     /// [`Scheduler::next_dispatch`] use this to wake without polling.
@@ -252,6 +263,58 @@ where
     /// middle of [`Scheduler::record_completion`].
     pub async fn config(&self) -> BatchConfig {
         *self.config.read().await
+    }
+
+    /// The batch cost budget (`max_batch_tokens`) the static cost cap and
+    /// the adaptive cost range currently derive from.
+    pub fn cost_budget(&self) -> u64 {
+        self.cost_budget.load(Ordering::Acquire)
+    }
+
+    /// Re-base the cost cap and the adaptive cost range on a new model
+    /// batch cost budget (`max_batch_tokens`).
+    ///
+    /// A no-op returning `false` when the budget is unchanged, which is
+    /// every call after the first in steady state. Otherwise the adaptive
+    /// controller is rebuilt from `max_batch_tokens` exactly as
+    /// [`SchedulerBuilder::build`] builds one (Python's production range
+    /// plus `SIE_ADAPTIVE_BATCH_*` overrides), the static cost cap becomes
+    /// the rebuilt controller's starting cost (the budget, unless an
+    /// override clamps it), the fill-ratio window restarts, and every live
+    /// batcher gets the new caps. The rebuilt controller re-calibrates its
+    /// latency target.
+    ///
+    /// This runs when the backend reports a different budget for a model
+    /// whose scheduler already exists, for example after the engine
+    /// restarted with a newer image or applied a changed model config.
+    pub async fn adopt_cost_budget(&self, max_batch_tokens: u64) -> bool {
+        if self.cost_budget() == max_batch_tokens {
+            return false;
+        }
+        // Same lock order as `record_completion` (controller, then config),
+        // so a concurrent controller step cannot publish caps derived from
+        // the old budget after this re-base.
+        let mut controller = self.controller.lock().await;
+        if self.cost_budget() == max_batch_tokens {
+            return false;
+        }
+        let budget_cfg = BatchConfig {
+            max_batch_cost: max_batch_tokens,
+            ..self.initial_config
+        };
+        *controller =
+            AdaptiveBatchController::from_batch_config_and_lookup(&budget_cfg, &*self.env);
+        // Batches formed before the first controller step already honour
+        // the operator's `SIE_ADAPTIVE_BATCH_*_COST` range.
+        let new_cfg = BatchConfig {
+            max_batch_cost: controller.current_batch_cost(),
+            ..budget_cfg
+        };
+        *self.config.write().await = new_cfg;
+        self.efficiency.lock().await.reset();
+        self.cost_budget.store(max_batch_tokens, Ordering::Release);
+        self.propagate_config(new_cfg).await;
+        true
     }
 
     /// Sum of pending items across every (op, lora) batcher.
@@ -550,6 +613,13 @@ where
         batch_cost: u64,
         batch_size: usize,
     ) -> RecordCompletionOutcome {
+        // The whole step runs under the controller lock, taken first, so it
+        // cannot interleave with `adopt_cost_budget`: caps derived from a
+        // replaced budget are never published after the re-base. Lock order
+        // is controller, then config, then the batcher map; no path takes
+        // the controller while holding one of the others.
+        let mut ctrl = self.controller.lock().await;
+
         let current_cap = self.config.read().await.max_batch_cost;
         self.efficiency.lock().await.record(batch_cost, current_cap);
 
@@ -561,19 +631,11 @@ where
         let observed_p50 = self.latency.lock().await.p50();
         let fill = self.efficiency.lock().await.mean_fill_ratio();
 
-        let (new_wait, new_cost, target_p50, starvation_streak, starvation_resets_delta) = {
-            let mut ctrl = self.controller.lock().await;
-            let prev_resets = ctrl.starvation_resets();
-            let (w, c) = ctrl.step(observed_p50, fill, Some(batch_size));
-            let new_resets = ctrl.starvation_resets();
-            (
-                w,
-                c,
-                ctrl.target_p50_ms(),
-                ctrl.starvation_streak(),
-                new_resets.saturating_sub(prev_resets),
-            )
-        };
+        let prev_resets = ctrl.starvation_resets();
+        let (new_wait, new_cost) = ctrl.step(observed_p50, fill, Some(batch_size));
+        let target_p50 = ctrl.target_p50_ms();
+        let starvation_streak = ctrl.starvation_streak();
+        let starvation_resets_delta = ctrl.starvation_resets().saturating_sub(prev_resets);
 
         // Update the shared snapshot. Short critical section under
         // the write lock — we only mutate two fields.
@@ -583,26 +645,8 @@ where
             cfg.max_batch_cost = new_cost;
             *cfg
         };
-        self.gather_quiet_us.store(
-            whole_micros(new_cfg.effective_coalesce_ms()),
-            Ordering::Release,
-        );
-        self.gather_longest_us
-            .store(whole_micros(new_cfg.max_batch_wait_ms), Ordering::Release);
-
-        // Propagate to every live batcher. We snapshot the Vec of
-        // Arcs under the read lock and drop it before the async
-        // `update_config` calls so a concurrent submit that creates a
-        // new batcher doesn't deadlock. A batcher created *after*
-        // this snapshot sees `new_cfg` via `config.read()` in
-        // `get_or_create`, so we don't lose the update.
-        let entries: Vec<Arc<BatcherEntry<I, T>>> = {
-            let map = self.batchers.read().await;
-            map.values().cloned().collect()
-        };
-        for entry in entries {
-            entry.former.update_config(new_cfg).await;
-        }
+        self.propagate_config(new_cfg).await;
+        drop(ctrl);
 
         RecordCompletionOutcome {
             new_wait_ms: new_wait,
@@ -613,6 +657,29 @@ where
             starvation_streak,
             starvation_resets_delta,
             batch_size,
+        }
+    }
+
+    /// Push `cfg` to every live batcher, and to the gather windows the lane
+    /// waits on after a return.
+    ///
+    /// We snapshot the Vec of Arcs under the read lock and drop it
+    /// before the async `update_config` calls so a concurrent submit
+    /// that creates a new batcher doesn't deadlock. A batcher created
+    /// *after* this snapshot sees `cfg` via `config.read()` in
+    /// `get_or_create`, so we don't lose the update. Callers write
+    /// `self.config` before calling this.
+    async fn propagate_config(&self, cfg: BatchConfig) {
+        self.gather_quiet_us
+            .store(whole_micros(cfg.effective_coalesce_ms()), Ordering::Release);
+        self.gather_longest_us
+            .store(whole_micros(cfg.max_batch_wait_ms), Ordering::Release);
+        let entries: Vec<Arc<BatcherEntry<I, T>>> = {
+            let map = self.batchers.read().await;
+            map.values().cloned().collect()
+        };
+        for entry in entries {
+            entry.former.update_config(cfg).await;
         }
     }
 
@@ -698,6 +765,7 @@ impl<I: HasCost, T> std::fmt::Debug for Scheduler<I, T> {
 pub struct SchedulerBuilder<I: HasCost, T> {
     config: BatchConfig,
     controller: Option<AdaptiveBatchController>,
+    env: Option<EnvLookup>,
     latency_window: usize,
     latency_min_samples: usize,
     efficiency_window: usize,
@@ -709,6 +777,7 @@ impl<I: HasCost, T> Default for SchedulerBuilder<I, T> {
         Self {
             config: BatchConfig::default(),
             controller: None,
+            env: None,
             // Python's `LatencyTracker(window_size=200, min_samples=10)`.
             latency_window: 200,
             latency_min_samples: 10,
@@ -738,6 +807,16 @@ where
         self
     }
 
+    /// Read the `SIE_ADAPTIVE_BATCH_*` overrides through `env` instead of
+    /// the process environment. They apply when the builder derives the
+    /// controller (no [`Self::controller`] supplied) and when the scheduler
+    /// re-bases on a new budget.
+    #[must_use]
+    pub fn env_lookup(mut self, env: EnvLookup) -> Self {
+        self.env = Some(env);
+        self
+    }
+
     /// Override the latency tracker window. Default 200 samples,
     /// 10-sample warm-up.
     #[must_use]
@@ -759,7 +838,8 @@ where
         // Default controller mirrors Python's
         // `ModelWorker.__init__` *production* wiring against the
         // current `BatchConfig` (model `max_batch_tokens` =
-        // `cfg.max_batch_cost`, initial wait = `cfg.max_batch_wait_ms`,
+        // `cfg.max_batch_cost`, which the registry sets to the model's
+        // own budget; initial wait = `cfg.max_batch_wait_ms`,
         // cost floor / ceiling = `max_batch_tokens // 4` ..
         // `max_batch_tokens * 4`, `cost_gain = gain * 0.5`,
         // `min_wait_ms = 15.0`). The bare `default()` / module-level
@@ -768,22 +848,36 @@ where
         // worker has been deploying.
         //
         // `SIE_ADAPTIVE_BATCH_*` env vars override on top, so
-        // operators can pin individual knobs without a recompile.
+        // operators can pin individual knobs without a recompile, and
+        // the static cost cap starts at the derived controller's starting
+        // cost, so batches formed before the first controller step honour
+        // an overridden range too. Without overrides that is the configured
+        // cost cap itself.
         // Tests using `.controller(...)` continue to bypass both env
         // and BatchConfig derivation entirely (deterministic).
-        let cfg = self.config;
+        let env = self.env.unwrap_or_else(process_env);
+        let mut config = self.config;
+        let controller = match self.controller {
+            Some(controller) => controller,
+            None => {
+                let derived =
+                    AdaptiveBatchController::from_batch_config_and_lookup(&self.config, &*env);
+                config.max_batch_cost = derived.current_batch_cost();
+                derived
+            }
+        };
         Scheduler {
             batchers: RwLock::new(HashMap::new()),
-            controller: Mutex::new(
-                self.controller
-                    .unwrap_or_else(|| AdaptiveBatchController::from_batch_config_and_env(&cfg)),
-            ),
+            controller: Mutex::new(controller),
             latency: Mutex::new(LatencyTracker::new(
                 self.latency_window,
                 self.latency_min_samples,
             )),
             efficiency: Mutex::new(BatchEfficiencyTracker::new(self.efficiency_window)),
-            config: RwLock::new(self.config),
+            config: RwLock::new(config),
+            initial_config: self.config,
+            cost_budget: AtomicU64::new(self.config.max_batch_cost),
+            env,
             new_item: Notify::new(),
             lane: std::sync::Mutex::new(Lane::default()),
             gather_quiet_us: AtomicU64::new(whole_micros(self.config.effective_coalesce_ms())),
@@ -1836,6 +1930,234 @@ mod tests {
         // scheduler — production deploys auto-calibrate target_p50.
         assert!(!snap.calibrated);
         assert!(snap.target_p50_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn adopt_cost_budget_rebases_every_batcher_and_rebuilds_the_controller() {
+        let s: Scheduler<StubItem, u32> = Scheduler::new(BatchConfig::default());
+        assert_eq!(s.cost_budget(), 16_384);
+        for lora in ["a", "b"] {
+            s.submit(
+                Op::Extract,
+                LoraKey::from_name(lora),
+                StubItem { cost: 1, idx: 0 },
+                0,
+            )
+            .await;
+        }
+        // Mark the controller, then move the caps off their initial values
+        // as controller steps do.
+        for _ in 0..3 {
+            let _ = s.record_completion(1, 1).await;
+        }
+        assert_eq!(s.controller_snapshot().await.starvation_streak, 3);
+        {
+            let mut cfg = s.config.write().await;
+            cfg.max_batch_wait_ms = 42.0;
+            cfg.max_batch_cost = 9_000;
+        }
+
+        assert!(s.adopt_cost_budget(720_000).await);
+
+        let expected = BatchConfig {
+            max_batch_cost: 720_000,
+            ..BatchConfig::default()
+        };
+        assert_eq!(s.config().await, expected, "re-based from the initial caps");
+        assert_eq!(s.cost_budget(), 720_000);
+        for lora in ["a", "b"] {
+            let former = {
+                let map = s.batchers.read().await;
+                Arc::clone(&map[&(Op::Extract, LoraKey::from_name(lora))].former)
+            };
+            assert_eq!(former.config().await, expected, "batcher {lora}");
+        }
+        {
+            let ctrl = s.controller.lock().await;
+            assert_eq!(
+                (
+                    ctrl.min_batch_cost,
+                    ctrl.max_batch_cost,
+                    ctrl.current_batch_cost()
+                ),
+                (180_000, 2_880_000, 720_000)
+            );
+            assert_eq!(ctrl.starvation_streak(), 0, "a fresh controller");
+        }
+        assert_eq!(s.efficiency.lock().await.sample_count(), 0);
+
+        // The same budget again changes nothing.
+        let _ = s.record_completion(1, 1).await;
+        assert!(!s.adopt_cost_budget(720_000).await);
+        assert_eq!(s.controller_snapshot().await.starvation_streak, 1);
+    }
+
+    #[tokio::test]
+    async fn adopt_cost_budget_rebases_the_gather_windows_after_a_return() {
+        let s: Scheduler<StubItem, u32> = Scheduler::new(BatchConfig::default());
+        // Windows a controller step left behind.
+        s.gather_quiet_us.store(1, Ordering::Release);
+        s.gather_longest_us.store(2, Ordering::Release);
+
+        assert!(s.adopt_cost_budget(720_000).await);
+
+        let initial = BatchConfig::default();
+        assert_eq!(
+            s.gather_quiet_us.load(Ordering::Acquire),
+            whole_micros(initial.effective_coalesce_ms())
+        );
+        assert_eq!(
+            s.gather_longest_us.load(Ordering::Acquire),
+            whole_micros(initial.max_batch_wait_ms)
+        );
+    }
+
+    // ---- The lane beside the runs-alone lane ----
+
+    /// Prepared audio: clips batch together, recordings over 30 s run alone
+    /// (`batch_former` point 5).
+    #[derive(Debug, Clone)]
+    struct Audio {
+        ms: u64,
+        alone: bool,
+        key: &'static str,
+    }
+
+    impl HasCost for Audio {
+        fn cost(&self) -> u64 {
+            self.ms
+        }
+        fn hard_batch_cost_cap(&self) -> Option<u64> {
+            Some(crate::audio_prep::MAX_AUDIO_BATCH_DURATION_MS)
+        }
+        fn runs_alone(&self) -> bool {
+            self.alone
+        }
+        fn original_index(&self) -> usize {
+            0
+        }
+        fn request_key(&self) -> Option<&str> {
+            Some(self.key)
+        }
+    }
+
+    fn audio_clip(key: &'static str, seconds: u64) -> Audio {
+        Audio {
+            ms: seconds * 1_000,
+            alone: false,
+            key,
+        }
+    }
+
+    fn recording(key: &'static str, seconds: u64) -> Audio {
+        Audio {
+            ms: seconds * 1_000,
+            alone: true,
+            key,
+        }
+    }
+
+    /// Whisper's budget (720000 ms) and the default item cap, with batch
+    /// wait and coalesce windows that do not fire by themselves in a test.
+    fn audio_lane() -> Arc<Scheduler<Audio, &'static str>> {
+        Arc::new(
+            Scheduler::builder()
+                .config(BatchConfig {
+                    max_batch_cost: 720_000,
+                    max_batch_wait_ms: 10_000.0,
+                    coalesce_ms: 40.0,
+                    coalesce_ratio: 1.0,
+                    ..BatchConfig::default()
+                })
+                .env_lookup(Arc::new(|_| None))
+                .build(),
+        )
+    }
+
+    async fn put(s: &Scheduler<Audio, &'static str>, item: Audio) {
+        let key = item.key;
+        s.submit(Op::Extract, LoraKey::base(), item, key).await;
+    }
+
+    /// The names in the next batch the lane sends within `ms`, if any.
+    async fn sent_within(
+        s: &Arc<Scheduler<Audio, &'static str>>,
+        ms: u64,
+    ) -> Option<Vec<&'static str>> {
+        timeout(TDuration::from_millis(ms), s.next_dispatch(true))
+            .await
+            .ok()
+            .map(|dispatch| {
+                let mut names = dispatch.batch.metadata;
+                names.sort_unstable();
+                names
+            })
+    }
+
+    #[tokio::test]
+    async fn a_long_recording_pending_does_not_send_a_clip_batch_ahead() {
+        // r2 (7 min) is longer than half the cap, so the whole queue would
+        // count as full. The clips' batch can still grow, so the lane holds
+        // it while r1 is with the engine, and the clip that arrives during
+        // r1's forward joins it, ahead of r2.
+        let s = audio_lane();
+        put(&s, recording("r1", 40)).await;
+        assert_eq!(sent_within(&s, 200).await, Some(vec!["r1"]));
+        put(&s, recording("r2", 420)).await;
+        put(&s, audio_clip("c1", 5)).await;
+        assert_eq!(sent_within(&s, 30).await, None, "held while r1 is out");
+        put(&s, audio_clip("c2", 5)).await;
+
+        s.note_return(1, Duration::from_millis(200));
+        assert_eq!(sent_within(&s, 300).await, Some(vec!["c1", "c2"]));
+        s.note_return(2, Duration::from_millis(200));
+        assert_eq!(sent_within(&s, 300).await, Some(vec!["r2"]));
+    }
+
+    #[tokio::test]
+    async fn a_long_recording_waits_for_clips_that_arrive_during_a_recording() {
+        // r2 queued behind r1 cannot grow, but sending it into the second
+        // slot would make a clip that arrives during r1 wait for both. Held,
+        // r2 lets that clip take its turn first.
+        let s = audio_lane();
+        put(&s, recording("r1", 40)).await;
+        assert_eq!(sent_within(&s, 200).await, Some(vec!["r1"]));
+        put(&s, recording("r2", 420)).await;
+        assert_eq!(sent_within(&s, 30).await, None, "held while r1 is out");
+        put(&s, audio_clip("c", 5)).await;
+
+        s.note_return(1, Duration::from_millis(200));
+        assert_eq!(sent_within(&s, 300).await, Some(vec!["c"]));
+        s.note_return(1, Duration::from_millis(200));
+        assert_eq!(sent_within(&s, 300).await, Some(vec!["r2"]));
+    }
+
+    #[tokio::test]
+    async fn a_long_recording_after_a_clip_batch_still_leaves_at_once() {
+        // After a clip batch the recording goes next whatever arrives (point
+        // 5), so holding it gains nothing: a 7 min one is full, as on main.
+        let s = audio_lane();
+        put(&s, audio_clip("c", 5)).await;
+        assert_eq!(sent_within(&s, 200).await, Some(vec!["c"]));
+        put(&s, recording("r", 420)).await;
+        assert_eq!(sent_within(&s, 30).await, Some(vec!["r"]));
+    }
+
+    #[tokio::test]
+    async fn a_full_clip_batch_still_leaves_while_a_recording_is_out() {
+        // Twelve clips fill a batch whatever the recordings pending, so the
+        // lane sends them into the second slot, as for any other full batch.
+        let s = audio_lane();
+        put(&s, recording("r1", 40)).await;
+        assert_eq!(sent_within(&s, 200).await, Some(vec!["r1"]));
+        put(&s, recording("r2", 60)).await;
+        const CLIPS: [&str; 12] = [
+            "c01", "c02", "c03", "c04", "c05", "c06", "c07", "c08", "c09", "c10", "c11", "c12",
+        ];
+        for name in CLIPS {
+            put(&s, audio_clip(name, 2)).await;
+        }
+        assert_eq!(sent_within(&s, 30).await, Some(CLIPS.to_vec()));
     }
 
     // ---- Aggregates ----
