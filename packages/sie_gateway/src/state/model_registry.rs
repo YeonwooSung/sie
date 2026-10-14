@@ -3567,6 +3567,8 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/x".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -3681,6 +3683,8 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/g".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -3775,6 +3779,8 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/scoped-only".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -4307,6 +4313,8 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/n".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -4359,6 +4367,8 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/unsafe-global-target".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -4383,6 +4393,8 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/mismatch".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -4409,6 +4421,8 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/mode-mismatch".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -4436,6 +4450,8 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/output-cap-mismatch".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -4463,6 +4479,8 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/kv-budget-mismatch".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -4490,6 +4508,8 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/chained-fallback".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -4581,6 +4601,8 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/g".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -4652,6 +4674,8 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/x".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -4819,6 +4843,8 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/profile-only".to_string(),
                 hf_revision: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -5240,6 +5266,8 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/broken".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -5303,6 +5331,8 @@ profiles:
                     let cfg = ModelConfig {
                         name: name.clone(),
                         hf_revision: None,
+                        description: None,
+                        release_date: None,
                         routing: None,
                         adapter_module: None,
                         default_bundle: None,
@@ -5556,6 +5586,8 @@ adapters:
         let config = ModelConfig {
             name: "test/model".to_string(),
             hf_revision: None,
+            description: None,
+            release_date: None,
             routing: None,
             adapter_module: None,
             default_bundle: None,
@@ -5631,6 +5663,8 @@ adapters:
             .add_model_config(ModelConfig {
                 name: "test/model".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -5690,6 +5724,8 @@ encode:
             .add_model_config(ModelConfig {
                 name: "test/model".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -5741,6 +5777,8 @@ encode:
             .add_model_config(ModelConfig {
                 name: "test/generator".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -5775,6 +5813,8 @@ encode:
                 .add_model_config(ModelConfig {
                     name: "test/generator".to_string(),
                     hf_revision: None,
+                    description: None,
+                    release_date: None,
                     routing: None,
                     adapter_module: None,
                     default_bundle: None,
@@ -5848,6 +5888,8 @@ adapters:
             .add_model_config(ModelConfig {
                 name: "test/model".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -5902,6 +5944,8 @@ encode:
             .add_model_config(ModelConfig {
                 name: "test/model".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -5927,6 +5971,8 @@ encode:
         ModelConfig {
             name: "test/model".to_string(),
             hf_revision: None,
+            description: None,
+            release_date: None,
             routing: None,
             adapter_module: None,
             default_bundle: None,
@@ -6529,6 +6575,8 @@ adapters:
         let seed = ModelConfig {
             name: "test/model".to_string(),
             hf_revision: None,
+            description: None,
+            release_date: None,
             routing: None,
             adapter_module: None,
             default_bundle: None,
@@ -6592,6 +6640,8 @@ adapters:
         let delta = ModelConfig {
             name: "test/model".to_string(),
             hf_revision: None,
+            description: None,
+            release_date: None,
             routing: None,
             adapter_module: None,
             default_bundle: None,
@@ -7076,6 +7126,8 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/revisioned".to_string(),
                 hf_revision: Some("89abcdef0123456789abcdef0123456789abcdef".to_string()),
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -7396,6 +7448,8 @@ adapters:
                 let config = ModelConfig {
                     name: format!("race/model-{i}"),
                     hf_revision: None,
+                    description: None,
+                    release_date: None,
                     routing: None,
                     adapter_module: None,
                     default_bundle: None,
@@ -7630,6 +7684,8 @@ profiles:
         ModelConfig {
             name: name.to_string(),
             hf_revision: None,
+            description: None,
+            release_date: None,
             routing: None,
             adapter_module: None,
             default_bundle: None,

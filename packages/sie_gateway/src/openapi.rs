@@ -54,6 +54,7 @@ static OPENAPI_JSON: LazyLock<String> = LazyLock::new(|| {
         crate::handlers::audio::proxy_openai_transcription,
         crate::handlers::proxy::proxy_rerank,
         crate::handlers::proxy::proxy_rerank_v2,
+        crate::handlers::systemone::proxy_systemone,
         crate::handlers::proxy::proxy_score,
         crate::handlers::proxy::proxy_extract,
         crate::handlers::proxy::proxy_generate,
@@ -165,6 +166,9 @@ static OPENAPI_JSON: LazyLock<String> = LazyLock::new(|| {
         RerankV2Request,
         RerankResponse,
         RerankResult,
+        SystemOneRequest,
+        SystemOneResponse,
+        SystemOneUsage,
         ScoreUsage,
         ScoreEntry,
         crate::handlers::config_api::ResolveRequest,
@@ -2712,6 +2716,12 @@ pub struct ModelInfoWire {
     pub max_sequence_length: Option<u64>,
     /// Immutable model weights revision, when the catalog pins one.
     pub revision: Option<String>,
+    /// One line about the model; `""` when the catalog sets none. Reported for
+    /// System One model-list clients (the TypeSafe SDKs).
+    pub description: String,
+    /// Release date of the served weights, `YYYY-MM-DD`; `""` when the catalog
+    /// sets none. Reported for System One model-list clients.
+    pub release_date: String,
     pub profiles: std::collections::HashMap<String, ProfileInfoWire>,
     /// Advertised model capabilities. Consumers use this to discover
     /// which features the model supports before composing a request.
@@ -3082,6 +3092,40 @@ pub struct ScoreRequest {
     pub instruction: Option<String>,
     #[serde(default)]
     pub options: Option<Value>,
+}
+
+/// A System One request: one state and its typed questions. Fields the route
+/// does not read are ignored.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SystemOneRequest {
+    /// SIE model id of a decision model, e.g. `fastino/GLiNER2.5-Decide`.
+    pub model: String,
+    /// The text to judge, a JSON object, or a list of conversation turns.
+    #[schema(value_type = Object)]
+    pub state: Value,
+    /// Typed questions by id: `{"type": "noul" | "choice" | "score",
+    /// "instructions"?, "criteria"?}`. A score question takes at most 10 levels.
+    #[schema(value_type = Object)]
+    pub questions: Value,
+}
+
+/// Tokens the decision model read; it generates none.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SystemOneUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// Answers by question id, in the System One response shape.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SystemOneResponse {
+    pub model: String,
+    /// One answer per question: `noul` (`noul`, the probability of yes),
+    /// `choice` (`choice`, `confidence`, `probabilities` by option) or `score`
+    /// (`score`, `confidence`, `legend` and `probabilities` by level index).
+    #[schema(value_type = Object)]
+    pub answers: Value,
+    pub usage: SystemOneUsage,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -3865,6 +3909,7 @@ mod tests {
             ("/v1/moderations", &["post"][..]),
             ("/v1/rerank", &["post"][..]),
             ("/v2/rerank", &["post"][..]),
+            ("/v1/systemone", &["post"][..]),
             ("/ws/cluster-status", &["get"][..]),
             ("/v1/encode/{model}", &["post"][..]),
             ("/v1/score/{model}", &["post"][..]),

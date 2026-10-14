@@ -278,7 +278,10 @@ pub fn is_length_limit_error(error: &axum::Error) -> bool {
     false
 }
 
-fn request_body_error(error: &axum::Error, limit: usize) -> (StatusCode, &'static str, String) {
+pub(crate) fn request_body_error(
+    error: &axum::Error,
+    limit: usize,
+) -> (StatusCode, &'static str, String) {
     if is_length_limit_error(error) {
         (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -12477,7 +12480,7 @@ fn build_generate_success_body(
 
 /// Check client SDK version skew.
 /// Warns once per minor version if client SDK differs by >1 minor version.
-fn check_sdk_version(headers: &HeaderMap) {
+pub(crate) fn check_sdk_version(headers: &HeaderMap) {
     let Some(sdk_version) = headers
         .get("x-sie-sdk-version")
         .and_then(|v| v.to_str().ok())
@@ -15830,7 +15833,10 @@ fn normalize_rerank_request(
     })
 }
 
-fn compatibility_model_uri(endpoint: &str, model: &str) -> Result<axum::http::Uri, String> {
+pub(crate) fn compatibility_model_uri(
+    endpoint: &str,
+    model: &str,
+) -> Result<axum::http::Uri, String> {
     let model = model.trim_start_matches('/');
     if model.is_empty() {
         return Err("'model' must contain a model id".to_string());
@@ -17821,6 +17827,8 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/h".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -22173,6 +22181,8 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/slow".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -25529,6 +25539,8 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/buffered".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -25592,6 +25604,8 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/g".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -25675,6 +25689,8 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/plain".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -25742,6 +25758,8 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/g2".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -25805,6 +25823,8 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/g3".to_string(),
                 hf_revision: None,
+                description: None,
+                release_date: None,
                 routing: None,
                 adapter_module: None,
                 default_bundle: None,
@@ -29471,6 +29491,8 @@ mod tests {
             dims: std::collections::HashMap::new(),
             max_sequence_length: None,
             revision: None,
+            description: None,
+            release_date: None,
             routing: None,
             max_output_tokens: None,
             profile_max_output_tokens: std::collections::HashMap::new(),

@@ -7,5 +7,6 @@ pub mod pools;
 pub mod proxy;
 pub mod serving_disclosure;
 pub mod sse;
+pub mod systemone;
 #[cfg(test)]
 pub(crate) mod test_support;
