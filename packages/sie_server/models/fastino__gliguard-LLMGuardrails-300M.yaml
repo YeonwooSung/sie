@@ -1,4 +1,6 @@
 sie_id: fastino/gliguard-LLMGuardrails-300M
+description: "fastino/gliguard-LLMGuardrails-300M: extraction model."
+release_date: "2026-05-21"
 hf_id: fastino/gliguard-LLMGuardrails-300M
 hf_revision: 4c03acfe6fcef7bb806d0ae721742d593ddba387
 inputs:

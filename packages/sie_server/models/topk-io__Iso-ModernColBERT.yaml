@@ -1,4 +1,6 @@
 sie_id: topk-io/Iso-ModernColBERT
+description: "topk-io/Iso-ModernColBERT: embedding and reranking model."
+release_date: "2026-05-29"
 hf_id: topk-io/Iso-ModernColBERT
 hf_revision: a43b93e62b11ff205b7f935c1ce2207bfed2d283
 inputs:

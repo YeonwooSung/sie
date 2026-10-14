@@ -1,4 +1,6 @@
 sie_id: knowledgator/opir-edge-v1.0
+description: "knowledgator/opir-edge-v1.0: extraction model."
+release_date: "2026-05-29"
 hf_id: knowledgator/opir-edge-v1.0
 hf_revision: 467a0431f744522f92f4e37d7756309b4c12332a
 inputs:

@@ -1,4 +1,6 @@
 sie_id: "tencent/Hy-MT2-1.8B"
+description: "tencent/Hy-MT2-1.8B: generation model."
+release_date: "2026-05-26"
 hf_id: "tencent/Hy-MT2-1.8B"
 hf_revision: 9a341cd1b679d3efd23b46e847b01745a71ed792
 inputs:

@@ -1,4 +1,6 @@
 sie_id: fastino/gliner2-privacy-filter-PII-multi
+description: "fastino/gliner2-privacy-filter-PII-multi: extraction model."
+release_date: "2026-09-28"
 hf_id: fastino/gliner2-privacy-filter-PII-multi
 hf_revision: 1cb4166094dc58fa8d836429f060d6c95f62b495
 inputs:

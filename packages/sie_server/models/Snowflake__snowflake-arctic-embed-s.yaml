@@ -1,4 +1,6 @@
 sie_id: Snowflake/snowflake-arctic-embed-s
+description: "Snowflake/snowflake-arctic-embed-s: embedding model."
+release_date: "2024-12-04"
 hf_id: Snowflake/snowflake-arctic-embed-s
 hf_revision: e596f507467533e48a2e17c007f0e1dacc837b33
 inputs:

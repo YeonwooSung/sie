@@ -1,4 +1,6 @@
 sie_id: fastino/gliner2.5-base-v1
+description: "fastino/gliner2.5-base-v1: extraction model."
+release_date: "2026-09-28"
 hf_id: fastino/gliner2.5-base-v1
 hf_revision: ca906247640776a07753514055be9726f9080ead
 inputs:

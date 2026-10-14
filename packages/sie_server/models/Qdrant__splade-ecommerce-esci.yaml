@@ -1,4 +1,6 @@
 sie_id: Qdrant/splade-ecommerce-esci
+description: "Qdrant/splade-ecommerce-esci: embedding model."
+release_date: "2026-06-05"
 hf_id: Qdrant/splade-ecommerce-esci
 hf_revision: 73ccced877077b0fe1967e9c8637c8364792a6a2
 inputs:

@@ -8,6 +8,8 @@
 # ``Gemma3TextModel``. Older versions raise an unsupported-model error
 # which the registry classifies as ``DEPENDENCY``.
 sie_id: google/embeddinggemma-300m
+description: "google/embeddinggemma-300m: embedding model."
+release_date: "2025-09-25"
 hf_id: google/embeddinggemma-300m
 # Pinned to an immutable commit SHA (design §6.6): a served id maps to
 # identical weights forever. ``main`` was mutable and did NOT guarantee

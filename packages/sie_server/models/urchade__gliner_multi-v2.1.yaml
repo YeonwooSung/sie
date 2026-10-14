@@ -1,4 +1,6 @@
 sie_id: urchade/gliner_multi-v2.1
+description: "urchade/gliner_multi-v2.1: extraction model."
+release_date: "2025-12-08"
 hf_id: urchade/gliner_multi-v2.1
 hf_revision: 443d26d654e0324125a96bebd8e796c14ff2efe6
 hf_tokenizer_dependencies:

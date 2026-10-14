@@ -1,4 +1,6 @@
 sie_id: naver-clova-ix/donut-base-finetuned-cord-v2
+description: "naver-clova-ix/donut-base-finetuned-cord-v2: extraction model."
+release_date: "2022-08-13"
 hf_id: naver-clova-ix/donut-base-finetuned-cord-v2
 hf_revision: 8003d433113256b4ce3a0f5bf604b29ff78a7451
 inputs:

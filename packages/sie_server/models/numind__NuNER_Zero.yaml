@@ -1,4 +1,6 @@
 sie_id: numind/NuNER_Zero
+description: "numind/NuNER_Zero: extraction model."
+release_date: "2025-02-26"
 hf_id: numind/NuNER_Zero
 hf_revision: c90187673f464518dca09f41689184ed6976242c
 hf_tokenizer_dependencies:

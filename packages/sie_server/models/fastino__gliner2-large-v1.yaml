@@ -1,4 +1,6 @@
 sie_id: fastino/gliner2-large-v1
+description: "fastino/gliner2-large-v1: extraction model."
+release_date: "2026-05-19"
 hf_id: fastino/gliner2-large-v1
 hf_revision: b122b11eeaee4dabd32bed80412f3234c0d0e943
 inputs:

@@ -1,4 +1,6 @@
 sie_id: google/gemma-4-31B-it
+description: "google/gemma-4-31B-it: generation model."
+release_date: "2026-07-20"
 hf_id: google/gemma-4-31B-it
 hf_revision: 842da3794eaa0b77d5f08bae87a17459d91ff475
 # Gemma 4 dense 31B is served by the shared ``sglang-cu130`` bundle

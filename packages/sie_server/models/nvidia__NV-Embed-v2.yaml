@@ -1,4 +1,6 @@
 sie_id: nvidia/NV-Embed-v2
+description: "Hyukkyu/nv-embed-v2: embedding model."
+release_date: "2025-12-09"
 # Mirror of nvidia/NV-Embed-v2 with transformers-5.x compatibility patches in
 # modeling_nvembed.py (DynamicCache API, rotary position_embeddings). Verified
 # 2026-07-06: weight files sha-identical to nvidia/NV-Embed-v2, configuration

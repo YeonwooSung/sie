@@ -1,4 +1,6 @@
 sie_id: thenlper/gte-small
+description: "thenlper/gte-small: embedding model."
+release_date: "2024-11-16"
 hf_id: thenlper/gte-small
 inputs:
   text: true

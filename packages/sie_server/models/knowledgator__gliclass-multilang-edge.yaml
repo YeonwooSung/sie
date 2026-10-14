@@ -1,4 +1,6 @@
 sie_id: knowledgator/gliclass-multilang-edge
+description: "knowledgator/gliclass-multilang-edge: extraction model."
+release_date: "2026-04-30"
 hf_id: knowledgator/gliclass-multilang-edge
 hf_revision: d16c08ef70547514081952104e6fc3d190d9ee39
 inputs:

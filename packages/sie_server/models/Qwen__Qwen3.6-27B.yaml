@@ -1,4 +1,6 @@
 sie_id: Qwen/Qwen3.6-27B
+description: "Qwen/Qwen3.6-27B: generation model."
+release_date: "2026-04-24"
 hf_id: Qwen/Qwen3.6-27B
 hf_revision: 6a9e13bd6fc8f0983b9b99948120bc37f49c13e9
 inputs:

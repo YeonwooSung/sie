@@ -1,4 +1,6 @@
 sie_id: jinaai/jina-colbert-v2
+description: "jinaai/jina-colbert-v2: embedding and reranking model."
+release_date: "2025-01-17"
 hf_id: jinaai/jina-colbert-v2
 hf_revision: 4552c4dc1ffd7d7a635b6a41a1077fe9c9cdd974
 inputs:

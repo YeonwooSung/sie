@@ -1,4 +1,6 @@
 sie_id: lightonai/LightOnOCR-2-1B
+description: "lightonai/LightOnOCR-2-1B: extraction model."
+release_date: "2026-07-08"
 hf_id: lightonai/LightOnOCR-2-1B
 hf_revision: c97bd377f04481830395218fa8951df9deaba756
 inputs:

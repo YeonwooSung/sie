@@ -1,4 +1,6 @@
 sie_id: knowledgator/gliner-pii-small-v1.0
+description: "knowledgator/gliner-pii-small-v1.0: extraction model."
+release_date: "2025-09-27"
 hf_id: knowledgator/gliner-pii-small-v1.0
 hf_revision: d21aad5b4a7ec82b3d0970fd1ac74a12c087d85e
 inputs:

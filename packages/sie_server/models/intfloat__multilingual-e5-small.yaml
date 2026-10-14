@@ -1,4 +1,6 @@
 sie_id: intfloat/multilingual-e5-small
+description: "intfloat/multilingual-e5-small: embedding model."
+release_date: "2026-04-02"
 hf_id: intfloat/multilingual-e5-small
 hf_revision: 614241f622f53c4eeff9890bdc4f31cfecc418b3
 inputs:

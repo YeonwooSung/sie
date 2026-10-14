@@ -1,4 +1,6 @@
 sie_id: cross-encoder/nli-deberta-v3-base
+description: "cross-encoder/nli-deberta-v3-base: extraction model."
+release_date: "2025-04-11"
 hf_id: cross-encoder/nli-deberta-v3-base
 hf_revision: 6c749ce3425cd33b46d187e45b92bbf96ee12ec7
 inputs:

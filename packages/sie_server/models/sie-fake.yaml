@@ -22,6 +22,8 @@
 # loadtime options are the only channel into the adapter constructor, and
 # SIE_FAKE_FAULTS env overrides key on it.
 sie_id: sie-fake
+description: "sie-fake: embedding, reranking and generation model."
+release_date: "2026-07-22"
 package_backed: true
 inputs:
   text: true

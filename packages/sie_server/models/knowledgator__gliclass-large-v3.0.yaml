@@ -1,4 +1,6 @@
 sie_id: knowledgator/gliclass-large-v3.0
+description: "knowledgator/gliclass-large-v3.0: extraction model."
+release_date: "2025-08-12"
 hf_id: knowledgator/gliclass-large-v3.0
 hf_revision: e065d1844f913a9aa611cf33623a9538b8aa8841
 inputs:

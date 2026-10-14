@@ -1,4 +1,6 @@
 sie_id: naver/v-splade-quality
+description: "naver/v-splade-quality: embedding model."
+release_date: "2026-07-08"
 hf_id: naver/v-splade-quality
 hf_revision: 99bdc93f42460e595b2fb1e78b96edd44e898441
 inputs:

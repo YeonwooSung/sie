@@ -1,4 +1,6 @@
 sie_id: nvidia/parakeet-tdt-0.6b-v3
+description: "nvidia/parakeet-tdt-0.6b-v3: extraction model."
+release_date: "2026-08-05"
 hf_id: nvidia/parakeet-tdt-0.6b-v3
 hf_revision: 541d1f99c6b0c3cd0b11a95167540bb8edefd82b
 inputs:

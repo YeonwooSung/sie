@@ -1,4 +1,6 @@
 sie_id: openai/whisper-large-v3-turbo
+description: "openai/whisper-large-v3-turbo: extraction model."
+release_date: "2024-10-04"
 hf_id: openai/whisper-large-v3-turbo
 hf_revision: 41f01f3fe87f28c78e2fbf8b568835947dd65ed9
 inputs:

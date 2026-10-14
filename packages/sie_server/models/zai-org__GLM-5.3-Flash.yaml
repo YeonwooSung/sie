@@ -1,4 +1,6 @@
 sie_id: "zai-org/GLM-5.3-Flash"
+description: "zai-org/GLM-5.3-Flash: generation model."
+release_date: "2026-09-07"
 hf_id: "zai-org/GLM-5.3-Flash"
 hf_revision: eb9eb208eb0d988989d07a6a12d0fdeb5f52574a
 # Glm5NextForConditionalGeneration: 321B parameters in a 305.8 GiB blockwise

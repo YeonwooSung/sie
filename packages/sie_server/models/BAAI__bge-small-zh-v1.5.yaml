@@ -1,4 +1,6 @@
 sie_id: BAAI/bge-small-zh-v1.5
+description: "BAAI/bge-small-zh-v1.5: embedding model."
+release_date: "2023-10-12"
 hf_id: BAAI/bge-small-zh-v1.5
 inputs:
   text: true

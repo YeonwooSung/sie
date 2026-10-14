@@ -1,4 +1,6 @@
 sie_id: ibm-granite/granite-embedding-97m-multilingual-r2
+description: "ibm-granite/granite-embedding-97m-multilingual-r2: embedding model."
+release_date: "2026-05-18"
 hf_id: ibm-granite/granite-embedding-97m-multilingual-r2
 hf_revision: 835ad14087e140460703cf0fae09f97d469d65c2
 inputs:

@@ -1,4 +1,6 @@
 sie_id: Qwen/Qwen3.8-27B-FP8
+description: "Qwen/Qwen3.8-27B-FP8: generation model."
+release_date: "2026-08-14"
 hf_id: Qwen/Qwen3.8-27B-FP8
 hf_revision: 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a
 # Official first-party blockwise FP8 checkpoint. The pinned config declares

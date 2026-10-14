@@ -1,4 +1,6 @@
 sie_id: Marqo/marqo-fashionSigLIP
+description: "Marqo/marqo-fashionSigLIP: embedding model."
+release_date: "2026-02-18"
 hf_id: Marqo/marqo-fashionSigLIP
 hf_revision: c56244cc94f92419e8369fa71efdaf403b124ce8
 inputs:

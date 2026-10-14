@@ -1,4 +1,6 @@
 sie_id: google/siglip-so400m-patch14-224
+description: "google/siglip-so400m-patch14-224: embedding model."
+release_date: "2024-08-23"
 hf_id: google/siglip-so400m-patch14-224
 hf_revision: d04cf29fca7b6374f74d8bea1969314492266b5e
 inputs:

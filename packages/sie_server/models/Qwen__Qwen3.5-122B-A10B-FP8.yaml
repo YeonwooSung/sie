@@ -1,4 +1,6 @@
 sie_id: Qwen/Qwen3.5-122B-A10B-FP8
+description: "Qwen/Qwen3.5-122B-A10B-FP8: generation model."
+release_date: "2026-04-24"
 hf_id: Qwen/Qwen3.5-122B-A10B-FP8
 hf_revision: a099dee70ccfcd8d5dda56aaa0b60cb8ecadabc9
 # Official first-party blockwise FP8 checkpoint. The pinned config declares

@@ -1,4 +1,6 @@
 sie_id: intfloat/e5-mistral-7b-instruct
+description: "intfloat/e5-mistral-7b-instruct: embedding model."
+release_date: "2026-04-02"
 hf_id: intfloat/e5-mistral-7b-instruct
 hf_revision: d62cc4417be0e3289c03dd459d1ef2d137e2554e
 inputs:

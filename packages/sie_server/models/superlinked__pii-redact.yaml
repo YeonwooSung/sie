@@ -1,4 +1,6 @@
 sie_id: superlinked/pii-redact
+description: "urchade/gliner_multi_pii-v1: extraction model."
+release_date: "2024-04-20"
 # urchade/gliner_multi_pii-v1 and numind/NuNER_Zero, composed as the PII
 # redaction study composes them (examples/redact): 300-word windows sharing 50
 # words, spans scoring 0.6 or more, the two models' spans unioned, and every

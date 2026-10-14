@@ -1,4 +1,6 @@
 sie_id: mixedbread-ai/mxbai-edge-colbert-v0-32m
+description: "mixedbread-ai/mxbai-edge-colbert-v0-32m: embedding and reranking model."
+release_date: "2026-04-15"
 hf_id: mixedbread-ai/mxbai-edge-colbert-v0-32m
 hf_revision: 963e23afa1478d8bcc12e5d7115adcfdbd22c3af
 inputs:

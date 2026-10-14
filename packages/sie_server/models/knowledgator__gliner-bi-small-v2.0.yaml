@@ -1,4 +1,6 @@
 sie_id: knowledgator/gliner-bi-small-v2.0
+description: "knowledgator/gliner-bi-small-v2.0: extraction model."
+release_date: "2026-04-22"
 hf_id: knowledgator/gliner-bi-small-v2.0
 hf_revision: 3d74c1bf459b8b1c0be1ecbddd679416ce005418
 hf_tokenizer_dependencies:

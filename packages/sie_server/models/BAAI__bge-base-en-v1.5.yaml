@@ -1,4 +1,6 @@
 sie_id: BAAI/bge-base-en-v1.5
+description: "BAAI/bge-base-en-v1.5: embedding model."
+release_date: "2024-02-21"
 hf_id: BAAI/bge-base-en-v1.5
 inputs:
   text: true

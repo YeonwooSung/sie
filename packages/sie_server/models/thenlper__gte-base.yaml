@@ -1,4 +1,6 @@
 sie_id: thenlper/gte-base
+description: "thenlper/gte-base: embedding model."
+release_date: "2024-11-16"
 hf_id: thenlper/gte-base
 inputs:
   text: true
