@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator, Callable, Iterator
 from types import SimpleNamespace
 from typing import Any
@@ -209,16 +210,56 @@ def test_malformed_first_event_is_502_before_streaming_starts(remote_chat: tuple
     assert stream.closed
 
 
+def _remote_chat_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [record.getMessage() for record in caplog.records if record.name == openai_local.__name__]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_a_502_before_output_logs_its_reason(
+    remote_chat: tuple, streaming: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, _, _, _ = remote_chat
+    answer_with(remote_chat, json_response(401, {"error": {"message": "private", "code": 401}}))
+    with caplog.at_level(logging.WARNING, logger=openai_local.__name__):
+        response = client.post("/v1/chat/completions", json={**BODY, "stream": streaming})
+    assert response.status_code == 502
+    assert response.json()["error"]["message"] == "upstream generation request failed"
+    assert _remote_chat_warnings(caplog) == [f"remote chat for {MODEL} failed: upstream answered 401"]
+    assert "private" not in caplog.text
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_a_missing_upstream_key_is_a_502_whose_log_names_it(
+    remote_chat: tuple, streaming: bool, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, adapter, _, requests = remote_chat
+    monkeypatch.delenv("CHAT_API_KEY", raising=False)
+    keyed = adapter._upstream.model_copy(update={"api_key_secret": "CHAT_API_KEY"})
+    adapter._async_client = upstream_client(keyed, transport=httpx.MockTransport(requests.append))
+    with caplog.at_level(logging.WARNING, logger=openai_local.__name__):
+        response = client.post("/v1/chat/completions", json={**BODY, "stream": streaming})
+    assert response.status_code == 502
+    assert response.json()["error"]["message"] == "upstream generation request failed"
+    assert _remote_chat_warnings(caplog) == [f"remote chat for {MODEL} failed: the upstream credential is unavailable"]
+    assert not requests
+
+
 @pytest.mark.parametrize("disconnect", [False, True])
-def test_failure_after_output_is_in_band_and_never_retried(remote_chat: tuple, disconnect: bool) -> None:
+def test_failure_after_output_is_in_band_and_never_retried(
+    remote_chat: tuple, disconnect: bool, caplog: pytest.LogCaptureFixture
+) -> None:
     client, _, _, requests = remote_chat
     stream = ChatStream(events()[:1], disconnect=disconnect)
     answer_with(remote_chat, httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream))
-    response = client.post("/v1/chat/completions", json={**BODY, "stream": True})
+    with caplog.at_level(logging.WARNING, logger=openai_local.__name__):
+        response = client.post("/v1/chat/completions", json={**BODY, "stream": True})
     assert response.status_code == 200
     assert '"content":"answer"' in response.text
     assert '"error"' in response.text
     assert "private" not in response.text
+    [warning] = _remote_chat_warnings(caplog)
+    assert warning.startswith(f"remote chat for {MODEL} failed after output: ")
+    assert "private" not in caplog.text
     assert len(requests) == 1
     assert stream.closed
     assert upstream_limiter("chat-api")._in_flight == 0
@@ -686,6 +727,103 @@ def test_native_remote_failure_after_output_remains_a_stream_error(remote_chat: 
     assert len(requests) == 1
     assert stream.closed
     assert upstream_limiter("chat-api")._in_flight == 0
+
+
+CREDENTIAL = "sk-canary-0d3c7a51e9b24f68"
+PROMPT = "private prompt 5c2e"
+UNAVAILABLE = "upstream 'chat-api' is unavailable: request failed (ConnectError)"
+
+
+def _render_chat_locally(remote_chat: tuple, monkeypatch: pytest.MonkeyPatch) -> None:
+    client, _, config, _ = remote_chat
+    data = config.model_dump()
+    data.update(remote_backed=False, hf_id="onboarded/model", hf_revision="a" * 40)
+    data["profiles"]["default"]["adapter_options"]["runtime"] = {}
+    client.app.state.registry.get_config.return_value = ModelConfig.model_validate(data)
+    template = SimpleNamespace(
+        chat_template="template", apply_chat_template=lambda messages, **_: messages[-1]["content"]
+    )
+    monkeypatch.setattr(remote_chat_prompt, "_tokenizer", lambda *args: template)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    ("surface", "failure", "status", "source", "message"),
+    [
+        ("chat", "404", 502, "route", f"remote chat for {MODEL} failed: upstream answered 404"),
+        ("chat", "connect", 503, "route", f"remote chat for {MODEL} failed: {UNAVAILABLE}"),
+        ("rendered chat", "401", 502, "route", f"remote chat for {MODEL} failed: upstream answered 401"),
+        ("rendered chat", "connect", 503, "adapter", f"remote generation failed: {UNAVAILABLE}"),
+        ("native", "connect", 503, "adapter", f"remote generation failed: {UNAVAILABLE}"),
+        ("completions", "connect", 503, "adapter", f"remote generation failed: {UNAVAILABLE}"),
+    ],
+)
+def test_a_remote_generation_failure_logs_one_warning_with_its_reason(
+    remote_chat: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    surface: str,
+    failure: str,
+    status: int,
+    source: str,
+    message: str,
+    streaming: bool,
+) -> None:
+    client, adapter, config, requests = remote_chat
+    config.profiles["default"].adapter_options.runtime.clear()
+    if surface == "rendered chat":
+        _render_chat_locally(remote_chat, monkeypatch)
+    adapter._upstream = adapter._upstream.model_copy(update={"api_key_secret": "CHAT_API_KEY"})
+    monkeypatch.setenv("CHAT_API_KEY", CREDENTIAL)
+
+    def respond() -> httpx.Response:
+        if failure == "connect":
+            raise httpx.ConnectError("private upstream detail")
+        return json_response(int(failure), {"error": {"message": "private upstream detail"}})
+
+    answer_with(remote_chat, respond)
+    if surface == "native":
+        path, body = f"/v1/generate/{SAFE_MODEL}", {"prompt": PROMPT, "max_new_tokens": 8, "stream": streaming}
+    elif surface == "completions":
+        path, body = "/v1/completions", {"model": MODEL, "prompt": PROMPT, "max_tokens": 8, "stream": streaming}
+    else:
+        path, body = "/v1/chat/completions", {**BODY, "messages": [{"role": "user", "content": PROMPT}]}
+        body["stream"] = streaming
+    caplog.set_level(logging.DEBUG)
+    response = client.post(path, json=body)
+
+    assert response.status_code == status, response.text
+    logger_name = openai_local.__name__ if source == "route" else type(adapter).__module__
+    warnings = [(record.name, record.getMessage()) for record in caplog.records if record.levelno >= logging.WARNING]
+    assert warnings == [(logger_name, message)]
+    assert [request.headers["authorization"] for request in requests] == [f"Bearer {CREDENTIAL}"]
+    assert requests[0].url.path.endswith("/chat/completions") is (surface == "chat")
+    for private in (CREDENTIAL, PROMPT, "private upstream detail"):
+        assert private not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("streaming", "message"),
+    [(False, f"generate failed for {SAFE_MODEL}"), (True, "stream_generate failed before output")],
+)
+def test_a_native_remote_failure_before_output_logs_one_warning_with_its_reason(
+    remote_chat: tuple, caplog: pytest.LogCaptureFixture, streaming: bool, message: str
+) -> None:
+    client, _, config, _ = remote_chat
+    config.profiles["default"].adapter_options.runtime.clear()
+    answer_with(remote_chat, json_response(401, {"error": {"message": "private upstream detail"}}))
+    caplog.set_level(logging.DEBUG)
+    response = client.post(
+        f"/v1/generate/{SAFE_MODEL}", json={"prompt": PROMPT, "max_new_tokens": 8, "stream": streaming}
+    )
+
+    assert response.status_code == 500
+    [record] = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert (record.name, record.getMessage()) == ("sie_server.api.generate", message)
+    assert record.exc_info is not None
+    assert str(record.exc_info[1]) == "upstream answered 401"
+    for private in (PROMPT, "private upstream detail"):
+        assert private not in caplog.text
 
 
 _GENERATION_SURFACES = [
