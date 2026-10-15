@@ -6681,6 +6681,7 @@ mod tests {
     use std::path::PathBuf;
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tracing::instrument::WithSubscriber;
 
     use crate::delivery::LocalDelivery;
     use crate::scheduler::{BatchConfig, Scheduler};
@@ -6742,11 +6743,21 @@ mod tests {
             .without_time()
             .with_writer(capture.clone())
             .finish();
+        let unobserved = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let _subscriber = tracing::subscriber::set_default(subscriber);
         let backend = LoadingModelBackend::new("cold");
         let dispatcher = dispatcher_with_backend(backend.clone());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
+        dispatcher
+            .dispatch_decoded(
+                local_group("unobserved-request", "unobserved", 2..3, &tx),
+                1,
+                Instant::now(),
+            )
+            .with_subscriber(unobserved.clone())
+            .await;
+        assert!(capture.completions().is_empty());
         dispatcher
             .dispatch_decoded(
                 local_group("cold-request", "cold", 0..1, &tx),
@@ -6768,7 +6779,7 @@ mod tests {
 
         let events = capture.completions();
         assert_eq!(events.len(), 2);
-        assert_eq!(backend.encoded_models(), ["warm", "cold"]);
+        assert_eq!(backend.encoded_models(), ["unobserved", "warm", "cold"]);
         for (event, model) in events.iter().zip(["warm", "cold"]) {
             assert_eq!(event["level"], "INFO");
             assert_eq!(event["target"], "sie_server_sidecar::dispatcher");
