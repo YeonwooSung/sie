@@ -1,6 +1,4 @@
 sie_id: gliner-community/gliner_small-v2.5
-description: "gliner-community/gliner_small-v2.5: extraction model."
-release_date: "2026-04-28"
 hf_id: gliner-community/gliner_small-v2.5
 hf_revision: f227d3cd637bd4e6757ae143935316d062393341
 inputs:

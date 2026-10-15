@@ -1,6 +1,4 @@
 sie_id: docling
-description: "superlinked/docling-artifacts: extraction model."
-release_date: "2026-08-08"
 hf_id: superlinked/docling-artifacts
 hf_revision: 310479be56f3a99a0fea75d930e11eea38bf5ef7
 inputs:

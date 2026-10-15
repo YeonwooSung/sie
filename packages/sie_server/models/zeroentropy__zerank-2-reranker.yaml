@@ -1,6 +1,4 @@
 sie_id: zeroentropy/zerank-2-reranker
-description: "zeroentropy/zerank-2-reranker: reranking model."
-release_date: "2026-07-24"
 hf_id: zeroentropy/zerank-2-reranker
 hf_revision: 5eae30d5ee3c6b2df2ef6d723bde45172d761c4c
 inputs:

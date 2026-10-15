@@ -1,6 +1,4 @@
 sie_id: defog/sqlcoder-7b-2
-description: "defog/sqlcoder-7b-2: generation model."
-release_date: "2024-02-12"
 hf_id: defog/sqlcoder-7b-2
 # SQLCoder-7B-2 (Defog) — a CodeLlama-7B base fine-tuned for text-to-SQL.
 # Served via the existing SGLang generation adapter (LlamaForCausalLM is native

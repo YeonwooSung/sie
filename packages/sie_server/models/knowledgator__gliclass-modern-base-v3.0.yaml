@@ -1,6 +1,4 @@
 sie_id: knowledgator/gliclass-modern-base-v3.0
-description: "knowledgator/gliclass-modern-base-v3.0: extraction model."
-release_date: "2025-08-12"
 hf_id: knowledgator/gliclass-modern-base-v3.0
 hf_revision: ac369222ca4375ca66ebaf7fb5220f223514c035
 inputs:

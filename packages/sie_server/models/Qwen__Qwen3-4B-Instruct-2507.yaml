@@ -1,6 +1,4 @@
 sie_id: Qwen/Qwen3-4B-Instruct-2507
-description: "Qwen/Qwen3-4B-Instruct-2507: generation model."
-release_date: "2025-09-17"
 hf_id: Qwen/Qwen3-4B-Instruct-2507
 hf_revision: cdbee75f17c01a7cc42f958dc650907174af0554
 inputs:

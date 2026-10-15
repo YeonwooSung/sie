@@ -1,6 +1,4 @@
 sie_id: zai-org/GLM-OCR
-description: "zai-org/GLM-OCR: extraction model."
-release_date: "2026-05-19"
 hf_id: zai-org/GLM-OCR
 hf_revision: ca5d8b3e287e52589e37c28385d9655ee4372f9d
 inputs:

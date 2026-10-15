@@ -1,6 +1,4 @@
 sie_id: facebook/bart-large-mnli
-description: "facebook/bart-large-mnli: extraction model."
-release_date: "2023-09-05"
 hf_id: facebook/bart-large-mnli
 hf_revision: d7645e127eaf1aefc7862fd59a17a5aa8558b8ce
 inputs:

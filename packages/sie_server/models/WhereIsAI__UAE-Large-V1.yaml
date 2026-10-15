@@ -1,6 +1,4 @@
 sie_id: WhereIsAI/UAE-Large-V1
-description: "WhereIsAI/UAE-Large-V1: embedding model."
-release_date: "2025-07-29"
 hf_id: WhereIsAI/UAE-Large-V1
 inputs:
   text: true

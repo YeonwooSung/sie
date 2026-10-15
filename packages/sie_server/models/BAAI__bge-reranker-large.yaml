@@ -1,6 +1,4 @@
 sie_id: BAAI/bge-reranker-large
-description: "BAAI/bge-reranker-large: reranking model."
-release_date: "2024-05-11"
 hf_id: BAAI/bge-reranker-large
 hf_revision: 55611d7bca2a7133960a6d3b71e083071bbfc312
 inputs:

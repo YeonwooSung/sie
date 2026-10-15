@@ -1,6 +1,4 @@
 sie_id: openai/privacy-filter
-description: "openai/privacy-filter: extraction model."
-release_date: "2026-04-22"
 hf_id: openai/privacy-filter
 hf_revision: 7ffa9a043d54d1be65afb281eddf0ffbe629385b
 inputs:

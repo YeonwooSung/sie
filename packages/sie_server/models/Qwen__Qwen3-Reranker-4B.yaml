@@ -1,6 +1,4 @@
 sie_id: Qwen/Qwen3-Reranker-4B
-description: "Qwen/Qwen3-Reranker-4B: reranking model."
-release_date: "2026-04-16"
 hf_id: Qwen/Qwen3-Reranker-4B
 hf_revision: 22e683669bc0f0bd69640a1354a6d0aebcfeede5
 inputs:

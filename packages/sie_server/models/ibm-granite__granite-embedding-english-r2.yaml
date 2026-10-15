@@ -1,6 +1,4 @@
 sie_id: ibm-granite/granite-embedding-english-r2
-description: "ibm-granite/granite-embedding-english-r2: embedding model."
-release_date: "2026-01-06"
 hf_id: ibm-granite/granite-embedding-english-r2
 hf_revision: 47ea694b257b703fee9253d75c2b1f2985180498
 inputs:

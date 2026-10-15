@@ -1,6 +1,4 @@
 sie_id: knowledgator/opir-edge-multilang-v1.0
-description: "knowledgator/opir-edge-multilang-v1.0: extraction model."
-release_date: "2026-05-29"
 hf_id: knowledgator/opir-edge-multilang-v1.0
 hf_revision: 969a05f901f8de234b0204f5309cb7e6450e6371
 inputs:

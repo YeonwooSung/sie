@@ -1,6 +1,4 @@
 sie_id: ibm-granite/granite-guardian-3.0-2b
-description: "ibm-granite/granite-guardian-3.0-2b: generation model."
-release_date: "2025-01-03"
 hf_id: ibm-granite/granite-guardian-3.0-2b
 hf_revision: e48b7b8acf438d24daa2271ada6df945b5b8895e
 inputs:

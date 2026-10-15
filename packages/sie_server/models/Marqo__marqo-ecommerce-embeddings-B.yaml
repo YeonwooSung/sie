@@ -1,6 +1,4 @@
 sie_id: Marqo/marqo-ecommerce-embeddings-B
-description: "Marqo/marqo-ecommerce-embeddings-B: embedding model."
-release_date: "2024-11-12"
 hf_id: Marqo/marqo-ecommerce-embeddings-B
 hf_revision: 6854090aa39b2a9d70f390d83ae9e70cf9d9004e
 inputs:

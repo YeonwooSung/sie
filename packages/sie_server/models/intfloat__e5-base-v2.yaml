@@ -1,6 +1,4 @@
 sie_id: intfloat/e5-base-v2
-description: "intfloat/e5-base-v2: embedding model."
-release_date: "2025-02-17"
 hf_id: intfloat/e5-base-v2
 hf_revision: f52bf8ec8c7124536f0efb74aca902b2995e5bcd
 inputs:

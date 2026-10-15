@@ -1,6 +1,4 @@
 sie_id: "google/madlad400-3b-mt"
-description: "google/madlad400-3b-mt: generation model."
-release_date: "2023-11-27"
 hf_id: "google/madlad400-3b-mt"
 hf_revision: fa184c675da0b5c9e1c8694fccd4e12e2d422094
 inputs:

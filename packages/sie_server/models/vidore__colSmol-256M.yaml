@@ -1,6 +1,4 @@
 sie_id: vidore/colSmol-256M
-description: "vidore/colSmol-256M: embedding model."
-release_date: "2025-03-14"
 hf_id: vidore/colSmol-256M
 hf_revision: a59110fdf114638b8018e6c9a018907e12f14855
 inputs:

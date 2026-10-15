@@ -1,6 +1,4 @@
 sie_id: nomic-ai/modernbert-embed-base
-description: "nomic-ai/modernbert-embed-base: embedding model."
-release_date: "2025-01-24"
 hf_id: nomic-ai/modernbert-embed-base
 hf_revision: d556a88e332558790b210f7bdbe87da2fa94a8d8
 inputs:

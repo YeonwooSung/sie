@@ -1,6 +1,4 @@
 sie_id: openai/clip-vit-large-patch14
-description: "openai/clip-vit-large-patch14: embedding model."
-release_date: "2023-09-15"
 hf_id: openai/clip-vit-large-patch14
 hf_revision: 32bd64288804d66eefd0ccbe215aa642df71cc41
 inputs:

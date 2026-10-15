@@ -1,6 +1,4 @@
 sie_id: BAAI/bge-reranker-v2-m3
-description: "BAAI/bge-reranker-v2-m3: reranking model."
-release_date: "2024-06-24"
 hf_id: BAAI/bge-reranker-v2-m3
 hf_revision: 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
 inputs:

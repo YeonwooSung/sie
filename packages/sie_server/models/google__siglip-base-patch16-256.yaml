@@ -1,6 +1,4 @@
 sie_id: google/siglip-base-patch16-256
-description: "google/siglip-base-patch16-256: embedding model."
-release_date: "2024-09-26"
 hf_id: google/siglip-base-patch16-256
 hf_revision: b078df89e446d623010d890864d4207fe6399f61
 inputs:

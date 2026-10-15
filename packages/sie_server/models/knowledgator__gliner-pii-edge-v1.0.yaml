@@ -1,6 +1,4 @@
 sie_id: knowledgator/gliner-pii-edge-v1.0
-description: "knowledgator/gliner-pii-edge-v1.0: extraction model."
-release_date: "2026-03-26"
 hf_id: knowledgator/gliner-pii-edge-v1.0
 hf_revision: 9b7f39b0a2da971a5beea78d35f1539d4009c891
 inputs:

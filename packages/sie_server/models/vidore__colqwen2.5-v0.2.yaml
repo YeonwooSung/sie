@@ -1,6 +1,4 @@
 sie_id: vidore/colqwen2.5-v0.2
-description: "vidore/colqwen2.5-v0.2: embedding model."
-release_date: "2025-06-16"
 hf_id: vidore/colqwen2.5-v0.2
 hf_revision: 6f6fcdfd1a114dfe365f529701b33d66b9349014
 inputs:

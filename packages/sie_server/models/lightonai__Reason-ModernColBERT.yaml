@@ -1,6 +1,4 @@
 sie_id: lightonai/Reason-ModernColBERT
-description: "lightonai/Reason-ModernColBERT: embedding and reranking model."
-release_date: "2026-04-14"
 hf_id: lightonai/Reason-ModernColBERT
 hf_revision: b0e5f1aa8d8dee8626f183b9e3b8241badf51664
 inputs:

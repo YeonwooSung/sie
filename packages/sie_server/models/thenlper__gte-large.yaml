@@ -1,6 +1,4 @@
 sie_id: thenlper/gte-large
-description: "thenlper/gte-large: embedding model."
-release_date: "2024-11-15"
 hf_id: thenlper/gte-large
 inputs:
   text: true

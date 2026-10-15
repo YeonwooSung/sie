@@ -1,6 +1,4 @@
 sie_id: tencent/R3-embedding-0.6b
-description: "tencent/R3-embedding-0.6b: embedding model."
-release_date: "2026-07-08"
 hf_id: tencent/R3-embedding-0.6b
 hf_revision: 9df7e112330d858f4fd0a9d1aa5e1def15d5d25a
 inputs:

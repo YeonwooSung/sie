@@ -1,6 +1,4 @@
 sie_id: google/owlv2-base-patch16-ensemble
-description: "google/owlv2-base-patch16-ensemble: extraction model."
-release_date: "2024-10-31"
 hf_id: google/owlv2-base-patch16-ensemble
 hf_revision: cfd3195ba4ea9592eec887ded089f4c08eff231d
 inputs:

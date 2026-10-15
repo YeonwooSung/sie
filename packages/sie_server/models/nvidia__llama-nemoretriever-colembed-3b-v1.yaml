@@ -1,6 +1,4 @@
 sie_id: nvidia/llama-nemoretriever-colembed-3b-v1
-description: "nvidia/llama-nemoretriever-colembed-3b-v1: embedding model."
-release_date: "2026-02-04"
 hf_id: nvidia/llama-nemoretriever-colembed-3b-v1
 hf_revision: 75f7e7311c7a5965c535587fd5e563c5e4a3c583
 inputs:

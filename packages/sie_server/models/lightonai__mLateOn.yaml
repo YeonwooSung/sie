@@ -1,6 +1,4 @@
 sie_id: lightonai/mLateOn
-description: "lightonai/mLateOn: embedding and reranking model."
-release_date: "2026-07-30"
 hf_id: lightonai/mLateOn
 hf_revision: 35391e36392085d72a93d232f6122607a234ad7a
 inputs:

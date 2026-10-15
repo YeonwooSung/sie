@@ -1,6 +1,4 @@
 sie_id: Qwen/Qwen3Guard-Gen-4B
-description: "Qwen/Qwen3Guard-Gen-4B: generation model."
-release_date: "2025-11-07"
 hf_id: Qwen/Qwen3Guard-Gen-4B
 hf_revision: 6ec42827da0c1ff11e7a49dc269d2e810d27e108
 inputs:

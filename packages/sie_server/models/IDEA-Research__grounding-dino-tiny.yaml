@@ -1,6 +1,4 @@
 sie_id: IDEA-Research/grounding-dino-tiny
-description: "IDEA-Research/grounding-dino-tiny: extraction model."
-release_date: "2024-05-12"
 hf_id: IDEA-Research/grounding-dino-tiny
 hf_revision: a2bb814dd30d776dcf7e30523b00659f4f141c71
 inputs:

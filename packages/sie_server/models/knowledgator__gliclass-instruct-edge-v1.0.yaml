@@ -1,6 +1,4 @@
 sie_id: knowledgator/gliclass-instruct-edge-v1.0
-description: "knowledgator/gliclass-instruct-edge-v1.0: extraction model."
-release_date: "2026-02-17"
 hf_id: knowledgator/gliclass-instruct-edge-v1.0
 hf_revision: 727be8a417f6a7718e591b025e07054c146d8139
 inputs:

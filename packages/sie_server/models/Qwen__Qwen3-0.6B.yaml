@@ -1,6 +1,4 @@
 sie_id: Qwen/Qwen3-0.6B
-description: "Qwen/Qwen3-0.6B: generation model."
-release_date: "2025-07-26"
 hf_id: Qwen/Qwen3-0.6B
 hf_revision: c1899de289a04d12100db370d81485cdf75e47ca
 inputs:

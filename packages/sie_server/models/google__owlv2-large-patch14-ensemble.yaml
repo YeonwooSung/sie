@@ -1,6 +1,4 @@
 sie_id: google/owlv2-large-patch14-ensemble
-description: "google/owlv2-large-patch14-ensemble: extraction model."
-release_date: "2024-10-31"
 hf_id: google/owlv2-large-patch14-ensemble
 inputs:
   text: false

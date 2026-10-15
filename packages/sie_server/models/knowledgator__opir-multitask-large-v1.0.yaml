@@ -1,6 +1,4 @@
 sie_id: knowledgator/opir-multitask-large-v1.0
-description: "knowledgator/opir-multitask-large-v1.0: extraction model."
-release_date: "2026-05-29"
 hf_id: knowledgator/opir-multitask-large-v1.0
 hf_revision: 69bb27407d66eab4797049d36ba75eef3579335b
 inputs:

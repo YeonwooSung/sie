@@ -1,6 +1,4 @@
 sie_id: Ihor/gliner-biomed-large-v1.0
-description: "Ihor/gliner-biomed-large-v1.0: extraction model."
-release_date: "2025-07-16"
 hf_id: Ihor/gliner-biomed-large-v1.0
 hf_revision: f79771210ab2111a2081ef31620fdb7342f602e9
 hf_tokenizer_dependencies:

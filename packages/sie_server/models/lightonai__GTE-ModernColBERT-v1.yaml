@@ -1,6 +1,4 @@
 sie_id: lightonai/GTE-ModernColBERT-v1
-description: "lightonai/GTE-ModernColBERT-v1: embedding and reranking model."
-release_date: "2026-01-21"
 hf_id: lightonai/GTE-ModernColBERT-v1
 hf_revision: cbbe53366e564450558f5e639dd499171f127538
 inputs:

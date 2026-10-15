@@ -1,6 +1,4 @@
 sie_id: nvidia/llama-embed-nemotron-8b
-description: "nvidia/llama-embed-nemotron-8b: embedding model."
-release_date: "2026-04-23"
 hf_id: nvidia/llama-embed-nemotron-8b
 hf_revision: aa3b43a495a9b280d1bdb716da37c54bb495d630
 inputs:

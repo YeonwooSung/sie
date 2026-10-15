@@ -1,6 +1,4 @@
 sie_id: knowledgator/modern-gliner-bi-base-v1.0
-description: "knowledgator/modern-gliner-bi-base-v1.0: extraction model."
-release_date: "2025-01-07"
 hf_id: knowledgator/modern-gliner-bi-base-v1.0
 hf_revision: 2d73e4c02b52f96e2926baffc67b5e78532fc39c
 inputs:

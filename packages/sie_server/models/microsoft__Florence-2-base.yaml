@@ -1,6 +1,4 @@
 sie_id: microsoft/Florence-2-base
-description: "microsoft/Florence-2-base: extraction model."
-release_date: "2025-08-04"
 hf_id: microsoft/Florence-2-base
 hf_revision: 5ca5edf5bd017b9919c05d08aebef5e4c7ac3bac
 inputs:

@@ -1,6 +1,4 @@
 sie_id: fastino/gliner2.5-small-v1
-description: "fastino/gliner2.5-small-v1: extraction model."
-release_date: "2026-09-28"
 hf_id: fastino/gliner2.5-small-v1
 hf_revision: 7132dc4561c3f94563c6147e75ffa8ef34c4964a
 inputs:

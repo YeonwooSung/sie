@@ -27,8 +27,6 @@
 # compute_precision bfloat16 matches Meta's reference example notebook, which
 # runs under bfloat16 autocast. Scores are computed in float32.
 sie_id: facebook/sam3
-description: "facebook/sam3: extraction model."
-release_date: "2025-11-20"
 hf_id: facebook/sam3
 hf_revision: 3c879f39826c281e95690f02c7821c4de09afae7
 inputs:

@@ -1,6 +1,4 @@
 sie_id: Qwen/Qwen3-Embedding-0.6B
-description: "Qwen/Qwen3-Embedding-0.6B: embedding model."
-release_date: "2026-04-20"
 hf_id: Qwen/Qwen3-Embedding-0.6B
 hf_revision: 97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3
 inputs:

@@ -1,6 +1,4 @@
 sie_id: numind/NuNER_Zero-span
-description: "numind/NuNER_Zero-span: extraction model."
-release_date: "2025-02-03"
 hf_id: numind/NuNER_Zero-span
 hf_revision: 063b4dec1aaf626058e7c071657b15d52abffca0
 hf_tokenizer_dependencies:

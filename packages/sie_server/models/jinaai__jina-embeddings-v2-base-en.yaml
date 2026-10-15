@@ -1,6 +1,4 @@
 sie_id: jinaai/jina-embeddings-v2-base-en
-description: "jinaai/jina-embeddings-v2-base-en: embedding model."
-release_date: "2025-01-06"
 hf_id: jinaai/jina-embeddings-v2-base-en
 inputs:
   text: true

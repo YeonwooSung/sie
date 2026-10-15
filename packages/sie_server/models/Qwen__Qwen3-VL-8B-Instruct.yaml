@@ -1,6 +1,4 @@
 sie_id: "Qwen/Qwen3-VL-8B-Instruct"
-description: "Qwen/Qwen3-VL-8B-Instruct: generation model."
-release_date: "2025-10-15"
 hf_id: "Qwen/Qwen3-VL-8B-Instruct"
 hf_revision: 0c351dd01ed87e9c1b53cbc748cba10e6187ff3b
 inputs:

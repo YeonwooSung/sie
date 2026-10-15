@@ -1,6 +1,4 @@
 sie_id: knowledgator/gliformer-base-v1
-description: "knowledgator/gliformer-base-v1: embedding and extraction model."
-release_date: "2026-09-14"
 hf_id: knowledgator/gliformer-base-v1
 hf_revision: 590f9d3f577ea2f6d685aaec84b2d66b6db86b15
 inputs:

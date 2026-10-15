@@ -1,6 +1,4 @@
 sie_id: answerdotai/ModernBERT-base
-description: "answerdotai/ModernBERT-base: embedding model."
-release_date: "2025-01-15"
 hf_id: answerdotai/ModernBERT-base
 inputs:
   text: true

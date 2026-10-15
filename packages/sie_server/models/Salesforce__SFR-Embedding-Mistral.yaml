@@ -1,6 +1,4 @@
 sie_id: Salesforce/SFR-Embedding-Mistral
-description: "Salesforce/SFR-Embedding-Mistral: embedding model."
-release_date: "2025-02-04"
 hf_id: Salesforce/SFR-Embedding-Mistral
 hf_revision: 33a60fe7b5e00b9414981280c571e8a4f9f42f1b
 inputs:

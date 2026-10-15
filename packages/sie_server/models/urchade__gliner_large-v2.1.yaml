@@ -1,6 +1,4 @@
 sie_id: urchade/gliner_large-v2.1
-description: "urchade/gliner_large-v2.1: extraction model."
-release_date: "2024-04-10"
 hf_id: urchade/gliner_large-v2.1
 hf_revision: abd49a1f1ebc12af1be84d06f6848221cf96dcad
 inputs:

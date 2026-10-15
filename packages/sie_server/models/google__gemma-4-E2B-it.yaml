@@ -1,6 +1,4 @@
 sie_id: google/gemma-4-E2B-it
-description: "google/gemma-4-E2B-it: generation model."
-release_date: "2026-07-20"
 hf_id: google/gemma-4-E2B-it
 # ── Engine (see issue #1415) ──
 #

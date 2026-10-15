@@ -1,6 +1,4 @@
 sie_id: Alibaba-NLP/gte-Qwen2-7B-instruct
-description: "Alibaba-NLP/gte-Qwen2-7B-instruct: embedding model."
-release_date: "2025-03-24"
 hf_id: Alibaba-NLP/gte-Qwen2-7B-instruct
 # Immutable pin (repo main as of the PR #2104 g7e validation, last modified
 # 2025-03-24): trust_remote_code executes modeling_qwen.py from the Hub, so

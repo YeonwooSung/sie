@@ -1,6 +1,4 @@
 sie_id: Alibaba-NLP/gte-Qwen2-1.5B-instruct
-description: "Alibaba-NLP/gte-Qwen2-1.5B-instruct: embedding model."
-release_date: "2025-05-28"
 hf_id: Alibaba-NLP/gte-Qwen2-1.5B-instruct
 hf_revision: a9af15a6372d7d6b25e9fb07c2ccb9e1fe645644
 inputs:

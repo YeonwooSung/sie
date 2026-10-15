@@ -1,6 +1,4 @@
 sie_id: tencent/R3-rerank-0.6b
-description: "tencent/R3-rerank-0.6b: reranking model."
-release_date: "2026-07-08"
 hf_id: tencent/R3-rerank-0.6b
 hf_revision: 6d0c3e486b8653578fd3f0e3c8e7871a0ce01953
 inputs:

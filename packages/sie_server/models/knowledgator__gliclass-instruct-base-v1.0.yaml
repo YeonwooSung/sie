@@ -1,6 +1,4 @@
 sie_id: knowledgator/gliclass-instruct-base-v1.0
-description: "knowledgator/gliclass-instruct-base-v1.0: extraction model."
-release_date: "2026-05-21"
 hf_id: knowledgator/gliclass-instruct-base-v1.0
 hf_revision: 4f6a108b08a5537f395521d19b5073e197923dd3
 inputs:

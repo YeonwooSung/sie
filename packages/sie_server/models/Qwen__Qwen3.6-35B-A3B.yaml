@@ -1,6 +1,4 @@
 sie_id: Qwen/Qwen3.6-35B-A3B
-description: "Qwen/Qwen3.6-35B-A3B: generation model."
-release_date: "2026-04-24"
 hf_id: Qwen/Qwen3.6-35B-A3B
 hf_revision: 995ad96eacd98c81ed38be0c5b274b04031597b0
 # Qwen3.6-35B-A3B is the Qwen3.5-compatible hybrid VLM/MoE architecture

@@ -1,6 +1,4 @@
 sie_id: knowledgator/gliclass-multilang-ultra
-description: "knowledgator/gliclass-multilang-ultra: extraction model."
-release_date: "2026-04-30"
 hf_id: knowledgator/gliclass-multilang-ultra
 hf_revision: 33c3ffec64056b0d37173d2dd90b885ac29b72c3
 inputs:
