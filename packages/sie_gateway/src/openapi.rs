@@ -3100,11 +3100,11 @@ pub struct ScoreRequest {
 pub struct SystemOneRequest {
     /// SIE model id of a decision model, e.g. `fastino/GLiNER2.5-Decide`.
     pub model: String,
-    /// The text to judge, a JSON object, or a list of conversation turns.
-    #[schema(value_type = Object)]
+    /// The text to judge (a string), a JSON object, or a list of conversation
+    /// turns.
     pub state: Value,
     /// Typed questions by id: `{"type": "noul" | "choice" | "score",
-    /// "instructions"?, "criteria"?}`. A score question takes at most 10 levels.
+    /// "instructions"?, "criteria"?}`. A score question takes 1 to 10 levels.
     #[schema(value_type = Object)]
     pub questions: Value,
 }
@@ -3120,7 +3120,8 @@ pub struct SystemOneUsage {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SystemOneResponse {
     pub model: String,
-    /// One answer per question: `noul` (`noul`, the probability of yes),
+    /// One answer per question: `noul` (`noul`, the probability of yes,
+    /// `answer` and `confidence`),
     /// `choice` (`choice`, `confidence`, `probabilities` by option) or `score`
     /// (`score`, `confidence`, `legend` and `probabilities` by level index).
     #[schema(value_type = Object)]

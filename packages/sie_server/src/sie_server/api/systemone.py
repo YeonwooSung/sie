@@ -14,7 +14,7 @@ as ``POST /v1/extract/{model}``:
 - ``choice`` and ``score`` confidences follow the System One API's published
   definitions (see :func:`choice_confidence` and :func:`score_confidence`);
 - a state or question set that does not fit the model's row is refused with
-  422 instead of being truncated, as ``extract`` does by default;
+  422 instead of being truncated (``extract``'s default);
 - validation errors are 422 in FastAPI's ``{"detail": [...]}`` shape, other
   errors ``{"detail": {"error_type", "code", "message"}}``, and a retryable
   error's ``Retry-After`` is at most 60 seconds, with ``retry-after-ms``.
@@ -42,7 +42,7 @@ from sie_server.api.helpers import (
     validated_total,
 )
 from sie_server.api.options import resolve_runtime_options
-from sie_server.api.routing import remote_routing, route_request
+from sie_server.api.routing import error_code, fallback_refusal, remote_routing, route_request
 from sie_server.api.validation import validate_machine_profile_header
 from sie_server.core.worker import QueueFullError
 from sie_server.core.worker.handlers.extract import ExtractHandler
@@ -169,7 +169,7 @@ def normalize_questions(questions: Mapping[str, Any]) -> dict[str, Any]:
     """The questions as the decision adapters read them.
 
     A missing or ``null`` ``instructions`` becomes ``""``. A score question
-    must have 1 to 10 levels, none of them ``null``. Everything else is left to
+    with a list of levels must have 1 to 10 of them, none ``null``. Everything else is left to
     the adapter's own validation, which rejects what it cannot answer.
 
     Raises:
@@ -185,6 +185,8 @@ def normalize_questions(questions: Mapping[str, Any]) -> dict[str, Any]:
         if question.get("type") == "score":
             levels = question.get("criteria")
             if isinstance(levels, list):
+                if not levels:
+                    raise _invalid(f"score question {qid!r} has no levels", ["questions", qid, "criteria"])
                 if len(levels) > MAX_SCORE_LEVELS:
                     raise _invalid(
                         f"score question {qid!r} has {len(levels)} levels; at most {MAX_SCORE_LEVELS} are allowed",
@@ -197,14 +199,18 @@ def normalize_questions(questions: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def to_answer(answer: Mapping[str, Any]) -> dict[str, Any]:
-    """One adapter answer in the System One shape, with System One confidences."""
+    """One adapter answer in the System One shape, with System One confidences.
+
+    Raises:
+        ValueError: A probability is not a number, or a score level key is not an integer.
+    """
     result = dict(answer)
     kind = result.get("type")
     probabilities = result.get("probabilities")
     if kind == "choice" and isinstance(probabilities, Mapping):
         result["confidence"] = choice_confidence([float(p) for p in probabilities.values()])
     elif kind == "score" and isinstance(probabilities, Mapping):
-        ordered = [float(probabilities[key]) for key in sorted(probabilities, key=lambda key: int(key))]
+        ordered = [float(probabilities[key]) for key in sorted(probabilities, key=int)]
         result["confidence"] = score_confidence(ordered)
     return result
 
@@ -239,11 +245,12 @@ def _retry_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
     if retry_key is None:
         return out
     try:
-        seconds = float(out.pop(retry_key))
+        seconds = float(out[retry_key])
     except ValueError:
         return out
     if not math.isfinite(seconds) or seconds < 0:
         return out
+    del out[retry_key]
     seconds = min(seconds, MAX_RETRY_AFTER_S)
     out["Retry-After"] = str(max(1, math.ceil(seconds)))
     out["retry-after-ms"] = str(int(seconds * 1000))
@@ -253,7 +260,7 @@ def _retry_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
 def error_response(error: HTTPException) -> JSONResponse:
     """An SIE error in the System One error shapes.
 
-    Input errors (400 ``INVALID_INPUT`` / ``INPUT_TOO_LONG``) become 422 in
+    Any 400 (for example ``INVALID_INPUT`` or ``INPUT_TOO_LONG``) becomes 422 in
     FastAPI's validation shape, as System One answers a request it cannot
     validate. Every other status keeps its code, with
     ``{"detail": {"error_type", "code", "message"}}``.
@@ -264,10 +271,11 @@ def error_response(error: HTTPException) -> JSONResponse:
     message = _error_message(error.detail)
     code = _error_code(error.detail)
     if error.status_code == status.HTTP_400_BAD_REQUEST:
+        entry: dict[str, Any] = {"type": "value_error", "loc": ["body"], "msg": message}
+        if code is not None:
+            entry["code"] = code
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            content={"detail": [{"type": "value_error", "loc": ["body"], "msg": message, "code": code}]},
-            headers=headers,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, content={"detail": [entry]}, headers=headers
         )
     error_type = _ERROR_TYPES.get(error.status_code, "api_error")
     detail: dict[str, Any] = {"error_type": error_type, "message": message}
@@ -277,11 +285,19 @@ def error_response(error: HTTPException) -> JSONResponse:
 
 
 def _item_error(result: Mapping[str, Any]) -> HTTPException | None:
-    """The 422 for an item the adapter refused (a state that does not fit, an unreadable state)."""
+    """The 422 for an item the adapter refused (a state that does not fit, an unreadable state).
+
+    The entry carries the adapter's code (``INPUT_TOO_LONG``, ``INVALID_INPUT``).
+    """
     error = result.get("error")
     if not isinstance(error, Mapping):
         return None
-    return _invalid(str(error.get("message", "the state could not be read")), ["state"])
+    code = _error_code(error) or ErrorCode.INVALID_INPUT.value
+    message = str(error.get("message", "the state could not be read"))
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        detail=[{"type": "value_error", "loc": ["body", "state"], "msg": message, "code": code}],
+    )
 
 
 @router.post(
@@ -311,7 +327,7 @@ async def system_one(
     try:
         return await _system_one(request, http_request, x_machine_profile)
     except HTTPException as error:
-        return error_response(error)
+        return error_response(fallback_refusal(http_request, error.status_code, error_code(error)) or error)
 
 
 async def _system_one(
@@ -374,18 +390,24 @@ async def _system_one(
         output = cast("ExtractOutput", worker_result.output)
         result = ExtractHandler.format_output(output)[0]
         if refusal := _item_error(result):
-            span.set_attribute("error", _error_code(result.get("error")) or ErrorCode.INVALID_INPUT.value)
+            span.set_attribute("error", refusal.detail[0]["code"])
             raise refusal
 
         data = result.get("data") or {}
-        answers = {qid: to_answer(data[qid]) for qid in questions if isinstance(data.get(qid), Mapping)}
+        try:
+            answers = {qid: to_answer(data[qid]) for qid in questions if isinstance(data.get(qid), Mapping)}
+        except (TypeError, ValueError) as e:
+            raise error_handler.handle_inference_error(RuntimeError(f"unreadable answer: {e}"), "Decision") from e
         if len(answers) != len(questions):
             missing = sorted(set(questions) - set(answers))
             raise error_handler.handle_inference_error(
                 RuntimeError(f"model returned no answer for questions {missing}"), "Decision"
             )
 
-        input_tokens = validated_total(output.input_token_counts, 1) or 0
+        counted_tokens = validated_total(output.input_token_counts, 1)
+        if counted_tokens is None:
+            logger.warning("Model %s reported no input token count for a System One request", model)
+        input_tokens = counted_tokens or 0
         timing = worker_result.timing
         if worker_telemetry_enabled():
             worker_telemetry().item_completed(
@@ -398,7 +420,7 @@ async def _system_one(
                 tokenization_s=timing.tokenization_ms / 1000.0,
                 inference_s=timing.inference_ms / 1000.0,
                 postprocessing_s=timing.postprocessing_ms / 1000.0,
-                units={"input_tokens": input_tokens},
+                units={} if counted_tokens is None else {"input_tokens": counted_tokens},
             )
 
         body = SystemOneResponse(model=model, answers=answers, usage=SystemOneUsage(input_tokens=input_tokens))

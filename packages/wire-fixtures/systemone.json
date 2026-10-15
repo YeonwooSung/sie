@@ -2,7 +2,7 @@
   "_comment": [
     "Golden contract of the System One-compatible POST /v1/systemone, served by",
     "the single server (packages/sie_server/src/sie_server/api/systemone.py) and",
-    "the gateway (packages/sie_gateway/src/handlers/proxy.rs::proxy_systemone).",
+    "the gateway (packages/sie_gateway/src/handlers/systemone.rs::proxy_systemone).",
     "Both translate a System One request into one extract item and the extract",
     "result back into the System One response; both load this file in tests.",
     "`requests`: a valid request and the extract call it becomes (one item,",
@@ -105,6 +105,7 @@
         "questions": {"q": {"type": "score", "criteria": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]}}
       }
     },
+    {"name": "no score levels", "request": {"model": "fastino/GLiNER2.5-Decide", "state": "hi", "questions": {"q": {"type": "score", "criteria": []}}}},
     {"name": "null score level", "request": {"model": "fastino/GLiNER2.5-Decide", "state": "hi", "questions": {"q": {"type": "score", "criteria": ["low", null]}}}},
     {"name": "images", "request": {"model": "fastino/GLiNER2.5-Decide", "state": "hi", "questions": {"q": {"type": "noul"}}, "images": ["https://example.com/a.png"]}},
     {"name": "audio", "request": {"model": "fastino/GLiNER2.5-Decide", "state": "hi", "questions": {"q": {"type": "noul"}}, "audio": ["https://example.com/a.wav"]}},

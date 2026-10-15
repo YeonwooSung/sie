@@ -23,7 +23,7 @@ from sie_server.config.model import EncodeTask, ExtractTask, ModelConfig, Profil
 from sie_server.core.inference_output import ExtractItemError, ExtractOutput
 from sie_server.core.registry import ModelRegistry
 from sie_server.core.timing import RequestTiming
-from sie_server.core.worker import WorkerResult
+from sie_server.core.worker import QueueFullError, WorkerResult
 from sie_server.types.responses import ErrorCode
 
 DECIDE = "fastino/GLiNER2.5-Decide"
@@ -284,6 +284,16 @@ class TestValidation:
         adapter.extract.side_effect = too_long
         detail = self._assert_422(_post(client))
         assert detail[0]["loc"] == ["body", "state"]
+        assert detail[0]["code"] == ErrorCode.INPUT_TOO_LONG.value
+
+    def test_unreadable_state_keeps_its_code(self, client: TestClient, adapter: MagicMock) -> None:
+        def unreadable(items: list[Any], **_: Any) -> ExtractOutput:
+            error = ExtractItemError(code=ErrorCode.INVALID_INPUT.value, message="state is not valid JSON")
+            return ExtractOutput(entities=[[]], data=[{}], errors=[error], input_token_counts=[0])
+
+        adapter.extract.side_effect = unreadable
+        detail = self._assert_422(_post(client))
+        assert detail[0]["code"] == ErrorCode.INVALID_INPUT.value
 
 
 class TestErrors:
@@ -296,7 +306,29 @@ class TestErrors:
 
     def test_missing_answer_is_a_server_error(self, client: TestClient, adapter: MagicMock) -> None:
         adapter.extract.side_effect = lambda items, **_: ExtractOutput(entities=[[]], data=[{}], input_token_counts=[1])
-        assert _post(client).status_code == 500
+        response = _post(client)
+        assert response.status_code == 500
+        assert response.json()["detail"]["error_type"] == "api_error"
+
+    @pytest.mark.parametrize("probabilities", [{"0": 0.5, "high": 0.5}, {"0": 0.5, "1": "half"}])
+    def test_unreadable_answer_is_a_server_error(
+        self, client: TestClient, adapter: MagicMock, probabilities: dict[str, Any]
+    ) -> None:
+        answer = {"type": "score", "score": 0.5, "probabilities": probabilities}
+        adapter.extract.side_effect = lambda items, **_: ExtractOutput(
+            entities=[[]], data=[{"q": answer}], input_token_counts=[1]
+        )
+        response = _post(client, questions={"q": {"type": "score", "criteria": ["low", "high"]}})
+        assert response.status_code == 500
+        assert response.json()["detail"]["error_type"] == "api_error"
+
+    def test_queue_full_is_retryable(self, client: TestClient, adapter: MagicMock) -> None:
+        adapter.extract.side_effect = QueueFullError("queue full")
+        response = _post(client)
+        assert response.status_code == 503
+        assert int(response.headers["Retry-After"]) <= MAX_RETRY_AFTER_S
+        assert response.headers["retry-after-ms"] == str(int(float(response.headers["Retry-After"]) * 1000))
+        assert set(response.json()["detail"]) >= {"error_type", "message"}
 
     def test_retry_after_capped_and_mirrored(self) -> None:
         error = HTTPException(
@@ -320,6 +352,20 @@ class TestErrors:
     def test_bad_request_becomes_422(self) -> None:
         response = error_response(HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": "bad"}))
         assert response.status_code == 422
+        assert json.loads(response.body)["detail"][0]["code"] == "INVALID_INPUT"
+
+    def test_bad_request_without_a_code_has_no_code(self) -> None:
+        response = error_response(HTTPException(status_code=400, detail="bad"))
+        assert "code" not in json.loads(response.body)["detail"][0]
+
+    def test_unparseable_retry_after_passes_through(self) -> None:
+        date = "Wed, 21 Oct 2026 07:28:00 GMT"
+        error = HTTPException(
+            status_code=503, detail={"code": "QUEUE_FULL", "message": "busy"}, headers={"Retry-After": date}
+        )
+        response = error_response(error)
+        assert response.headers["Retry-After"] == date
+        assert "retry-after-ms" not in response.headers
 
 
 class TestConfidence:

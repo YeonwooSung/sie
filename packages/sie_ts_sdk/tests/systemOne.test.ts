@@ -9,7 +9,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SIEClient } from "../src/client.js";
 import { RequestError } from "../src/errors.js";
 import { packMessage, unpackMessage } from "../src/msgpack.js";
-import { choiceConfidence, scoreConfidence, systemOneRequest } from "../src/systemone.js";
+import {
+  choiceConfidence,
+  scoreConfidence,
+  systemOneRequest,
+  systemOneResult,
+} from "../src/systemone.js";
 
 const mockFetch = vi.fn();
 vi.stubGlobal("fetch", mockFetch);
@@ -19,6 +24,15 @@ const fixturesDir = fileURLToPath(new URL("../../wire-fixtures/", import.meta.ur
 const FIXTURE: any = JSON.parse(readFileSync(`${fixturesDir}systemone.json`, "utf8"));
 const RESPONSE_CASE = FIXTURE.responses[0];
 const MODEL: string = RESPONSE_CASE.model;
+// Invalid requests only the HTTP route can see: the SDK takes the model as an
+// argument and sends no media fields.
+const ROUTE_ONLY_INVALID_REQUESTS = new Set([
+  "missing model",
+  "empty model",
+  "images",
+  "audio",
+  "videos",
+]);
 const QUESTIONS: Record<string, unknown> = Object.fromEntries(
   (RESPONSE_CASE.questions as string[]).map((qid) => [qid, { type: "noul" }]),
 );
@@ -103,14 +117,39 @@ describe("System One fixture", () => {
   });
 
   it.each(
-    // biome-ignore lint/suspicious/noExplicitAny: golden fixture JSON
-    FIXTURE.invalid_requests.filter((testCase: any) =>
-      /^(number|boolean|null|empty q|questions|question|eleven|null score)/.test(testCase.name),
+    FIXTURE.invalid_requests.filter(
+      // biome-ignore lint/suspicious/noExplicitAny: golden fixture JSON
+      (testCase: any) => !ROUTE_ONLY_INVALID_REQUESTS.has(testCase.name),
     ),
   )("refuses: $name", (testCase) => {
     expect(() =>
       systemOneRequest(testCase.request.state, testCase.request.questions ?? {}),
     ).toThrow(RequestError);
+  });
+
+  it.each(FIXTURE.responses)("renders the response: $name", (testCase) => {
+    const questions = Object.fromEntries(
+      (testCase.questions as string[]).map((qid) => [qid, { type: "noul" }]),
+    );
+    const result = systemOneResult(
+      testCase.model,
+      {
+        id: "item-0",
+        entities: [],
+        data: testCase.data,
+        request: { usage: { inputTokens: testCase.input_tokens } },
+      },
+      questions,
+    );
+    expectClose(result, testCase.response);
+  });
+
+  it.each([
+    { "0": 0.5, high: 0.5 },
+    { "0": 0.5, "1": "half" },
+  ])("refuses unreadable probabilities: %o", (probabilities) => {
+    const result = { id: "item-0", entities: [], data: { q: { type: "score", probabilities } } };
+    expect(() => systemOneResult(MODEL, result, { q: { type: "score" } })).toThrow(RequestError);
   });
 
   it("matches the confidence goldens", () => {

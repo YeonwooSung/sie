@@ -51,6 +51,8 @@ def system_one_request(state: Any, questions: Mapping[str, Any]) -> tuple[Item, 
             normalized["instructions"] = ""
         levels = normalized.get("criteria")
         if normalized.get("type") == "score" and isinstance(levels, list):
+            if not levels:
+                raise RequestError(f"score question {qid!r} has no levels", code="INVALID_INPUT")
             if len(levels) > MAX_SCORE_LEVELS:
                 raise RequestError(
                     f"score question {qid!r} has {len(levels)} levels; at most {MAX_SCORE_LEVELS} are allowed",
@@ -86,14 +88,17 @@ def score_confidence(probabilities: list[float]) -> float:
     return min(1.0, max(0.0, 1.0 - spread / even))
 
 
-def _answer(answer: Mapping[str, Any]) -> dict[str, Any]:
+def _answer(qid: str, answer: Mapping[str, Any]) -> dict[str, Any]:
     result = dict(answer)
     probabilities = result.get("probabilities")
-    if result.get("type") == "choice" and isinstance(probabilities, Mapping):
-        result["confidence"] = choice_confidence([float(p) for p in probabilities.values()])
-    elif result.get("type") == "score" and isinstance(probabilities, Mapping):
-        ordered = [float(probabilities[key]) for key in sorted(probabilities, key=lambda key: int(key))]
-        result["confidence"] = score_confidence(ordered)
+    try:
+        if result.get("type") == "choice" and isinstance(probabilities, Mapping):
+            result["confidence"] = choice_confidence([float(p) for p in probabilities.values()])
+        elif result.get("type") == "score" and isinstance(probabilities, Mapping):
+            ordered = [float(probabilities[key]) for key in sorted(probabilities, key=int)]
+            result["confidence"] = score_confidence(ordered)
+    except (TypeError, ValueError) as e:
+        raise RequestError(f"unreadable answer to question {qid!r}: {e}", code="INVALID_RESPONSE") from e
     return result
 
 
@@ -106,7 +111,12 @@ def system_one_result(model: str, result: ExtractResult, questions: Mapping[str,
     """
     error = result.get("error")
     if error:
-        raise RequestError(error["message"], code=error["code"], status_code=422, param="state")
+        raise RequestError(
+            str(error.get("message", "the state could not be read")),
+            code=str(error.get("code", "INVALID_INPUT")),
+            status_code=422,
+            param="state",
+        )
     data = result.get("data") or {}
     missing = [qid for qid in questions if not isinstance(data.get(qid), Mapping)]
     if missing:
@@ -119,6 +129,6 @@ def system_one_result(model: str, result: ExtractResult, questions: Mapping[str,
     input_tokens = usage.get("input_tokens", 0)
     return {
         "model": model,
-        "answers": {qid: _answer(data[qid]) for qid in questions},
+        "answers": {qid: _answer(qid, data[qid]) for qid in questions},
         "usage": {"input_tokens": input_tokens if isinstance(input_tokens, int) else 0, "output_tokens": 0},
     }

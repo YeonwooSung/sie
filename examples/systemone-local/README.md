@@ -65,8 +65,9 @@ uv run conformance.py --check-auth
 
 A Serverless model that has gone cold takes minutes to load. SIE answers
 `503` with a `Retry-After` of at most 60 seconds while it loads, and the
-TypeSafe SDK gives up after about 30 seconds of retries. Warm the model first,
-for example with one call from the console playground.
+TypeSafe SDK retries twice by default (`max_retries=2` in `typesafe-sdk`
+0.7.4), so a cold load outlasts its retries. Warm the model first, for example
+with one call from the console playground.
 
 ## Limits
 
@@ -76,10 +77,12 @@ never truncates the text silently:
 
 | Model | Row | What shares the row |
 |---|---|---|
-| `fastino/GLiNER2.5-Decide` | 512 tokens | All of the request's questions (at most half the row) and the state |
-| `fastino/GLiNER2.5-Decide-1B` | 2,048 tokens | Same; use it for longer text |
-| `fastino/GLiNER2.5-multi-Decide` | 2,048 tokens | Same; multilingual |
+| `fastino/GLiNER2.5-Decide` | 512 tokens | All of the request's questions (at most 256 tokens, half the row) and the state |
+| `fastino/GLiNER2.5-Decide-1B` | 2,048 tokens | All of the questions (at most 512 tokens) and the state; use it for longer text |
+| `fastino/GLiNER2.5-multi-Decide` | 2,048 tokens | Same as Decide-1B; multilingual |
 | `convaiinnovations/laya-typed-decisions` | 1,024 tokens | One question and the state, per question |
+| `convaiinnovations/laya-multilingual` | 1,024 tokens | Same; multilingual |
+| `convaiinnovations/laya` | 512 tokens | Same |
 
 Other differences from TypeSafe's hosted API:
 

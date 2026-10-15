@@ -79,7 +79,6 @@ from sie_sdk.types import (
     CostEstimate,
     EncodeResult,
     ExtractResult,
-    SystemOneResult,
     File,
     FileDeleted,
     FileList,
@@ -102,6 +101,7 @@ from sie_sdk.types import (
     ResponseResult,
     ScoreResult,
     StatusMessage,
+    SystemOneResult,
     WorkerInfo,
 )
 

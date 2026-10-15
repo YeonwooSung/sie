@@ -10,7 +10,7 @@ import pytest
 from sie_sdk import SIEAsyncClient, SIEClient
 from sie_sdk.client.async_ import _AioResponse
 from sie_sdk.client.errors import RequestError
-from sie_sdk.systemone import choice_confidence, score_confidence, system_one_request
+from sie_sdk.systemone import choice_confidence, score_confidence, system_one_request, system_one_result
 
 FIXTURE = json.loads(
     (Path(__file__).resolve().parents[3] / "wire-fixtures" / "systemone.json").read_text(encoding="utf-8")
@@ -18,6 +18,9 @@ FIXTURE = json.loads(
 RESPONSE_CASE = FIXTURE["responses"][0]
 MODEL = RESPONSE_CASE["model"]
 QUESTIONS = {qid: {"type": "noul"} for qid in RESPONSE_CASE["questions"]}
+# Invalid requests only the HTTP route can see: the SDK takes the model as an
+# argument and sends no media fields.
+ROUTE_ONLY_INVALID_REQUESTS = {"missing model", "empty model", "images", "audio", "videos"}
 
 
 def _extract_response(item: dict[str, Any]) -> bytes:
@@ -108,13 +111,7 @@ def test_fixture_requests(case: dict[str, Any]) -> None:
 
 @pytest.mark.parametrize(
     "case",
-    [
-        case
-        for case in FIXTURE["invalid_requests"]
-        if case["name"].startswith(
-            ("number", "boolean", "null", "empty q", "questions", "question", "eleven", "null score")
-        )
-    ],
+    [case for case in FIXTURE["invalid_requests"] if case["name"] not in ROUTE_ONLY_INVALID_REQUESTS],
     ids=lambda case: case["name"],
 )
 def test_fixture_invalid_requests(case: dict[str, Any]) -> None:
@@ -128,3 +125,30 @@ def test_fixture_confidence(kind: str) -> None:
     fn = choice_confidence if kind == "choice" else score_confidence
     for case in FIXTURE["confidence"][kind]:
         assert fn(case["probabilities"]) == pytest.approx(case["confidence"])
+
+
+@pytest.mark.parametrize("case", FIXTURE["responses"], ids=lambda case: case["name"])
+def test_fixture_responses(case: dict[str, Any]) -> None:
+    questions = {qid: {"type": "noul"} for qid in case["questions"]}
+    extract = {
+        "id": "item-0",
+        "entities": [],
+        "data": case["data"],
+        "request": {"usage": {"input_tokens": case["input_tokens"]}},
+    }
+    _assert_close(system_one_result(case["model"], extract, questions), case["response"])  # type: ignore[arg-type]
+
+
+def test_missing_answer_raises_invalid_response() -> None:
+    extract = {"id": "item-0", "entities": [], "data": {}}
+    with pytest.raises(RequestError) as raised:
+        system_one_result(MODEL, extract, {"q": {"type": "noul"}})  # type: ignore[arg-type]
+    assert raised.value.code == "INVALID_RESPONSE"
+
+
+@pytest.mark.parametrize("probabilities", [{"0": 0.5, "high": 0.5}, {"0": 0.5, "1": "half"}])
+def test_unreadable_probabilities_raise_invalid_response(probabilities: dict[str, Any]) -> None:
+    extract = {"id": "item-0", "entities": [], "data": {"q": {"type": "score", "probabilities": probabilities}}}
+    with pytest.raises(RequestError) as raised:
+        system_one_result(MODEL, extract, {"q": {"type": "score"}})  # type: ignore[arg-type]
+    assert raised.value.code == "INVALID_RESPONSE"

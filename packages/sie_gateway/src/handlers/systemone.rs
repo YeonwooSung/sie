@@ -8,8 +8,8 @@
 //! check `packages/wire-fixtures/systemone.json`.
 //!
 //! - Request `{model, state, questions}`. Unknown fields are ignored; a
-//!   question may omit `instructions` or send `null`; media fields and more
-//!   than 10 score levels are refused.
+//!   question may omit `instructions` or send `null`; media fields and a
+//!   score question without 1 to 10 levels are refused.
 //! - Response `{model, answers, usage: {input_tokens, output_tokens}}`, JSON.
 //!   Choice and score confidences follow the System One definitions.
 //! - The extract call sets `overflow_policy: "error"`, so a state or question
@@ -28,6 +28,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Map, Value};
+use tracing::warn;
 
 use crate::http_error::GatewayOwnedFault;
 use crate::server::AppState;
@@ -41,14 +42,17 @@ use super::proxy::{
 /// Request body cap. A System One request is one text state and its
 /// questions; 16 MiB is the text-route cap the chat and embeddings routes use.
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
-/// Native extract reply cap. One item's answers: a probability per option.
+/// Native extract reply cap, the same 16 MiB as the other compatibility
+/// routes' native replies; one item's answers are far smaller.
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// Score levels per question, as the System One API accepts.
 pub(crate) const MAX_SCORE_LEVELS: usize = 10;
 /// Longest `Retry-After` the route sends. System One clients (and LiteLLM)
 /// wait at most 60 seconds before falling back.
 pub(crate) const MAX_RETRY_AFTER_S: u64 = 60;
-/// Adapter modules that answer typed questions.
+/// Adapter modules that answer typed questions: the modules of the single
+/// server's `DECISION_ADAPTERS` (`sie_server.api.systemone`), which names
+/// their classes.
 const DECISION_ADAPTER_MODULES: [&str; 2] = [
     "sie_server.adapters.gliner2.decide",
     "sie_server.adapters.laya.adapter",
@@ -138,6 +142,12 @@ pub(crate) fn normalize_request(parsed: &Value) -> Result<SystemOneRequest, Inva
         }
         if question.get("type").and_then(Value::as_str) == Some("score") {
             if let Some(levels) = question.get("criteria").and_then(Value::as_array) {
+                if levels.is_empty() {
+                    return Err(invalid(
+                        &["questions", qid, "criteria"],
+                        format!("score question {qid:?} has no levels"),
+                    ));
+                }
                 if levels.len() > MAX_SCORE_LEVELS {
                     return Err(invalid(
                         &["questions", qid, "criteria"],
@@ -202,23 +212,40 @@ pub(crate) fn score_confidence(probabilities: &[f64]) -> f64 {
     (1.0 - spread / even).clamp(0.0, 1.0)
 }
 
+fn probability(value: &Value) -> Result<f64, String> {
+    value
+        .as_f64()
+        .ok_or_else(|| format!("probability {value} is not a number"))
+}
+
 /// One adapter answer in the System One shape, with System One confidences.
-pub(crate) fn to_answer(answer: &Map<String, Value>) -> Map<String, Value> {
+///
+/// `Err` for a probability that is not a number or a score level key that is
+/// not an integer, as the single server refuses them.
+pub(crate) fn to_answer(answer: &Map<String, Value>) -> Result<Map<String, Value>, String> {
     let mut result = answer.clone();
     let kind = answer.get("type").and_then(Value::as_str);
     let Some(probabilities) = answer.get("probabilities").and_then(Value::as_object) else {
-        return result;
+        return Ok(result);
     };
     let confidence = match kind {
         Some("choice") => {
-            let values: Vec<f64> = probabilities.values().filter_map(Value::as_f64).collect();
+            let values = probabilities
+                .values()
+                .map(probability)
+                .collect::<Result<Vec<f64>, String>>()?;
             Some(choice_confidence(&values))
         }
         Some("score") => {
-            let mut levels: Vec<(u64, f64)> = probabilities
+            let mut levels = probabilities
                 .iter()
-                .filter_map(|(key, value)| Some((key.parse().ok()?, value.as_f64()?)))
-                .collect();
+                .map(|(key, value)| {
+                    let level: u64 = key
+                        .parse()
+                        .map_err(|_| format!("score level {key:?} is not an integer"))?;
+                    Ok((level, probability(value)?))
+                })
+                .collect::<Result<Vec<(u64, f64)>, String>>()?;
             levels.sort_by_key(|(level, _)| *level);
             let values: Vec<f64> = levels.into_iter().map(|(_, p)| p).collect();
             Some(score_confidence(&values))
@@ -228,15 +255,16 @@ pub(crate) fn to_answer(answer: &Map<String, Value>) -> Map<String, Value> {
     if let Some(confidence) = confidence {
         result.insert("confidence".to_string(), json!(confidence));
     }
-    result
+    Ok(result)
 }
 
 /// What an extract reply becomes: the System One body, or the 422 for an item
-/// the adapter refused (a state that does not fit, an unreadable state).
+/// the adapter refused (a state that does not fit, an unreadable state) with
+/// the adapter's error code.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Translated {
     Answers(Value),
-    Refused(Invalid),
+    Refused(Invalid, String),
 }
 
 /// Translate a native extract reply into the System One response body.
@@ -259,7 +287,14 @@ pub(crate) fn response_from_extract(
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("the state could not be read");
-        return Ok(Translated::Refused(invalid(&["state"], message)));
+        let code = error
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("INVALID_INPUT");
+        return Ok(Translated::Refused(
+            invalid(&["state"], message),
+            code.to_string(),
+        ));
     }
     let data = item
         .get("data")
@@ -271,8 +306,11 @@ pub(crate) fn response_from_extract(
             .get(qid)
             .and_then(Value::as_object)
             .ok_or_else(|| format!("model returned no answer for question {qid:?}"))?;
-        answers.insert(qid.clone(), Value::Object(to_answer(answer)));
+        let answer = to_answer(answer).map_err(|error| format!("question {qid:?}: {error}"))?;
+        answers.insert(qid.clone(), Value::Object(answer));
     }
+    // The queued extract reply carries no `usage`, so this is 0 on a cluster;
+    // metered deployments report units in `X-SIE-Units-*` headers instead.
     let input_tokens = native
         .get("usage")
         .and_then(|usage| usage.get("input_tokens"))
@@ -375,6 +413,40 @@ fn copy_error_headers(from: &HeaderMap, to: &mut HeaderMap) {
     }
 }
 
+/// The code and message of a native error body. Reads the native and OpenAI
+/// envelopes (`{"detail" | "error": {code, message}}`), the batch failure
+/// `{"error": "all_items_failed", "details": [{code, error}]}`, and a FastAPI
+/// validation list (`{"detail": [{msg}]}`).
+pub(crate) fn error_parts(parsed: &Value) -> (Option<&str>, Option<&str>) {
+    let envelope = parsed.get("detail").or_else(|| parsed.get("error"));
+    if let Some(envelope @ Value::Object(_)) = envelope {
+        return (
+            envelope.get("code").and_then(Value::as_str),
+            envelope.get("message").and_then(Value::as_str),
+        );
+    }
+    if let Some(first) = parsed
+        .get("details")
+        .and_then(Value::as_array)
+        .and_then(|details| details.first())
+    {
+        return (
+            first.get("code").and_then(Value::as_str),
+            first.get("error").and_then(Value::as_str),
+        );
+    }
+    if let Some(first) = envelope
+        .and_then(Value::as_array)
+        .and_then(|detail| detail.first())
+    {
+        return (
+            first.get("code").and_then(Value::as_str),
+            first.get("msg").and_then(Value::as_str),
+        );
+    }
+    (None, None)
+}
+
 /// Re-surface a native error in the System One shapes. A 400 (invalid input,
 /// input too long) becomes 422; other statuses keep their code. The extensions
 /// (a gateway-owned-fault marker) and the retry headers survive.
@@ -386,14 +458,14 @@ async fn translate_error(response: Response) -> Response {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         Err(_) => Value::Null,
     };
-    let envelope = parsed.get("detail").or_else(|| parsed.get("error"));
-    let code = envelope
-        .and_then(|detail| detail.get("code"))
-        .and_then(Value::as_str);
-    let message = envelope
-        .and_then(|detail| detail.get("message"))
-        .and_then(Value::as_str)
-        .unwrap_or("request failed");
+    let (code, message) = error_parts(&parsed);
+    if message.is_none() {
+        warn!(
+            status = parts.status.as_u16(),
+            "System One: native error without a readable message"
+        );
+    }
+    let message = message.unwrap_or("request failed");
     let mut out = if parts.status == StatusCode::BAD_REQUEST {
         validation_error(&invalid(&[], message), code)
     } else {
@@ -404,7 +476,9 @@ async fn translate_error(response: Response) -> Response {
     out
 }
 
-fn translation_fault(stage: &'static str, message: impl Into<String>) -> Response {
+fn translation_fault(model: &str, stage: &'static str, message: impl Into<String>) -> Response {
+    let message = message.into();
+    warn!(model = %model, stage, error = %message, "System One: undelivered extract result");
     GatewayOwnedFault::new(stage).mark(api_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         Some("INTERNAL_ERROR"),
@@ -545,6 +619,7 @@ pub async fn proxy_systemone(State(state): State<Arc<AppState>>, req: Request) -
             Ok(value) => value,
             Err(error) => {
                 return translation_fault(
+                    &request.model,
                     "decode_extract_response",
                     format!("extract response is not valid JSON: {error}"),
                 )
@@ -552,6 +627,7 @@ pub async fn proxy_systemone(State(state): State<Arc<AppState>>, req: Request) -
         },
         Err(_) => {
             return translation_fault(
+                &request.model,
                 "read_extract_response",
                 "failed to read extract response body",
             )
@@ -559,8 +635,8 @@ pub async fn proxy_systemone(State(state): State<Arc<AppState>>, req: Request) -
     };
     let mut output = match response_from_extract(&native, &request.model, &request.questions) {
         Ok(Translated::Answers(body)) => (StatusCode::OK, Json(body)).into_response(),
-        Ok(Translated::Refused(error)) => validation_error(&error, Some("INPUT_TOO_LONG")),
-        Err(message) => return translation_fault("format_systemone", message),
+        Ok(Translated::Refused(error, code)) => validation_error(&error, Some(&code)),
+        Err(message) => return translation_fault(&request.model, "format_systemone", message),
     };
     for (name, value) in response_headers.iter() {
         if is_openai_compat_forwarded_header(name.as_str()) {
@@ -708,8 +784,66 @@ mod tests {
             .collect();
         assert_eq!(
             response_from_extract(&native, "m", &questions).unwrap(),
-            Translated::Refused(invalid(&["state"], "does not fit"))
+            Translated::Refused(
+                invalid(&["state"], "does not fit"),
+                "INPUT_TOO_LONG".to_string()
+            )
         );
+        let unreadable = json!({
+            "items": [{"id": "item-0", "data": {}, "error": {"code": "INVALID_INPUT", "message": "not JSON"}}],
+        });
+        assert_eq!(
+            response_from_extract(&unreadable, "m", &questions).unwrap(),
+            Translated::Refused(invalid(&["state"], "not JSON"), "INVALID_INPUT".to_string())
+        );
+    }
+
+    #[test]
+    fn unreadable_probabilities_are_a_translation_failure() {
+        let questions: Map<String, Value> = [("q".to_string(), json!({"type": "score"}))]
+            .into_iter()
+            .collect();
+        for probabilities in [
+            json!({"0": 0.5, "high": 0.5}),
+            json!({"0": 0.5, "1": "half"}),
+        ] {
+            let native = json!({"items": [{"id": "item-0", "data": {
+                "q": {"type": "score", "score": 0.5, "probabilities": probabilities}
+            }}]});
+            assert!(
+                response_from_extract(&native, "m", &questions).is_err(),
+                "{probabilities}"
+            );
+        }
+    }
+
+    #[test]
+    fn error_parts_reads_every_native_error_shape() {
+        for (body, code, message) in [
+            (
+                json!({"detail": {"code": "MODEL_LOADING", "message": "loading"}}),
+                Some("MODEL_LOADING"),
+                Some("loading"),
+            ),
+            (
+                json!({"error": {"code": "INVALID_INPUT", "message": "bad"}}),
+                Some("INVALID_INPUT"),
+                Some("bad"),
+            ),
+            (
+                json!({"error": "all_items_failed", "details": [{"item_index": 0, "error": "boom", "code": "INFERENCE_ERROR"}]}),
+                Some("INFERENCE_ERROR"),
+                Some("boom"),
+            ),
+            (
+                json!({"detail": [{"loc": ["body"], "msg": "field required"}]}),
+                None,
+                Some("field required"),
+            ),
+            (Value::Null, None, None),
+        ] {
+            assert_eq!(error_parts(&body), (code, message), "{body}");
+        }
     }
 
     #[test]
@@ -808,6 +942,44 @@ mod tests {
         assert_eq!(dispatched.len(), 1);
         assert_eq!(dispatched[0].endpoint, "extract");
         assert_eq!(dispatched[0].model, "acme/decide");
+    }
+
+    #[tokio::test]
+    async fn an_undelivered_result_is_a_gateway_owned_fault() {
+        let gateway = TestGateway::new(&[LOCAL_DECISION_MODEL]).await;
+        gateway
+            .add_verified_worker("local-1", LOCAL_LANE, &["acme/decide"])
+            .await;
+        gateway
+            .dispatcher
+            .return_extract_data(json!({"other": {"type": "noul", "noul": 0.5}}));
+        let request = systemone_request(json!({
+            "model": "acme/decide", "state": "hi", "questions": {"q": {"type": "noul"}}
+        }));
+        let response = proxy_systemone(State(Arc::clone(&gateway.state)), request).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.extensions().get::<GatewayOwnedFault>(),
+            Some(&GatewayOwnedFault::new("format_systemone"))
+        );
+        assert_eq!(
+            body_json(response).await["detail"]["code"],
+            "INTERNAL_ERROR"
+        );
+    }
+
+    #[tokio::test]
+    async fn translated_errors_keep_the_fault_marker() {
+        let marked = GatewayOwnedFault::new("upstream").mark(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some("INTERNAL_ERROR"),
+            "boom",
+        ));
+        let translated = translate_error(marked).await;
+        assert_eq!(
+            translated.extensions().get::<GatewayOwnedFault>(),
+            Some(&GatewayOwnedFault::new("upstream"))
+        );
     }
 
     #[tokio::test]

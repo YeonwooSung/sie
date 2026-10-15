@@ -10,7 +10,7 @@ once, so serving never calls Hugging Face:
 - ``description``: a hand-written line for the typed-decision models below;
   otherwise ``"<hf_id or sie_id>: <task> model."`` from the config's tasks.
 
-The two lines are inserted after ``sie_id:``; the rest of each file is left as
+The missing lines are inserted after ``sie_id:``; the rest of each file is left as
 it is. Configs that already set a field keep it. Run from the repository root:
 
     mise exec -- uv run --frozen python packages/sie_server/scripts/fill_model_metadata.py

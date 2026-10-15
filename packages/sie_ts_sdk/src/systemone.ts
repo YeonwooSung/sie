@@ -45,7 +45,8 @@ export interface SystemOneResult {
   /** The decision model that answered */
   model: string;
   /**
-   * One answer per question id. `noul`: `noul`, the probability of yes.
+   * One answer per question id. `noul`: `noul`, the probability of yes,
+   * `answer` and `confidence`.
    * `choice`: `choice`, `confidence` and `probabilities` by option. `score`:
    * `score`, `confidence`, and `legend` and `probabilities` by level index.
    */
@@ -91,6 +92,9 @@ export function systemOneRequest(
     }
     const levels = normalized.criteria;
     if (normalized.type === "score" && Array.isArray(levels)) {
+      if (levels.length === 0) {
+        throw invalid(`score question ${JSON.stringify(qid)} has no levels`);
+      }
       if (levels.length > MAX_SCORE_LEVELS) {
         throw invalid(
           `score question ${JSON.stringify(qid)} has ${levels.length} levels; at most ${MAX_SCORE_LEVELS} are allowed`,
@@ -133,17 +137,35 @@ export function scoreConfidence(probabilities: number[]): number {
   return Math.min(1, Math.max(0, 1 - spread / even));
 }
 
-function toAnswer(answer: Record<string, unknown>): Record<string, unknown> {
+function probability(qid: string, value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new RequestError(
+      `unreadable answer to question ${JSON.stringify(qid)}: probability ${JSON.stringify(value)} is not a number`,
+      "INVALID_RESPONSE",
+    );
+  }
+  return value;
+}
+
+function toAnswer(qid: string, answer: Record<string, unknown>): Record<string, unknown> {
   const result = { ...answer };
   const probabilities = result.probabilities;
   if (probabilities === null || typeof probabilities !== "object") return result;
-  const byKey = probabilities as Record<string, number>;
+  const byKey = probabilities as Record<string, unknown>;
   if (result.type === "choice") {
-    result.confidence = choiceConfidence(Object.values(byKey).map(Number));
+    result.confidence = choiceConfidence(Object.values(byKey).map((p) => probability(qid, p)));
   } else if (result.type === "score") {
-    const ordered = Object.keys(byKey)
+    const keys = Object.keys(byKey);
+    const badKey = keys.find((key) => !/^\d+$/.test(key));
+    if (badKey !== undefined) {
+      throw new RequestError(
+        `unreadable answer to question ${JSON.stringify(qid)}: score level ${JSON.stringify(badKey)} is not an integer`,
+        "INVALID_RESPONSE",
+      );
+    }
+    const ordered = keys
       .sort((a, b) => Number(a) - Number(b))
-      .map((key) => Number(byKey[key]));
+      .map((key) => probability(qid, byKey[key]));
     result.confidence = scoreConfidence(ordered);
   }
   return result;
@@ -175,7 +197,7 @@ export function systemOneResult(
   }
   const answers: Record<string, Record<string, unknown>> = {};
   for (const qid of Object.keys(questions)) {
-    answers[qid] = toAnswer(data[qid] as Record<string, unknown>);
+    answers[qid] = toAnswer(qid, data[qid] as Record<string, unknown>);
   }
   const inputTokens = result.request?.usage?.inputTokens;
   return {
