@@ -12,6 +12,8 @@ from sie_server.adapters.bge_m3_flash import BGEM3FlashAdapter
 from sie_server.config.model import ModelConfig
 from sie_server.core.inference_output import EncodeOutput, SparseVector
 from sie_server.types.inputs import Item
+from transformers import XLMRobertaConfig
+from transformers.models.xlm_roberta.modeling_xlm_roberta import XLMRobertaEmbeddings
 
 # bge_m3_flash requires CUDA at load() time. The score() / score_pairs() unit
 # tests in this module bypass load() by:
@@ -90,6 +92,39 @@ class TestBGEM3YamlConfig:
 
     def test_score_in_outputs(self, config: ModelConfig) -> None:
         assert "score" in config.outputs
+
+
+class TestBGEM3EmbeddingParity:
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    def test_packed_embeddings_match_native_addition_order(self, dtype: torch.dtype) -> None:
+        config = XLMRobertaConfig(
+            vocab_size=8,
+            hidden_size=4,
+            max_position_embeddings=8,
+            type_vocab_size=1,
+            hidden_dropout_prob=0.0,
+            pad_token_id=1,
+        )
+        embeddings = XLMRobertaEmbeddings(config).to(dtype).eval()
+        with torch.no_grad():
+            embeddings.word_embeddings.weight.copy_(torch.tensor([[1.0, 0.25, 0.5, 0.75]]).expand(8, -1))
+            embeddings.token_type_embeddings.weight.copy_(torch.tensor([[-1.0, 0.5, 0.25, 0.125]]))
+            embeddings.position_embeddings.weight.copy_(
+                torch.tensor([[torch.finfo(dtype).eps / 2, 0.25, -0.25, 0.25]]).expand(8, -1)
+            )
+
+        adapter = BGEM3FlashAdapter()
+        adapter._model = MagicMock(embeddings=embeddings)
+        input_ids = torch.tensor([0, 4, 2, 0, 2])
+        position_ids = torch.tensor([2, 3, 4, 2, 3])
+
+        expected = torch.cat(
+            [embeddings(input_ids=sequence.unsqueeze(0)).squeeze(0) for sequence in input_ids.split([3, 2])]
+        )
+        actual = adapter._run_embeddings(input_ids, position_ids)
+
+        assert actual.dtype == dtype
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 class TestBGEM3Packing:
