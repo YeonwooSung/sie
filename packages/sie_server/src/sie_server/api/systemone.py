@@ -210,7 +210,7 @@ def to_answer(answer: Mapping[str, Any]) -> dict[str, Any]:
     if kind == "choice" and isinstance(probabilities, Mapping):
         result["confidence"] = choice_confidence([float(p) for p in probabilities.values()])
     elif kind == "score" and isinstance(probabilities, Mapping):
-        ordered = [float(probabilities[key]) for key in sorted(probabilities, key=int)]
+        ordered = [p for _, p in sorted((int(key), float(p)) for key, p in probabilities.items())]
         result["confidence"] = score_confidence(ordered)
     return result
 
@@ -390,7 +390,7 @@ async def _system_one(
         output = cast("ExtractOutput", worker_result.output)
         result = ExtractHandler.format_output(output)[0]
         if refusal := _item_error(result):
-            span.set_attribute("error", refusal.detail[0]["code"])
+            span.set_attribute("error", _error_code(result.get("error")) or ErrorCode.INVALID_INPUT.value)
             raise refusal
 
         data = result.get("data") or {}

@@ -95,7 +95,7 @@ def _answer(qid: str, answer: Mapping[str, Any]) -> dict[str, Any]:
         if result.get("type") == "choice" and isinstance(probabilities, Mapping):
             result["confidence"] = choice_confidence([float(p) for p in probabilities.values()])
         elif result.get("type") == "score" and isinstance(probabilities, Mapping):
-            ordered = [float(probabilities[key]) for key in sorted(probabilities, key=int)]
+            ordered = [p for _, p in sorted((int(key), float(p)) for key, p in probabilities.items())]
             result["confidence"] = score_confidence(ordered)
     except (TypeError, ValueError) as e:
         raise RequestError(f"unreadable answer to question {qid!r}: {e}", code="INVALID_RESPONSE") from e
