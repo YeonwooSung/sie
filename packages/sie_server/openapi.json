@@ -2141,6 +2141,13 @@
             "title": "Profiles",
             "default": {}
           },
+          "lora_adapters": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Lora Adapters"
+          },
           "revision": {
             "anyOf": [
               {

@@ -435,6 +435,9 @@ class ModelInfo(TypedDict, total=False):
     profiles: dict[str, ProfileInfo]
     """Servable profiles keyed by name; address one as ``"model@profile"``."""
 
+    lora_adapters: list[str]
+    """Single-server ready LoRA names; absent on gateways (not fleet residency)."""
+
     capabilities: ModelCapabilities | None
     """``None`` for models that declare no ``generate`` task."""
 

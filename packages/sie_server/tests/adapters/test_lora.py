@@ -1071,6 +1071,7 @@ class TestPinnedLoraServing:
         adapter.get_preprocessor.return_value = None
         adapter.memory_footprint.return_value = 0
         adapter.lora_capability.return_value = lora_cap
+        adapter.lora_runtime_config.return_value = None
         return adapter
 
     @staticmethod
@@ -1226,7 +1227,22 @@ class _GatedTinyLoRAAdapter(TinyLoRAAdapter):
 
 
 class TestRegistryLoraLifecycle:
-    async def test_a_lora_evicted_while_loading_does_not_stay_resident(self, tmp_path: Path) -> None:
+    def test_final_peft_unload_restores_base_and_allows_reload(self, tmp_path: Path) -> None:
+        lora = _save_plain_lora(tmp_path / "adapter")
+        adapter = TinyLoRAAdapter()
+        adapter.load("cpu")
+        expected = adapter._model(_probe()).detach()
+        for _ in range(2):
+            adapter.load_lora(lora)
+            adapter.set_active_lora(lora)
+            assert not torch.equal(adapter._model(_probe()).detach(), expected)
+            adapter.unload_lora(lora)
+            assert adapter._peft_model is None
+            assert not adapter._loaded_loras
+            assert not any(isinstance(module, BaseTunerLayer) for module in adapter._model.modules())
+            assert torch.equal(adapter._model(_probe()).detach(), expected)
+
+    async def test_loading_lora_reserves_capacity_until_it_can_be_evicted(self, tmp_path: Path) -> None:
         first = _save_plain_lora(tmp_path / "first")
         second = _save_plain_lora(tmp_path / "second")
         gates = {first: threading.Event(), second: threading.Event()}
@@ -1237,10 +1253,11 @@ class TestRegistryLoraLifecycle:
         assert await registry.ensure_lora_loaded_async("t/tiny", first) == (False, True)
         first_load = next(iter(registry._background_tasks))
         assert await registry.ensure_lora_loaded_async("t/tiny", second) == (False, True)
-        assert list(loaded.loras) == [second]
+        assert list(loaded.loras) == [first]
 
         gates[first].set()
         await first_load
+        assert await registry.ensure_lora_loaded_async("t/tiny", second) == (False, True)
         gates[second].set()
         await asyncio.gather(*registry._background_tasks)
 
@@ -1595,11 +1612,18 @@ def _engine_owned_lora_config() -> ModelConfig:
     )
 
 
+class _StartupOnlyEmbeddingAdapter(SGLangEmbeddingAdapter):
+    """A non-reloadable engine for the generic capability-absence contract."""
+
+    def lora_capability(self):
+        return None
+
+
 class TestEngineOwnedLoras:
     """An adapter whose engine loads its LoRAs at launch answers a load request with a terminal error."""
 
     async def test_a_declared_source_is_refused_without_a_load_or_a_backoff(self) -> None:
-        adapter = SGLangEmbeddingAdapter("org/engine", lora_paths={"legal": "org/legal-lora"})
+        adapter = _StartupOnlyEmbeddingAdapter("org/engine", lora_paths={"legal": "org/legal-lora"})
         registry, loaded = _registry_serving(adapter, _engine_owned_lora_config())
         checker = ModelStateChecker(registry, "t/engine", MagicMock())
 
@@ -1618,7 +1642,7 @@ class TestEngineOwnedLoras:
 
     @pytest.mark.parametrize("preformed", [False, True])
     async def test_a_batch_selecting_a_declared_source_fails_with_a_terminal_error(self, preformed: bool) -> None:
-        adapter = SGLangEmbeddingAdapter("org/engine", lora_paths={"legal": "org/legal-lora"})
+        adapter = _StartupOnlyEmbeddingAdapter("org/engine", lora_paths={"legal": "org/legal-lora"})
         registry, _ = _registry_serving(adapter, _engine_owned_lora_config())
         worker = ModelWorker(
             adapter, WorkerConfig(max_batch_wait_ms=1), model_name="t/engine", registry_callbacks=registry

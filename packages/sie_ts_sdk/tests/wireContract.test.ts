@@ -65,6 +65,7 @@ function expectEveryTypedFieldPresent(model: ModelInfo | undefined): void {
 const FULL_WIRE_ENTRY = {
   name: "BAAI/bge-m3",
   loaded: true,
+  lora_adapters: ["support"],
   state: "loaded",
   last_error: null,
   inputs: ["text"],

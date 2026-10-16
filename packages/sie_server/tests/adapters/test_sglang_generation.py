@@ -360,7 +360,8 @@ def test_load_emits_lora_launch_args(
         max_loras_per_batch=2,
     )
 
-    adapter.load("cuda:0")
+    with patch.object(adapter._lora, "fetch", side_effect=lambda source: source):
+        adapter.load("cuda:0")
 
     cmd = mock_popen.call_args[0][0]
     assert "--enable-lora" in cmd
@@ -594,7 +595,7 @@ def test_generate_n_gt_one_fans_out_into_candidates(mock_async_client: MagicMock
 
 
 @patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
-def test_generate_forwards_lora_path(mock_async_client: MagicMock, adapter) -> None:
+def test_generate_forwards_lora_path(mock_async_client: MagicMock) -> None:
     """`lora_path` (the served-name) is forwarded as SGLang
     sampling_params.lora_path for per-request adapter selection.
     """
@@ -603,6 +604,8 @@ def test_generate_forwards_lora_path(mock_async_client: MagicMock, adapter) -> N
     ]
     stream = _FakeStreamingResponse(sse_lines)
     mock_async_client.return_value = _make_client_with_stream(stream)
+    adapter = SGLangGenerationAdapter("test-model", lora_paths={"acme-support": "acme/support-lora"})
+    adapter._lora.started()
     adapter._server_url = "http://localhost:30005"
 
     asyncio.run(collect_generation(adapter.generate(prompt="Hi", max_new_tokens=8, lora_path="acme-support")))

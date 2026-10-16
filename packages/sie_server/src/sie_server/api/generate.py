@@ -80,6 +80,7 @@ from sie_server.adapters._generation_base import (
 )
 from sie_server.adapters.remote.sie import SieUpstreamAdapter
 from sie_server.api.helpers import ModelStateChecker, oom_retry_after_from_registry, read_bounded_request_body
+from sie_server.api.lora import ensure_generation_lora, validate_generation_lora
 from sie_server.api.routing import remote_routing, route_request
 from sie_server.api.streaming_response import prefetched_sse_response
 from sie_server.api.validation import validate_machine_profile_header, validate_signed_i64
@@ -152,6 +153,7 @@ _SUPPORTED_FIELDS = {
     "prompt_cache_key",
     "safety_identifier",
     "options",
+    "lora_adapter",
 }
 
 
@@ -1195,6 +1197,10 @@ async def generate(
             param = "options.profile" if "options.profile" in message else "options"
             raise _bad_request(message, param=param) from exc
 
+        lora = validate_generation_lora(
+            config, body.get("lora_adapter"), profile=(body.get("options") or {}).get("profile") or "default"
+        )
+
         # Explicit top-level sampler fields win; omitted values now carry the
         # resolved profile/request runtime defaults applied above.
         temperature_raw = body.get("temperature")
@@ -1290,6 +1296,7 @@ async def generate(
                 f"Model '{model}' adapter does not support generate (not a GenerationAdapter)",
                 code=ErrorCode.MODEL_NOT_FOUND.value,
             )
+        await ensure_generation_lora(registry, route.key, lora)
         reasoning_format = resolve_reasoning_format(config, adapter)
         thinking_starts_in_prompt = (
             suppress_thinking
@@ -1322,6 +1329,8 @@ async def generate(
             # controls are streaming-only and were absent, not false/null.
             generation_parameters.pop("logprobs")
             generation_parameters.pop("top_logprobs")
+        if lora is not None:
+            generation_parameters["lora_path"] = lora
         try:
             preflight_result = adapter.preflight_generate(generation_parameters, stream=bool(stream_raw))
         except GenerationError as exc:

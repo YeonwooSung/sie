@@ -35,12 +35,12 @@ from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ERR_REQUIRES_TEXT, ComputePrecision
 from sie_server.adapters.sglang import _server
+from sie_server.adapters.sglang._lora import SGLangLoraManager, SGLangLoraMixin, leased_encode
 from sie_server.adapters.sglang._memory import SGLangMemoryBudget
 from sie_server.core.inference_output import EncodeOutput
 from sie_server.core.tokenizer import load_tokenizer
 
 if TYPE_CHECKING:
-    from sie_server.adapters.lora import LoraCapability
     from sie_server.types.inputs import Item
 
 logger = logging.getLogger(__name__)
@@ -84,7 +84,7 @@ def _resolve_embed_concurrency(configured: int | None) -> int:
     return _DEFAULT_EMBED_CONCURRENCY
 
 
-class SGLangEmbeddingAdapter(BaseAdapter):
+class SGLangEmbeddingAdapter(SGLangLoraMixin, BaseAdapter):
     """Adapter for LLM embedding models using SGLang HTTP server backend.
 
     SGLang pre-allocates GPU memory for the KV cache, providing stable memory
@@ -144,6 +144,11 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         append_eos: bool = False,
         lora_paths: dict[str, str] | None = None,
         max_loras_per_batch: int = 8,
+        max_loaded_loras: int | None = None,
+        preload_loras: list[str] | None = None,
+        lora_revisions: dict[str, str | None] | None = None,
+        max_lora_rank: int | None = None,
+        lora_target_modules: list[str] | None = None,
         dense_dim: int | None = None,
         startup_timeout_s: float | None = None,
         embed_concurrency: int | None = None,
@@ -223,6 +228,16 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         self._append_eos = append_eos
         self._eos_token = ""  # Resolved from the model tokenizer in load() when append_eos
         self._lora_paths = lora_paths or {}
+        self._lora = SGLangLoraManager(
+            lora_paths,
+            preload=preload_loras,
+            revisions=lora_revisions,
+            max_rank=max_lora_rank,
+            target_modules=lora_target_modules,
+            max_per_batch=max_loras_per_batch,
+            max_loaded=max_loaded_loras,
+            server_url=lambda: self._server_url,
+        )
         self._max_loras_per_batch = max_loras_per_batch
         self._startup_timeout_s = _server.resolve_startup_timeout(startup_timeout_s)
         self._embed_concurrency = _resolve_embed_concurrency(embed_concurrency)
@@ -279,7 +294,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
 
         These are the names that can be passed to encode(lora=...).
         """
-        return list(self._lora_paths.keys())
+        return self._lora.available
 
     @property
     def lora_enabled(self) -> bool:
@@ -363,23 +378,12 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         if self._revision is not None:
             cmd.extend(["--revision", self._revision])
 
-        # LoRA configuration for the SGLang server.
-        if self._lora_paths:
-            cmd.append("--enable-lora")
-            lora_path_str = ",".join(f"{name}={path}" for name, path in self._lora_paths.items())
-            cmd.extend(["--lora-paths", lora_path_str])
-            cmd.extend(["--max-loras-per-batch", str(self._max_loras_per_batch)])
-            logger.info(
-                "LoRA enabled with %d adapters: %s",
-                len(self._lora_paths),
-                list(self._lora_paths.keys()),
-            )
-
         # The port (and, once opened, the log fd) belong to this adapter from
         # the reservation above onward, so every raise below hands them back
         # rather than leaking one slot of the 100-port span per attempt: a full
         # /tmp in open_output_log, a failed exec, or a cancelled load included.
         try:
+            cmd.extend(self._lora.launch_args())
             cmd.extend(self._memory_budget.launch_args(device_indices[0]))
             # Only a group rendezvouses, so width one reserves nothing and its
             # launch argv is unchanged. Left to the engine it picks a random
@@ -393,8 +397,16 @@ class SGLangEmbeddingAdapter(BaseAdapter):
                 self._nccl_port = self._reserved_nccl_port
                 cmd.extend(["--nccl-port", str(self._nccl_port)])
             self._output_file = _server.open_output_log()
+            extra_env = None
+            if self._lora.deferred:
+                extra_env = {
+                    "SIE_SGLANG_LORA_COMPAT": "1",
+                    "PYTHONPATH": os.pathsep.join(
+                        filter(None, [str(Path(__file__).parent / "_compat"), os.environ.get("PYTHONPATH", "")])
+                    ),
+                }
             self._process = _server.launch_sglang_server(
-                cmd, device_indices=device_indices, output_file=self._output_file
+                cmd, device_indices=device_indices, output_file=self._output_file, extra_env=extra_env
             )
 
             if not _server.wait_for_server(
@@ -412,6 +424,8 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         except BaseException:
             self._abort_failed_load()
             raise
+
+        self._lora.started()
 
         # Concurrent-POST fan-out: a keep-alive session with a connection pool
         # sized to the concurrency and a matching thread pool, so a sharded
@@ -446,6 +460,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         log, and clear _server_url/_device so the adapter does not look "loaded".
         Mirrors the generation siblings (SGLang + MLX).
         """
+        self._lora.stop_mutations()
         _server.terminate_process(self._process)
         self._process = None
         _server.release_port(self._port)
@@ -457,11 +472,13 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         self._nccl_port = None
         self._port = None
         self._server_url = None
+        self._lora.close()
         self._device = None
         self._cleanup_output_log()
 
     def unload(self) -> None:
         """Unload the model by stopping SGLang server subprocess."""
+        self._lora.stop_mutations()
         if self._post_executor is not None:
             self._post_executor.shutdown(wait=False)
             self._post_executor = None
@@ -484,6 +501,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         self._nccl_port = None
         self._port = None
         self._server_url = None
+        self._lora.close()
         self._device = None
         self._dense_dim = self._configured_dense_dim
         self._cleanup_output_log()
@@ -513,6 +531,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
             device_total_bytes=device_total_bytes,
         )
 
+    @leased_encode
     def encode(
         self,
         items: list[Item],
@@ -544,10 +563,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         self._check_loaded()
 
         # Validate active LoRA if specified
-        lora = self._active_lora
-        if lora is not None and lora not in self._lora_paths:
-            msg = f"LoRA '{lora}' is not loaded"
-            raise ValueError(msg)
+        lora = self._lora.engine_name(self._active_lora) if self._active_lora is not None else None
 
         self._validate_output_types(output_types)
 
@@ -603,7 +619,9 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         # ``_embed_texts`` fans the batch out into ``embed_concurrency``
         # concurrent POSTs so SGLang's continuous batcher stays fed (the serving
         # loop is single-threaded, so a lone blocking POST under-drives it).
-        model_name = lora if lora is not None else "default"
+        # Pinned SGLang resolves LoRA only from base:adapter or explicit
+        # lora_path. A bare served alias silently selects the base model.
+        model_name = f"default:{lora}" if lora is not None else "default"
         non_empty_embeddings = self._embed_texts(non_empty_texts, model_name)
 
         dense_dim = self._validate_or_set_dense_dim(non_empty_embeddings)
@@ -918,25 +936,6 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         """
         return self._max_concurrent_dispatch
 
-    def supports_lora(self) -> bool:
-        """Return True if LoRA adapters are configured."""
-        return bool(self._lora_paths)
-
-    def lora_capability(self) -> LoraCapability | None:
-        """Return ``None``: the engine loads its LoRA adapters at launch and cannot load or unload one later.
-
-        A LoRA is selected by its served name through :meth:`set_active_lora`.
-        """
-        return None
-
-    def supports_hot_lora_reload(self) -> bool:
-        """Return False - SGLang blocks during LoRA loading.
-
-        SGLang's /load_lora_adapter endpoint blocks the server until loading
-        completes. This is not true hot-reload like PEFT provides.
-        """
-        return False
-
     def set_active_lora(self, lora_name: str | None) -> None:
         """Set the active LoRA for the next encode() call.
 
@@ -949,7 +948,6 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         Raises:
             ValueError: ``lora_name`` is not one of the served names the engine launched with.
         """
-        if lora_name is not None and lora_name not in self._lora_paths:
-            msg = f"LoRA '{lora_name}' is not loaded"
-            raise ValueError(msg)
+        with self._lora.lease(lora_name):
+            pass
         self._active_lora = lora_name

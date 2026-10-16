@@ -1159,6 +1159,72 @@ auto-retries; see `packages/sie_sdk/README.md` for client-side controls.
 | `SIE_MAX_LORAS_PER_MODEL` | `10` | Maximum concurrent LoRA adapters per base model. A request loads or selects only the adapters its selected profile declares. `options.lora` or `options.lora_id` naming any other is rejected with HTTP 400: `INVALID_INPUT` from this server, and `INVALID_REQUEST` from the gateway (code `unknown_lora_adapter` where it answers in the OpenAI error envelope). |
 | `SIE_MAX_ITEM_TEXT_BYTES` | `2097152` (2 MiB) | Most bytes of UTF-8 one encode, score, or extract item may carry in its `text` and `metadata` together. A larger item is rejected with `INVALID_INPUT` (HTTP 400) before it is tokenized. Generation prompts are not items and are not affected. |
 
+SGLang generation and embedding profiles can defer declared LoRAs until a
+request selects them. Keep one source allowlist in `lora_paths` and use
+`preload_loras` to select startup adapters:
+
+```yaml
+adapter_options:
+  loadtime:
+    mem_fraction_static: 0.80
+    lora_paths:
+      support:
+        id: acme/support-lora
+        revision: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa # replace with the repository's immutable commit
+      legal: acme/legal-lora
+    preload_loras: []
+    max_lora_rank: 16
+    lora_target_modules: [q_proj, v_proj]
+    max_loras_per_batch: 2
+```
+
+Omitting `preload_loras` keeps the existing behavior: every declared source
+loads at startup and remains pinned in SIE. An empty list defers every source;
+a nonempty list preloads and pins only those served names. Names must be unique
+members of the selected profile's map. Profile `loadtime` blocks use full
+replacement when a child supplies one, so restate the source map and its other
+options when changing only a child's preload selection.
+
+Deferred adapters require the maximum rank and target modules at engine launch
+because SGLang allocates its LoRA buffers then. LoRA profiles require an explicit
+memory fraction. For profiles with deferred adapters, the resolved
+`max_loras_per_model` engine setting (normally `SIE_MAX_LORAS_PER_MODEL`)
+bounds resident adapters, including pinned preloads
+and in-flight loads; `max_loras_per_batch` and the preload count cannot exceed
+it. When full, SIE drains and evicts the least-recently-used unpinned adapter. An
+adapter being loaded or drained retains its slot, and all-pinned/full capacity
+returns a retry response. Unconfirmed attach rollback or unload retains the
+slot and requires a model reload rather than risking unbounded residency.
+Startup-only profiles retain every declared adapter: their effective capacity
+is at least the pinned source count and `max_loras_per_batch`, even when the
+configured runtime limit is lower.
+
+Generation and chat requests select a selected-profile declared name with
+`lora_adapter` (a served alias or its declared source id);
+embedding requests use `options.lora` (or a declared source `options.lora_id`).
+The first request for a cold adapter returns HTTP 503 `LORA_LOADING` with
+`Retry-After`; retry after loading finishes. Source files are downloaded outside
+the inference mutation lock, while attachment may briefly pause SGLang's
+scheduler. Requests cannot supply a new repository or override its configured
+revision. Runtime adapters must contain ordinary LoRA A/B safetensors, without
+base-weight transforms, saved base modules, variable rank/alpha patterns,
+rsLoRA, or DoRA.
+
+Generation streams keep independent adapter leases and can run concurrently
+through SGLang's continuous batcher. Eviction refuses new leases and waits for
+active streams to finish. Embedding dispatch remains serialized by selected
+LoRA; this change does not introduce a mixed-adapter embedding forward. Deferred
+LoRA profiles require one tokenizer worker and one data-parallel worker;
+LoRA generation on those profiles supports `n=1` and `best_of=1` because pinned
+upstream versions have unsafe multi-candidate unload accounting. SGLang
+0.5.10.post1 uses SIE's scoped GPU-slot release compatibility hook; 0.5.20
+already implements that cleanup natively.
+
+The single-server `/v1/models` response includes top-level `lora_adapters` with
+ready served names, excluding adapters being loaded or evicted. Gateways omit
+this worker-local snapshot. Their `capabilities.lora_adapters` continues to
+advertise the declared allowlist, including cold adapters.
+
 ### Compute & precision
 
 | Env var | Default | Effect |

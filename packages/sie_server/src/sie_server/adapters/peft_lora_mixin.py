@@ -443,6 +443,9 @@ class PEFTLoRAMixin:
         if self._active_lora == lora_name:
             self.set_active_lora(None)
 
+        # PEFT's get_base_model consults active_peft_config, which disappears
+        # when delete_adapter removes the final adapter. Capture it first.
+        base_model = self._peft_model.get_base_model()
         # Delete the adapter
         self._peft_model.delete_adapter(self._get_peft_adapter_name(lora_name))
         self._loaded_loras.discard(lora_name)
@@ -451,8 +454,7 @@ class PEFTLoRAMixin:
         # If no LoRAs remain, unwrap the model
         if not self._loaded_loras:
             logger.debug("No LoRAs remaining, unwrapping PeftModel")
-            # Get the base model back
-            base_model = self._peft_model.get_base_model()
+            _unwrap_lora_layers(base_model)
             self._model = base_model
             del self._peft_model
             self._peft_model = None

@@ -34,6 +34,7 @@ import math
 import os
 import re
 from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Annotated, Any, cast
 from urllib.parse import urlsplit
@@ -79,6 +80,7 @@ from sie_server.api.helpers import (
     openai_error_response,
     upstream_unavailable_exception,
 )
+from sie_server.api.lora import LeasedStreamingResponse, ensure_generation_lora, validate_generation_lora
 from sie_server.api.options import resolve_runtime_options
 from sie_server.api.routing import error_code, fallback_refusal, remote_routing, route_request
 from sie_server.api.score import score_usage_from_output
@@ -157,7 +159,7 @@ _ANSWER_FINISH_REASONS = frozenset({"stop", "tool_calls"})
 _MAX_RERANK_DOCS = MAX_SCORE_ITEMS
 
 # Mirror the gateway's public chat field boundary, minus controls that require
-# gateway-owned admission/routing translation (best_of, LoRA selection, cache
+# gateway-owned admission/routing translation (best_of, cache
 # keys). Most importantly this excludes SGLang's backend/DP/custom-processor
 # extensions, so the public body cannot steer the managed child or execute a
 # client-supplied logit processor.
@@ -191,6 +193,7 @@ _CUDA_CHAT_FIELDS = frozenset(
         "tool_choice",
         "parallel_tool_calls",
         "stream_options",
+        "lora_adapter",
     }
 )
 
@@ -831,6 +834,7 @@ def _prepare_chat_body(
     proxied.pop("safety_identifier", None)
     proxied.pop("schema_in_prompt", None)
     proxied.pop("include_reasoning", None)
+    proxied.pop("lora_adapter", None)
     if proxied.get("parallel_tool_calls") is None:
         proxied.pop("parallel_tool_calls", None)
 
@@ -1157,7 +1161,8 @@ async def _sanitize_sse_stream(
     hide_thinking_blocks: bool,
     initial_inside_thinking: bool,
     reasoning_format: ReasoningFormat,
-    slot: asyncio.Semaphore | None,
+    slot: asyncio.Semaphore | None = None,
+    owns_resources: bool = True,
     tool_call_limit: int | None = None,
     strict_grammar: GrammarSpec | None = None,
     include_reasoning: bool = False,
@@ -1276,22 +1281,23 @@ async def _sanitize_sse_stream(
             await asyncio.wait({next_chunk})
             if not next_chunk.cancelled():
                 next_chunk.exception()
-        try:
-            await aclose_with_error_precedence(
-                response,
-                outcome_selected=terminal_outcome_selected,
-                context="generation child SSE response",
-            )
-        finally:
+        if owns_resources:
             try:
                 await aclose_with_error_precedence(
-                    client,
+                    response,
                     outcome_selected=terminal_outcome_selected,
-                    context="generation child SSE client",
+                    context="generation child SSE response",
                 )
             finally:
-                if slot is not None:
-                    slot.release()
+                try:
+                    await aclose_with_error_precedence(
+                        client,
+                        outcome_selected=terminal_outcome_selected,
+                        context="generation child SSE client",
+                    )
+                finally:
+                    if slot is not None:
+                        slot.release()
 
 
 async def _stream_strict_violation(
@@ -1556,22 +1562,26 @@ async def chat_completions(
     Errors are emitted as top-level OpenAI ``{"error": {...}}`` envelopes
     (never FastAPI's ``{"detail": ...}`` wrapper), matching ``/v1/completions``.
     """
-    try:
-        response = await _chat_completions(http_request, x_machine_profile)
-        if isinstance(response, JSONResponse) and response.status_code >= status.HTTP_400_BAD_REQUEST:
-            payload = json.loads(bytes(response.body))
-            code = payload.get("error", {}).get("code")
-            refusal = fallback_refusal(http_request, response.status_code, code)
-            if refusal is not None:
-                return openai_error_response(refusal)
-        return response
-    except HTTPException as exc:
-        return openai_error_response(fallback_refusal(http_request, exc.status_code, error_code(exc)) or exc)
+    async with AsyncExitStack() as lifetime:
+        try:
+            response = await _chat_completions(http_request, x_machine_profile, lifetime)
+            if isinstance(response, JSONResponse) and response.status_code >= status.HTTP_400_BAD_REQUEST:
+                payload = json.loads(bytes(response.body))
+                code = payload.get("error", {}).get("code")
+                refusal = fallback_refusal(http_request, response.status_code, code)
+                if refusal is not None:
+                    return openai_error_response(refusal)
+            if isinstance(response, StreamingResponse):
+                return LeasedStreamingResponse(response, lifetime.pop_all())
+            return response
+        except HTTPException as exc:
+            return openai_error_response(fallback_refusal(http_request, exc.status_code, error_code(exc)) or exc)
 
 
 async def _chat_completions(
     http_request: Request,
     x_machine_profile: str | None,
+    lifetime: AsyncExitStack,
 ) -> Response | StreamingResponse:
     validate_machine_profile_header(x_machine_profile)
 
@@ -1629,6 +1639,7 @@ async def _chat_completions(
 
         # Validate capability and all CUDA edge fields before a model download.
         config = registry.get_config(registry_key)
+        lora = validate_generation_lora(config, body.get("lora_adapter"))
         gen_task = getattr(config.tasks, "generate", None)
         if gen_task is None:
             raise _bad_request(
@@ -1676,6 +1687,7 @@ async def _chat_completions(
 
         adapter = registry.get(route.key)
         registry.touch_lru(route.key)
+        await ensure_generation_lora(registry, route.key, lora, n=body.get("n"))
         if _adapter_answers_chat(registry.get_config(route.key)) and isinstance(adapter, GenerationAdapter):
             _validate_remote_chat_media(messages)
             return await _remote_chat_response(
@@ -1740,26 +1752,41 @@ async def _chat_completions(
         # in output.
         initial_inside_thinking = hide_thinking_blocks and thinking_enabled and reasoning_parser is None
 
+        if lora is not None:
+            if not isinstance(adapter, SGLangGenerationAdapter):
+                raise _bad_request("This chat backend does not support LoRA selection", param="lora_adapter")
+            try:
+                engine_name = lifetime.enter_context(adapter.lora_request(lora, n=body.get("n")))
+            except GenerationError as exc:
+                raise _generation_http_exception(exc, registry) from exc
+            # The child accepts a backend LoRA name, never a client-supplied path.
+            proxied["lora_path"] = engine_name
+
         if stream:
             if slot is not None:
                 await slot.acquire()
+                lifetime.callback(slot.release)
             client = _new_proxy_client()
+            lifetime.push_async_callback(
+                aclose_with_error_precedence,
+                client,
+                outcome_selected=True,
+                context="generation child SSE client",
+            )
             budget = _child_budget(config, proxied, stream=True)
             deadline = None if budget is None else asyncio.get_running_loop().time() + budget
             try:
                 upstream_request = client.build_request("POST", url, json=proxied, timeout=_child_timeout(budget))
                 upstream = await client.send(upstream_request, stream=True)
-            except asyncio.CancelledError:
-                await client.aclose()
-                if slot is not None:
-                    slot.release()
-                raise
             except httpx.HTTPError:
                 logger.warning("generation child chat stream connection failed", exc_info=True)
-                await client.aclose()
-                if slot is not None:
-                    slot.release()
                 return _upstream_error_response("generation child is unavailable")
+            lifetime.push_async_callback(
+                aclose_with_error_precedence,
+                upstream,
+                outcome_selected=True,
+                context="generation child SSE response",
+            )
             if upstream.status_code != status.HTTP_200_OK:
                 try:
                     await _read_upstream_body(upstream)
@@ -1767,11 +1794,6 @@ async def _chat_completions(
                     # The body is intentionally discarded; never log child
                     # validation details because they can include user input.
                     pass
-                finally:
-                    await upstream.aclose()
-                    await client.aclose()
-                    if slot is not None:
-                        slot.release()
                 logger.error("generation child chat error status=%d", upstream.status_code)
                 return _upstream_error_response(
                     response_status=_translated_upstream_status(upstream.status_code),
@@ -1784,11 +1806,6 @@ async def _chat_completions(
                     # Drain only for connection reuse and bounded cleanup; the
                     # unexpected response body is intentionally discarded.
                     pass
-                finally:
-                    await upstream.aclose()
-                    await client.aclose()
-                    if slot is not None:
-                        slot.release()
                 logger.error("generation child returned non-SSE content for a streaming request")
                 return _upstream_error_response("generation child returned an invalid streaming response")
             return StreamingResponse(
@@ -1799,7 +1816,7 @@ async def _chat_completions(
                     hide_thinking_blocks=hide_thinking_blocks,
                     initial_inside_thinking=initial_inside_thinking,
                     reasoning_format=reasoning_format,
-                    slot=slot,
+                    owns_resources=False,
                     tool_call_limit=tool_call_limit,
                     strict_grammar=strict_grammar,
                     include_reasoning=include_reasoning,

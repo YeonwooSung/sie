@@ -125,6 +125,15 @@ class GenerationCapacityError(GenerationError):
         self.upstream_reason = upstream_reason
 
 
+class GenerationLoraLoadingError(GenerationCapacityError):
+    """A selected LoRA is loading or draining for eviction."""
+
+    code = "LORA_LOADING"
+
+    def __init__(self) -> None:
+        super().__init__("The selected LoRA is loading; retry the request", retry_after_s=1)
+
+
 class GenerationDrainingError(GenerationCapacityError):
     """The generation backend is draining and cannot accept new work."""
 
