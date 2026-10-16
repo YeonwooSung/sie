@@ -18,7 +18,7 @@ From an initialized checkout:
 ```sh
 mise exec -- python tools/benchmarks/idle_worker/prepare.py \
   --baseline b0c26b02d21dbd146646c41b2b4f42627a0c9ebd \
-  --candidate 0649b2834f9c6c075f386516705d3179675575d4
+  --candidate f556494c8b70a6b25cb1d27acdadf1040d337218
 ```
 
 On the GPU machine, with the same locked workspace and prepared `_inputs/`:

@@ -24,9 +24,7 @@ def test_timing_hook_follows_sdk_extract_route() -> None:
             content=packb(
                 {
                     "model": "knowledgator/gliclass-large-v1.0",
-                        "items": [
-                        {"id": "probe", "entities": [], "classifications": [{"label": "billing", "score": 0.9}]}
-                    ],
+                    "items": [{"id": "probe", "entities": [], "classifications": [{"label": "billing", "score": 0.9}]}],
                 }
             ),
         )
