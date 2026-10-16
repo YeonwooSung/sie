@@ -247,13 +247,16 @@ def configs(directory: Path, fixtures: Path) -> dict[str, Any]:
         require(data["hf_revision"] == revision, "catalog model revision differs from benchmark pin")
         profile = data["profiles"]["default"]
         profile["adapter_path"] = (
-            "tools.benchmarks.runtime_lora.adapters:ObservedGenerationAdapter"
+            f"{Path(__file__).with_name('adapters.py')}:ObservedGenerationAdapter"
             if kind == "generation"
             else "sie_server.adapters.sglang.embedding:SGLangEmbeddingAdapter"
         )
         profile["max_batch_tokens"] = 4096
         profile["kv_budget_tokens"] = 4096
         loadtime = profile.setdefault("adapter_options", {}).setdefault("loadtime", {})
+        if kind == "embedding":
+            # The catalog's original PyTorch adapter owns the causal option.
+            loadtime.pop("causal", None)
         loadtime.update(
             {
                 "mem_fraction_static": 0.5,

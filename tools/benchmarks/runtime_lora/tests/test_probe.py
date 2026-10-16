@@ -17,11 +17,16 @@ import torch
 from peft import PeftModel
 from safetensors.torch import load_file
 from sie_sdk._msgpack import packb as pack_msgpack
+from sie_server.adapters.sglang.embedding import SGLangEmbeddingAdapter
+from sie_server.adapters.sglang.generation import SGLangGenerationAdapter
+from sie_server.config.model import ModelConfig
+from sie_server.core.loader import load_adapter, resolve_adapter_class, validate_loadtime_options
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
+from tools.benchmarks.runtime_lora.adapters import ObservedGenerationAdapter
 from tools.benchmarks.runtime_lora.fixtures import MODELS, digest, write_adapter
 from tools.benchmarks.runtime_lora.observer import patch_scheduler
-from tools.benchmarks.runtime_lora.probe import ROOT, Client, Evidence, batch_rows, check_effect, configs, mixed_batches
+from tools.benchmarks.runtime_lora.probe import Client, Evidence, batch_rows, check_effect, configs, mixed_batches
 
 
 def tiny_config() -> Qwen3Config:
@@ -77,6 +82,30 @@ def test_catalog_pins_and_declared_fixture_config(tmp_path: Path) -> None:
         assert options["max_loras_per_batch"] == 2
         assert options["max_loaded_loras"] == 3
         assert options["mem_fraction_static"] == 0.5
+
+
+@pytest.mark.parametrize("kind", ["generation", "embedding"])
+def test_generated_config_resolves_validates_and_constructs_without_engine_launch(tmp_path: Path, kind: str) -> None:
+    directory = tmp_path / "models"
+    generated = configs(directory, tmp_path / "fixtures")
+    config = ModelConfig.model_validate(generated[kind])
+    expected = SGLangGenerationAdapter if kind == "generation" else SGLangEmbeddingAdapter
+    assert issubclass(resolve_adapter_class(config, directory), expected)
+    validate_loadtime_options(config, directory)
+    adapter = load_adapter(config, directory, device="cuda:0")
+    try:
+        assert isinstance(adapter, expected)
+        assert adapter._process is None
+        assert adapter._lora.max_per_batch == 2
+        assert adapter._lora.max_loaded == 3
+        assert adapter._lora.preloaded == {str(tmp_path / "fixtures" / kind / "pin")}
+        if kind == "generation":
+            assert generated[kind]["tasks"]["generate"]["chat_template_kwargs"] == {"enable_thinking": False}
+            assert Path(adapter._compat_pythonpath_entries()[0], "sitecustomize.py").is_file()
+        else:
+            assert "causal" not in config.resolve_profile("default").loadtime
+    finally:
+        adapter._lora.close()
 
 
 def test_sdk_observer_captures_cold_503_and_native_retry(tmp_path: Path) -> None:
@@ -194,7 +223,9 @@ def test_observer_records_actual_successful_batch_and_does_not_change_result(
     assert mixed_batches([base_row], 0, 2**64) == []
 
 
-def test_child_observer_defers_import_and_preserves_production_hook(tmp_path: Path) -> None:
+def test_child_observer_defers_import_and_preserves_production_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A synthetic upstream package checks startup composition without CUDA."""
     for package in ("sglang", "sglang/srt", "sglang/srt/managers", "sglang/srt/lora"):
         directory = tmp_path / package
@@ -213,11 +244,12 @@ def test_child_observer_defers_import_and_preserves_production_hook(tmp_path: Pa
         "class Scheduler:\n    def run_batch(self, batch):\n        return 47\n"
     )
     trace = tmp_path / "child-batches.jsonl"
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    adapter = ObservedGenerationAdapter("unused", mem_fraction_static=0.5)
+    entries = adapter._compat_pythonpath_entries()
     environment = {
         **os.environ,
-        "PYTHONPATH": os.pathsep.join(
-            map(str, (ROOT / "tools/benchmarks/runtime_lora/_hooks", tmp_path, ROOT, ROOT / "packages/sie_server/src"))
-        ),
+        "PYTHONPATH": os.pathsep.join((*entries, str(tmp_path))),
         "SIE_RUNTIME_LORA_BATCH_TRACE": str(trace),
         "SIE_SGLANG_MM_PROCESS_CONFIG_COMPAT": "1",
         "SIE_SGLANG_LORA_COMPAT": "",
@@ -233,7 +265,7 @@ def test_child_observer_defers_import_and_preserves_production_hook(tmp_path: Pa
         "assert scheduler.run_batch(S(forward_mode='DECODE', reqs=[S(rid='r', lora_id=None)])) == 47\n"
     )
     result = subprocess.run(  # noqa: S603 — fixed synthetic package and script, no external input
-        [sys.executable, "-c", script], env=environment, capture_output=True, text=True, check=False
+        [sys.executable, "-c", script], cwd=tmp_path, env=environment, capture_output=True, text=True, check=False
     )
     assert result.returncode == 0, result.stderr
     rows = batch_rows(trace)
