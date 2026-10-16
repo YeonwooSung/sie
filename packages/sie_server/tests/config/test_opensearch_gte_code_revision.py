@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import torch
+import pytest
 import yaml
 from sie_config.model_schema import model_config_schema_errors
 from sie_server.config.model import ModelConfig
-from sie_server.core.loader import _build_adapter_kwargs, load_adapter
+from sie_server.core.loader import _build_adapter_kwargs, load_adapter, load_model_config
+from transformers import PretrainedConfig
 
 _MODEL_PATH = (
     Path(__file__).resolve().parents[2]
@@ -38,33 +38,39 @@ def test_catalog_preserves_independent_weights_and_code_revisions() -> None:
     assert kwargs["code_revision"] == _CODE_REVISION
 
 
-def test_catalog_code_revision_reaches_tokenizer_and_model(tmp_path: Path) -> None:
-    config = _config()
-    idf_path = tmp_path / "idf.json"
-    idf_path.write_text("{}")
-    tokenizer = MagicMock(model_max_length=512, vocab_size=30522, special_tokens_map={}, vocab={})
-    model = MagicMock(spec=["new", "config", "to", "eval"])
-    model.config = SimpleNamespace(
-        vocab_size=30522,
-        num_attention_heads=12,
-        hidden_size=768,
-        max_position_embeddings=512,
-    )
+@pytest.mark.parametrize(
+    ("auto_class", "module", "class_name"),
+    [("AutoConfig", "configuration", "NewConfig"), ("AutoModelForMaskedLM", "modeling", "NewForMaskedLM")],
+)
+def test_catalog_profile_selects_pinned_external_code(auto_class: str, module: str, class_name: str) -> None:
+    config = load_model_config(_MODEL_PATH)
+    adapter = load_adapter(config, _MODEL_PATH.parent, device="cpu")
+    remote_config = {"auto_map": {auto_class: f"Alibaba-NLP/new-impl--{module}.{class_name}"}}
 
     with (
-        patch("transformers.AutoTokenizer.from_pretrained", return_value=tokenizer) as load_tokenizer,
-        patch("transformers.AutoModelForMaskedLM.from_pretrained", return_value=model) as load_model,
-        patch("huggingface_hub.try_to_load_from_cache", return_value=str(idf_path)),
-        patch("huggingface_hub.hf_hub_download") as download,
+        patch("transformers.AutoTokenizer.from_pretrained") as load_tokenizer,
+        patch("transformers.models.auto.auto_factory.cached_file", return_value=None) as config_file,
+        patch("transformers.models.auto.auto_factory.find_adapter_config_file", return_value=None),
+        patch("transformers.PretrainedConfig.get_config_dict", return_value=(remote_config, {})),
+        patch(
+            "transformers.dynamic_module_utils.get_cached_module_file",
+            side_effect=RuntimeError("dynamic module loader reached"),
+        ) as module_load,
+        pytest.raises(RuntimeError, match="dynamic module loader reached"),
     ):
-        adapter = load_adapter(config, _MODEL_PATH.parent, device="cpu")
-        adapter.load("cpu")
+        if auto_class == "AutoModelForMaskedLM":
+            with patch(
+                "transformers.AutoConfig.from_pretrained",
+                return_value=(PretrainedConfig(auto_map=remote_config["auto_map"]), {}),
+            ):
+                adapter.load("cpu")
+        else:
+            adapter.load("cpu")
 
-    expected = {
-        "trust_remote_code": True,
-        "revision": _WEIGHTS_REVISION,
-        "code_revision": _CODE_REVISION,
-    }
-    load_tokenizer.assert_called_once_with(config.hf_id, **expected)
-    load_model.assert_called_once_with(config.hf_id, torch_dtype=torch.float32, **expected)
-    download.assert_not_called()
+    assert load_tokenizer.call_args.args == (config.hf_id,)
+    assert load_tokenizer.call_args.kwargs["revision"] == _WEIGHTS_REVISION
+    assert load_tokenizer.call_args.kwargs["code_revision"] == _CODE_REVISION
+    assert config_file.call_args.args == (config.hf_id, "config.json")
+    assert config_file.call_args.kwargs["revision"] == _WEIGHTS_REVISION
+    assert module_load.call_args.args == ("Alibaba-NLP/new-impl", f"{module}.py")
+    assert module_load.call_args.kwargs["revision"] == _CODE_REVISION
