@@ -42,6 +42,7 @@ from sie_sdk.bundle_utils import (
 )
 
 import sie_server
+from sie_server.api.decisions import router as decisions_router
 from sie_server.api.generate import router as generate_router
 from sie_server.api.openai_audio import router as openai_audio_router
 from sie_server.app.app_state_config import (
@@ -431,6 +432,7 @@ def openapi_export(
     app_.include_router(openai_completions_router)
     app_.include_router(openai_responses_router)
     app_.include_router(systemone_router)
+    app_.include_router(decisions_router)
     setup_custom_openapi_schema(app_)
 
     spec = app_.openapi()

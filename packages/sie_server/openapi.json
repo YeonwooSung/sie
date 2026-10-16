@@ -1217,6 +1217,145 @@
           }
         }
       }
+    },
+    "/v1/decisions": {
+      "post": {
+        "tags": [
+          "openai-compat"
+        ],
+        "summary": "Decisions",
+        "description": "Answer ordered predicate, choice, and score questions with a text decision model.",
+        "operationId": "decisions_v1_decisions_post",
+        "parameters": [
+          {
+            "name": "X-SIE-MACHINE-PROFILE",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Sie-Machine-Profile"
+            }
+          },
+          {
+            "name": "X-SIE-Remote",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The only accepted value is `forbid`. It keeps the request off remote upstreams: local capacity serves or refuses it, and a model served only by an upstream answers 400. Any other value answers 400.",
+              "title": "X-Sie-Remote"
+            },
+            "description": "The only accepted value is `forbid`. It keeps the request off remote upstreams: local capacity serves or refuses it, and a model served only by an upstream answers 400. Any other value answers 400."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or unsupported input"
+          },
+          "404": {
+            "description": "Model not found"
+          },
+          "503": {
+            "description": "Model loading or capacity exhausted"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "model": {
+                    "description": "SIE decision model id, for example fastino/GLiNER2.5-Decide.",
+                    "title": "Model",
+                    "type": "string"
+                  },
+                  "input": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "items": {
+                          "additionalProperties": true,
+                          "type": "object"
+                        },
+                        "type": "array"
+                      }
+                    ],
+                    "description": "Text or text-only messages, in conversation order.",
+                    "title": "Input"
+                  },
+                  "questions": {
+                    "description": "Predicate, choice, or score questions, in answer order.",
+                    "items": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "maxItems": 200,
+                    "minItems": 1,
+                    "title": "Questions",
+                    "type": "array"
+                  },
+                  "safety_identifier": {
+                    "anyOf": [
+                      {
+                        "maxLength": 128,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Safety Identifier"
+                  }
+                },
+                "required": [
+                  "model",
+                  "input",
+                  "questions"
+                ],
+                "title": "DecisionRequest",
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1241,6 +1380,71 @@
         ],
         "title": "ClassificationModel",
         "description": "Classification result."
+      },
+      "DecisionResponse": {
+        "properties": {
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "answers": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Answers"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/DecisionUsage"
+          }
+        },
+        "type": "object",
+        "required": [
+          "model",
+          "answers",
+          "usage"
+        ],
+        "title": "DecisionResponse"
+      },
+      "DecisionUsage": {
+        "properties": {
+          "input_tokens": {
+            "type": "integer",
+            "title": "Input Tokens"
+          },
+          "input_tokens_details": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Input Tokens Details"
+          },
+          "output_tokens": {
+            "type": "integer",
+            "title": "Output Tokens",
+            "default": 0
+          },
+          "output_tokens_details": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Output Tokens Details"
+          },
+          "total_tokens": {
+            "type": "integer",
+            "title": "Total Tokens"
+          }
+        },
+        "type": "object",
+        "required": [
+          "input_tokens",
+          "input_tokens_details",
+          "output_tokens_details",
+          "total_tokens"
+        ],
+        "title": "DecisionUsage"
       },
       "DenseVectorModel": {
         "properties": {
