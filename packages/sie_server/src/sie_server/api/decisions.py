@@ -301,7 +301,7 @@ async def decisions(
         try:
             response = await systemone._system_one(request, http_request, x_machine_profile)
             body = response_from_systemone(json.loads(bytes(response.body)), questions)
-        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        except (ArithmeticError, AttributeError, LookupError, TypeError, ValueError) as exc:
             raise HTTPException(
                 500, {"message": "model returned an invalid decision result", "code": "INTERNAL_ERROR"}
             ) from exc

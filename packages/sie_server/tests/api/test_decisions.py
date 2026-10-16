@@ -51,6 +51,7 @@ def test_shared_invalid_contract(case):
     with pytest.raises(HTTPException) as caught:
         decisions.normalize_request(case["request"])
     assert caught.value.status_code == 400
+    assert isinstance(caught.value.detail, dict)
     assert caught.value.detail["param"] == case["param"]
 
 
@@ -163,3 +164,30 @@ def test_model_refusal_preserves_code_and_names_input(dispatch):
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "INPUT_TOO_LONG"
     assert response.json()["error"]["param"] == "input"
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "fault"),
+    [
+        ("decisions", "empty_output"),
+        ("decisions", "oversized_predicate"),
+        ("decisions", "oversized_choice"),
+        ("systemone", "empty_output"),
+        ("systemone", "oversized_choice"),
+    ],
+)
+def test_malformed_worker_results_keep_the_public_error_envelope(dispatch, endpoint, fault):
+    if fault == "empty_output":
+        dispatch.output.entities = []
+    elif fault == "oversized_predicate":
+        dispatch.output.data[0]["question_0"]["noul"] = 10**4000
+    else:
+        dispatch.output.data[0]["question_1"]["probabilities"]["option_0"] = 10**4000
+    case = FIXTURE["requests"][0]
+    body = case["request" if endpoint == "decisions" else "systemone"]
+    response = dispatch.client.post(f"/v1/{endpoint}", json=body)
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json")
+    error = response.json()["error" if endpoint == "decisions" else "detail"]
+    assert error["code"] == "INTERNAL_ERROR"
+    assert error["message"] == "model returned an invalid decision result"

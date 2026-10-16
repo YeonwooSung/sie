@@ -328,6 +328,13 @@ async def system_one(
         return await _system_one(request, http_request, x_machine_profile)
     except HTTPException as error:
         return error_response(fallback_refusal(http_request, error.status_code, error_code(error)) or error)
+    except (ArithmeticError, AttributeError, LookupError, TypeError, ValueError):
+        logger.exception("Model returned an invalid System One result")
+        return error_response(
+            HTTPException(
+                500, {"message": "model returned an invalid decision result", "code": ErrorCode.INTERNAL_ERROR.value}
+            )
+        )
 
 
 async def _system_one(
