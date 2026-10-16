@@ -1868,6 +1868,36 @@ class StreamingProcessor:
             )
             return
         params = validation
+        if params.lora_adapter is not None and adapter.lora_capability() is not None:
+            try:
+                ready, _ = await self._registry.ensure_lora_loaded_async(model_id, params.lora_adapter)
+            except ValueError:
+                await self._terminal_error_then_settle(
+                    reply_subject,
+                    request_id=request_id,
+                    attempt_id=attempt_id,
+                    seq=0,
+                    code="invalid_request",
+                    message="The selected profile does not support this LoRA adapter",
+                    param="lora_adapter",
+                    msg=msg,
+                )
+                return
+            except KeyError:
+                ready = False
+            if not ready:
+                await self._terminal_error_then_settle(
+                    reply_subject,
+                    request_id=request_id,
+                    attempt_id=attempt_id,
+                    seq=0,
+                    code="LORA_LOADING",
+                    message="The selected LoRA is loading; retry the request",
+                    param="lora_adapter",
+                    retry_after_s=self._registry.lora_retry_after_s(model_id, params.lora_adapter),
+                    msg=msg,
+                )
+                return
         if (
             params.stream
             and config is not None
@@ -3602,6 +3632,16 @@ class StreamingProcessor:
         # Multi-LoRA — served-name of the adapter (gateway-validated shape).
         lora_adapter_raw = params.get("lora_adapter")
         lora_adapter = lora_adapter_raw if isinstance(lora_adapter_raw, str) and lora_adapter_raw else None
+        if lora_adapter_raw is not None:
+            if lora_adapter is None:
+                return _ValidationError(code="invalid_request", message="'lora_adapter' must be a nonempty string")
+            if config is None:
+                return _ValidationError(code="invalid_request", message="LoRA selection requires a declared profile")
+            profile_name = (options or {}).get("profile") or "default"
+            if lora_adapter not in config.resolve_profile(profile_name).lora_names():
+                return _ValidationError(
+                    code="invalid_request", message="The selected profile does not declare this LoRA adapter"
+                )
 
         # OpenAI ``tools`` / ``tool_choice`` / ``parallel_tool_calls``.
         # The gateway is the authority for shape validation (JSON-schema

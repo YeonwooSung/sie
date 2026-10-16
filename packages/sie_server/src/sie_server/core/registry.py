@@ -29,6 +29,7 @@ from sie_sdk.storage import is_cloud_path
 
 from sie_server.adapters._generation_base import GenerationAdapter
 from sie_server.adapters.base import ModelAdapter, released_bytes
+from sie_server.adapters.lora import LoraStateUncertainError
 from sie_server.config.device_groups import resolve_device_group, validate_tensor_parallel_size
 from sie_server.config.engine import EngineConfig
 from sie_server.config.model import ModelConfig
@@ -3358,12 +3359,12 @@ class ModelRegistry:
         if loaded is None:
             return False
 
-        lora_state = loaded.loras.get(lora)
+        lora_state = loaded.loras.get(self._lora_source(loaded, lora))
         if lora_state is None:
             return False
 
         # LoRA exists and is not in loading state
-        return not lora_state.loading
+        return not lora_state.loading and not lora_state.unloading
 
     def is_lora_loading(self, model: str, lora: str) -> bool:
         """Check if a LoRA adapter is currently being loaded.
@@ -3379,11 +3380,27 @@ class ModelRegistry:
         if loaded is None:
             return False
 
-        lora_state = loaded.loras.get(lora)
+        lora_state = loaded.loras.get(self._lora_source(loaded, lora))
         if lora_state is None:
             return False
 
-        return lora_state.loading
+        return lora_state.loading or lora_state.unloading
+
+    def loaded_lora_names(self, model: str) -> list[str]:
+        """Public served names currently ready on this worker; never expose source paths."""
+        loaded = self._loaded.get(model)
+        if loaded is None or loaded.lora_runtime is None or model in self._unloading:
+            return []
+        return [
+            name
+            for name, source in loaded.lora_runtime.aliases.items()
+            if (state := loaded.loras.get(source)) is not None and not state.loading and not state.unloading
+        ]
+
+    @staticmethod
+    def _lora_source(loaded: LoadedModel, name: str) -> str:
+        runtime = loaded.lora_runtime
+        return runtime.aliases.get(name, name) if runtime is not None else name
 
     async def ensure_lora_loaded_async(self, model: str, lora: str) -> tuple[bool, bool]:
         """Ensure a LoRA adapter is loaded, triggering load if needed.
@@ -3418,6 +3435,8 @@ class ModelRegistry:
             raise KeyError(msg)
 
         loaded_model = self._loaded[model]
+        if model in self._unloading:
+            return (False, True)
         adapter = loaded_model.adapter
 
         # One LoRA capability handle for the whole load path, in place of the
@@ -3427,12 +3446,18 @@ class ModelRegistry:
             msg = f"Model '{model}' cannot load a LoRA adapter at runtime"
             raise ValueError(msg)
 
-        if lora not in loaded_model.config.lora_revisions():
+        lora = self._lora_source(loaded_model, lora)
+        declared = (
+            set(loaded_model.lora_runtime.aliases.values())
+            if loaded_model.lora_runtime is not None
+            else loaded_model.config.lora_revisions()
+        )
+        if lora not in declared:
             msg = f"Model '{model}' does not declare this LoRA adapter"
             raise ValueError(msg)
 
         lora_state = loaded_model.loras.get(lora)
-        if lora_state is not None and not lora_state.loading:
+        if lora_state is not None and not lora_state.loading and not lora_state.unloading:
             loaded_model.loras.move_to_end(lora)
             return (True, False)
 
@@ -3443,7 +3468,7 @@ class ModelRegistry:
             # Check if already loaded
             lora_state = loaded_model.loras.get(lora)
             if lora_state is not None:
-                if lora_state.loading:
+                if lora_state.loading or lora_state.unloading:
                     # Still loading - return loading status
                     return (False, True)
                 # Already loaded
@@ -3454,6 +3479,24 @@ class ModelRegistry:
             if self._lora_backoff_s(loaded_model, lora) is not None:
                 return (False, True)
 
+            # Loading placeholders reserve slots. Never evict one, or drop a
+            # pinned startup adapter. A victim remains tracked until the
+            # engine confirms removal; its replacement owns that one slot.
+            victim: str | None = None
+            occupied = sum(not state.unloading for state in loaded_model.loras.values())
+            if occupied >= loaded_model.max_loras:
+                victim = next(
+                    (
+                        name
+                        for name, state in loaded_model.loras.items()
+                        if not state.loading and not state.unloading and not state.pinned
+                    ),
+                    None,
+                )
+                if victim is None:
+                    return (False, True)
+                loaded_model.loras[victim].unloading = True
+
             # Not loaded - start loading
             logger.info("Starting LoRA load for model '%s': %s", model, lora)
 
@@ -3463,27 +3506,11 @@ class ModelRegistry:
                 loading=True,
             )
 
-            # LRU eviction if needed (evict oldest LoRA)
-            while len(loaded_model.loras) > loaded_model.max_loras:
-                oldest_lora = next(iter(loaded_model.loras))
-                if oldest_lora == lora:
-                    # Don't evict the one we're loading
-                    break
-                logger.info(
-                    "LoRA LRU eviction for model '%s': evicting '%s' (max=%d)",
-                    model,
-                    oldest_lora,
-                    loaded_model.max_loras,
-                )
-                evicted = loaded_model.loras.pop(oldest_lora)
-                if not evicted.loading:
-                    await self._unload_lora(loaded_model, oldest_lora)
-
         # Load outside the lock if adapter supports hot reload
         if lora_cap.supports_hot_lora_reload():
             # Non-blocking load in background
             task = asyncio.create_task(
-                self._load_lora(model, lora),
+                self._load_lora(model, lora, loaded_model=loaded_model, victim=victim),
                 name=f"lora-load-{model}-{lora}",
             )
             self._background_tasks.add(task)
@@ -3491,10 +3518,12 @@ class ModelRegistry:
             return (False, True)
 
         # Blocking load - load synchronously
-        await self._load_lora(model, lora)
+        await self._load_lora(model, lora, loaded_model=loaded_model, victim=victim)
         return (self.is_lora_loaded(model, lora), self.lora_load_failed(model, lora))
 
-    async def _load_lora(self, model: str, lora: str) -> None:
+    async def _load_lora(
+        self, model: str, lora: str, *, loaded_model: LoadedModel | None = None, victim: str | None = None
+    ) -> None:
         """Load a LoRA adapter and record it, or drop its placeholder and back off when the load fails.
 
         A hot-reload adapter fetches the LoRA's files outside inference and
@@ -3506,8 +3535,8 @@ class ModelRegistry:
             model: Model name.
             lora: LoRA adapter name/path.
         """
+        loaded_model = loaded_model or self._loaded.get(model)
         try:
-            loaded_model = self._loaded.get(model)
             if loaded_model is None:
                 logger.warning("Model '%s' unloaded during LoRA load", model)
                 return
@@ -3528,9 +3557,25 @@ class ModelRegistry:
                 attach = functools.partial(lora_cap.load_lora, lora, revision=revision, source=source)
             else:
                 attach = functools.partial(lora_cap.load_lora, lora, revision=revision)
-            memory_bytes = await self._run_lora_mutation(loaded_model, attach)
+            if self._loaded.get(model) is not loaded_model or model in self._unloading:
+                lora_cap.discard_lora_source(lora)
+                return
+
+            if victim is not None:
+                await self._unload_lora(loaded_model, victim, model=model)
+                async with loaded_model.get_lora_lock():
+                    loaded_model.loras.pop(victim, None)
+
+            def attach_current() -> int:
+                if self._loaded.get(model) is not loaded_model or model in self._unloading:
+                    raise RuntimeError("Model unloaded before LoRA attach")
+                return attach()
+
+            memory_bytes = await self._run_lora_mutation(loaded_model, attach_current)
 
             async with loaded_model.get_lora_lock():
+                if self._loaded.get(model) is not loaded_model or model in self._unloading:
+                    return
                 loaded_model.lora_failures.pop(lora, None)
                 lora_state = loaded_model.loras.get(lora)
                 if lora_state is None:
@@ -3546,12 +3591,20 @@ class ModelRegistry:
                     memory_bytes / 1024 / 1024,
                 )
 
-        except Exception:
+        except Exception as error:
             logger.exception("Error loading LoRA '%s' for model '%s'", lora, model)
-            # Remove failed LoRA from tracking
-            loaded_model = self._loaded.get(model)
-            if loaded_model:
-                loaded_model.loras.pop(lora, None)
+            if loaded_model is not None and (capability := loaded_model.adapter.lora_capability()) is not None:
+                capability.discard_lora_source(lora)
+            # Never mutate a newly loaded incarnation of the same model. An
+            # uncertain backend mutation retains its reservation until reload.
+            if loaded_model is not None and self._loaded.get(model) is loaded_model:
+                uncertain = isinstance(error, LoraStateUncertainError)
+                if not uncertain or victim in loaded_model.loras:
+                    loaded_model.loras.pop(lora, None)
+                if victim is not None and victim in loaded_model.loras:
+                    victim_state = loaded_model.loras[victim]
+                    victim_state.unloading = False
+                    victim_state.loading = uncertain
                 previous = loaded_model.lora_failures.get(lora)
                 attempts = previous.attempts + 1 if previous is not None else 1
                 delay_s = min(_LORA_RETRY_BASE_S * 2 ** (attempts - 1), _LORA_RETRY_MAX_S)
@@ -3570,12 +3623,16 @@ class ModelRegistry:
     def lora_retry_after_s(self, model: str, lora: str) -> int:
         """Seconds a caller should wait before asking for ``lora`` again: the rest of a failed load's backoff, else 1."""
         loaded_model = self._loaded.get(model)
+        if loaded_model is not None:
+            lora = self._lora_source(loaded_model, lora)
         backoff = self._lora_backoff_s(loaded_model, lora) if loaded_model is not None else None
         return backoff if backoff is not None else 1
 
     def lora_load_failed(self, model: str, lora: str) -> bool:
         """True while ``lora``'s last load failed and the next one waits for the backoff."""
         loaded_model = self._loaded.get(model)
+        if loaded_model is not None:
+            lora = self._lora_source(loaded_model, lora)
         return loaded_model is not None and self._lora_backoff_s(loaded_model, lora) is not None
 
     def request_lora_load(self, model: str, lora: str) -> int | None:
@@ -3588,14 +3645,21 @@ class ModelRegistry:
         ``lora`` as a LoRA to load.
         """
         loaded_model = self._loaded.get(model)
+        if loaded_model is not None:
+            lora = self._lora_source(loaded_model, lora)
         if (
             loaded_model is None
             or loaded_model.adapter.lora_capability() is None
-            or lora not in loaded_model.config.lora_revisions()
+            or lora
+            not in (
+                set(loaded_model.lora_runtime.aliases.values())
+                if loaded_model.lora_runtime is not None
+                else loaded_model.config.lora_revisions()
+            )
         ):
             return None
         lora_state = loaded_model.loras.get(lora)
-        if lora_state is not None and not lora_state.loading:
+        if lora_state is not None and not lora_state.loading and not lora_state.unloading:
             loaded_model.loras.pop(lora)
         task = asyncio.create_task(self._ensure_lora_quietly(model, lora), name=f"lora-request-{model}-{lora}")
         self._background_tasks.add(task)
@@ -3608,14 +3672,17 @@ class ModelRegistry:
         except Exception:
             logger.exception("Error starting LoRA load for model '%s': %s", model, lora)
 
-    async def _unload_lora(self, loaded_model: LoadedModel, lora: str) -> None:
+    async def _unload_lora(self, loaded_model: LoadedModel, lora: str, *, model: str | None = None) -> None:
         lora_cap = loaded_model.adapter.lora_capability()
         if lora_cap is None:
             return
-        try:
-            await self._run_lora_mutation(loaded_model, functools.partial(lora_cap.unload_lora, lora))
-        except Exception:
-            logger.exception("Error unloading LoRA '%s'", lora)
+
+        def unload_current() -> None:
+            if model is not None and (self._loaded.get(model) is not loaded_model or model in self._unloading):
+                raise RuntimeError("Model unloaded before LoRA eviction")
+            lora_cap.unload_lora(lora)
+
+        await self._run_lora_mutation(loaded_model, unload_current)
 
     @staticmethod
     async def _run_lora_mutation[T](loaded_model: LoadedModel, mutation: Callable[[], T]) -> T:

@@ -1285,6 +1285,22 @@ class ModelConfig(BaseModel):
                     parent=self.profiles[profile.extends] if profile.extends is not None else None,
                 )
 
+        for name in self.profiles:
+            loadtime = self._resolve_profile_uncached(name).loadtime
+            if "preload_loras" not in loadtime:
+                continue
+            preload = loadtime["preload_loras"]
+            paths = loadtime.get("lora_paths")
+            if (
+                not isinstance(paths, dict)
+                or not paths
+                or not isinstance(preload, list)
+                or any(not isinstance(alias, str) or not alias for alias in preload)
+                or len(preload) != len(set(preload))
+                or not set(preload).issubset(paths)
+            ):
+                raise ValueError(f"Profile '{name}' preload_loras must contain unique declared lora_paths names")
+
         return self
 
     @model_validator(mode="after")
