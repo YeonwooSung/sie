@@ -7,10 +7,13 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
+import transformers
 import yaml
+from sie_server.adapters._types import ComputePrecision
 from sie_server.adapters.bge_m3_flash import BGEM3FlashAdapter
 from sie_server.config.model import ModelConfig
 from sie_server.core.inference_output import EncodeOutput, SparseVector
+from sie_server.core.loader import _build_adapter_kwargs
 from sie_server.types.inputs import Item
 from transformers import XLMRobertaConfig
 from transformers.models.xlm_roberta.modeling_xlm_roberta import XLMRobertaEmbeddings
@@ -92,6 +95,68 @@ class TestBGEM3YamlConfig:
 
     def test_score_in_outputs(self, config: ModelConfig) -> None:
         assert "score" in config.outputs
+
+    def test_resolved_profile_precisions(self, config: ModelConfig) -> None:
+        assert {name: config.resolve_profile(name).compute_precision for name in config.profiles} == {
+            "default": "float16",
+            "dense": "float16",
+            "sparse": "float16",
+            "multivector": "float16",
+            "candle": "bfloat16",
+            "banking": "bfloat16",
+            "medical-vn": "bfloat16",
+            "bge_m3_flag": None,
+        }
+
+    def test_default_precision_reaches_adapter_loading(
+        self,
+        config: ModelConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        kwargs = _build_adapter_kwargs(config, "bfloat16")
+        assert kwargs["compute_precision"] == "float16"
+        assert kwargs["revision"] == "5617a9f61b028005a4858fdac845db406aefb181"
+        model_loader = MagicMock()
+        tokenizer_loader = MagicMock()
+        monkeypatch.setattr(transformers.AutoModel, "from_pretrained", model_loader)
+        monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", tokenizer_loader)
+        adapter = BGEM3FlashAdapter(**kwargs)
+        head_loader = MagicMock()
+        monkeypatch.setattr(adapter, "_load_linear_layers", head_loader)
+
+        adapter.load("cuda:0")
+
+        model_loader.assert_called_once_with(
+            "BAAI/bge-m3",
+            torch_dtype=torch.float16,
+            attn_implementation="eager",
+            revision=config.hf_revision,
+        )
+        tokenizer_loader.assert_called_once_with("BAAI/bge-m3", revision=config.hf_revision)
+        head_loader.assert_called_once_with("BAAI/bge-m3", torch.float16, "cuda:0")
+
+    @pytest.mark.parametrize("name", ["default", "dense", "sparse", "multivector"])
+    def test_flash_profiles_preserve_recipe(self, config: ModelConfig, name: str) -> None:
+        profile = config.resolve_profile(name)
+        assert profile.adapter_path == "sie_server.adapters.bge_m3_flash:BGEM3FlashAdapter"
+        assert profile.max_batch_tokens == 16384
+        assert profile.loadtime == {}
+        expected_runtime: dict[str, Any] = {"pooling": "cls", "normalize": True}
+        if name != "default":
+            expected_runtime["output_types"] = [name]
+        assert profile.runtime == expected_runtime
+        assert config.max_sequence_length == 8192
+        assert config.dims == {"dense": 1024, "sparse": 250002, "multivector": 1024}
+
+    @pytest.mark.parametrize(
+        ("precision", "expected_dtype"),
+        [("float16", torch.float16), ("bfloat16", torch.bfloat16)],
+    )
+    def test_explicit_flash_precision_remains_supported(
+        self, precision: ComputePrecision, expected_dtype: torch.dtype
+    ) -> None:
+        adapter = BGEM3FlashAdapter(compute_precision=precision)
+        assert adapter._resolve_dtype() == expected_dtype
 
 
 class TestBGEM3EmbeddingParity:
