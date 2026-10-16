@@ -1140,6 +1140,222 @@
           }
         }
       }
+    },
+    "/v1/systemone": {
+      "post": {
+        "tags": [
+          "systemone"
+        ],
+        "summary": "System One",
+        "description": "Answer typed questions about one state (System One-compatible).\n\nClients written for the System One API work by changing their base URL.",
+        "operationId": "system_one_v1_systemone_post",
+        "parameters": [
+          {
+            "name": "X-SIE-MACHINE-PROFILE",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Sie-Machine-Profile"
+            }
+          },
+          {
+            "name": "X-SIE-Remote",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The only accepted value is `forbid`. It keeps the request off remote upstreams: local capacity serves or refuses it, and a model served only by an upstream answers 400. Any other value answers 400.",
+              "title": "X-Sie-Remote"
+            },
+            "description": "The only accepted value is `forbid`. It keeps the request off remote upstreams: local capacity serves or refuses it, and a model served only by an upstream answers 400. Any other value answers 400."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SystemOneRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Every question answered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SystemOneResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Model not found"
+          },
+          "422": {
+            "description": "Invalid request: a malformed question, a model that does not answer typed questions, or a state or question set that does not fit the model's window"
+          },
+          "503": {
+            "description": "Model loading or server busy; retry after Retry-After (at most 60 seconds)"
+          }
+        }
+      }
+    },
+    "/v1/decisions": {
+      "post": {
+        "tags": [
+          "openai-compat"
+        ],
+        "summary": "Decisions",
+        "description": "Answer ordered predicate, choice, and score questions with a text decision model.",
+        "operationId": "decisions_v1_decisions_post",
+        "parameters": [
+          {
+            "name": "X-SIE-MACHINE-PROFILE",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Sie-Machine-Profile"
+            }
+          },
+          {
+            "name": "X-SIE-Remote",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The only accepted value is `forbid`. It keeps the request off remote upstreams: local capacity serves or refuses it, and a model served only by an upstream answers 400. Any other value answers 400.",
+              "title": "X-Sie-Remote"
+            },
+            "description": "The only accepted value is `forbid`. It keeps the request off remote upstreams: local capacity serves or refuses it, and a model served only by an upstream answers 400. Any other value answers 400."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or unsupported input"
+          },
+          "404": {
+            "description": "Model not found"
+          },
+          "503": {
+            "description": "Model loading or capacity exhausted"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "model": {
+                    "description": "SIE decision model id, for example fastino/GLiNER2.5-Decide.",
+                    "title": "Model",
+                    "type": "string"
+                  },
+                  "input": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "items": {
+                          "additionalProperties": true,
+                          "type": "object"
+                        },
+                        "type": "array"
+                      }
+                    ],
+                    "description": "Text or text-only messages, in conversation order.",
+                    "title": "Input"
+                  },
+                  "questions": {
+                    "description": "Predicate, choice, or score questions, in answer order.",
+                    "items": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "maxItems": 200,
+                    "minItems": 1,
+                    "title": "Questions",
+                    "type": "array"
+                  },
+                  "safety_identifier": {
+                    "anyOf": [
+                      {
+                        "maxLength": 128,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Safety Identifier"
+                  }
+                },
+                "required": [
+                  "model",
+                  "input",
+                  "questions"
+                ],
+                "title": "DecisionRequest",
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1164,6 +1380,71 @@
         ],
         "title": "ClassificationModel",
         "description": "Classification result."
+      },
+      "DecisionResponse": {
+        "properties": {
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "answers": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Answers"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/DecisionUsage"
+          }
+        },
+        "type": "object",
+        "required": [
+          "model",
+          "answers",
+          "usage"
+        ],
+        "title": "DecisionResponse"
+      },
+      "DecisionUsage": {
+        "properties": {
+          "input_tokens": {
+            "type": "integer",
+            "title": "Input Tokens"
+          },
+          "input_tokens_details": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Input Tokens Details"
+          },
+          "output_tokens": {
+            "type": "integer",
+            "title": "Output Tokens",
+            "default": 0
+          },
+          "output_tokens_details": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Output Tokens Details"
+          },
+          "total_tokens": {
+            "type": "integer",
+            "title": "Total Tokens"
+          }
+        },
+        "type": "object",
+        "required": [
+          "input_tokens",
+          "input_tokens_details",
+          "output_tokens_details",
+          "total_tokens"
+        ],
+        "title": "DecisionUsage"
       },
       "DenseVectorModel": {
         "properties": {
@@ -1870,6 +2151,16 @@
               }
             ],
             "title": "Revision"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description",
+            "default": ""
+          },
+          "release_date": {
+            "type": "string",
+            "title": "Release Date",
+            "default": ""
           },
           "capabilities": {
             "anyOf": [
@@ -2914,6 +3205,95 @@
         ],
         "title": "SparseVectorModel",
         "description": "Sparse embedding vector."
+      },
+      "SystemOneRequest": {
+        "properties": {
+          "model": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Model",
+            "description": "SIE model id of a decision model, e.g. fastino/GLiNER2.5-Decide."
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              }
+            ],
+            "title": "State",
+            "description": "The text to judge, or a JSON object, or a list of conversation turns."
+          },
+          "questions": {
+            "additionalProperties": true,
+            "type": "object",
+            "minProperties": 1,
+            "title": "Questions",
+            "description": "Typed questions by id: {\"type\": \"noul\" | \"choice\" | \"score\", \"instructions\"?, \"criteria\"?}."
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "model",
+          "state",
+          "questions"
+        ],
+        "title": "SystemOneRequest",
+        "description": "A System One request: one state and its typed questions."
+      },
+      "SystemOneResponse": {
+        "properties": {
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "answers": {
+            "additionalProperties": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "object",
+            "title": "Answers"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/SystemOneUsage"
+          }
+        },
+        "type": "object",
+        "required": [
+          "model",
+          "answers",
+          "usage"
+        ],
+        "title": "SystemOneResponse",
+        "description": "Answers by question id, in the System One response shape."
+      },
+      "SystemOneUsage": {
+        "properties": {
+          "input_tokens": {
+            "type": "integer",
+            "title": "Input Tokens"
+          },
+          "output_tokens": {
+            "type": "integer",
+            "title": "Output Tokens",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "input_tokens"
+        ],
+        "title": "SystemOneUsage",
+        "description": "Tokens the model read. Decision models generate no tokens."
       },
       "TimingInfoModel": {
         "properties": {

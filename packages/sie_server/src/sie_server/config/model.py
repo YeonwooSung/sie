@@ -886,6 +886,11 @@ class ModelConfig(BaseModel):
     _synthetic_profile_variant_source: tuple[str, str] | None = PrivateAttr(default=None)
 
     sie_id: str
+    # One line about the model, and the date its served weights were released
+    # (YYYY-MM-DD). /v1/models reports both, as the System One API's model list
+    # does, so System One clients can list SIE's models.
+    description: str | None = None
+    release_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     hf_id: str | None = None
     hf_revision: str | None = None
     hf_tokenizer_dependencies: dict[str, str] = Field(default_factory=dict)

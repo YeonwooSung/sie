@@ -367,6 +367,10 @@ export interface ModelInfo {
   maxSequenceLength?: number | null;
   /** Pinned HF commit SHA for the weights; null for unpinned/package-backed models */
   revision?: string | null;
+  /** One line about the model; "" when the catalog sets none */
+  description?: string;
+  /** Release date of the served weights, YYYY-MM-DD; "" when the catalog sets none */
+  releaseDate?: string;
   /** Servable profiles keyed by name; address one as "model@profile" */
   profiles?: Record<string, ProfileInfo>;
   /** Advertised model capabilities; null for models with no `generate` task */
@@ -390,7 +394,7 @@ export interface ModelInfo {
 
 /**
  * A `/v1/models` entry exactly as the gateway emits it, before the client
- * camelCases the three renamed top-level keys.
+ * camelCases the four renamed top-level keys.
  *
  * Declared once here (rather than inline per call site) so `listModels` and
  * `getModel` cannot drift apart, and so the emitted key set has a single
@@ -406,6 +410,8 @@ export interface WireModelInfo {
   dims?: ModelDims;
   max_sequence_length?: number | null;
   revision?: string | null;
+  description?: string;
+  release_date?: string;
   profiles?: Record<string, ProfileInfo>;
   capabilities?: ModelCapabilities | null;
   pending_generation?: PendingGeneration;
@@ -423,6 +429,7 @@ export interface WireModelInfo {
 const MODEL_INFO_WIRE_FIELD_SET: Record<keyof WireModelInfo, true> = {
   aliases: true,
   capabilities: true,
+  description: true,
   dims: true,
   inputs: true,
   last_error: true,
@@ -432,6 +439,7 @@ const MODEL_INFO_WIRE_FIELD_SET: Record<keyof WireModelInfo, true> = {
   outputs: true,
   pending_generation: true,
   profiles: true,
+  release_date: true,
   revision: true,
   routing: true,
   state: true,

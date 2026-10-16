@@ -428,6 +428,10 @@ class ModelInfo(TypedDict, total=False):
     dims: ModelDims
     max_sequence_length: int | None
     revision: str | None
+    description: str
+    """One line about the model; ``""`` when the catalog sets none."""
+    release_date: str
+    """Release date of the served weights, ``YYYY-MM-DD``; ``""`` when the catalog sets none."""
     profiles: dict[str, ProfileInfo]
     """Servable profiles keyed by name; address one as ``"model@profile"``."""
 
@@ -596,6 +600,35 @@ class ExtractResult(TypedDict, total=False):
     data: dict[str, Any]
     error: ExtractItemErrorDetail
     request: RequestMetadata
+
+
+class SystemOneUsage(TypedDict):
+    """Tokens a System One call read. Decision models generate none.
+
+    ``input_tokens`` is the metered count the response reported (SIE
+    Serverless meters every request); ``0`` when the deployment reports no
+    metering. ``POST /v1/systemone`` itself always returns the worker's count.
+    """
+
+    input_tokens: int
+    output_tokens: int
+
+
+class SystemOneResult(TypedDict):
+    """Answers to typed questions, in the System One response shape.
+
+    Attributes:
+        model: The decision model that answered.
+        answers: One answer per question id. ``noul``: ``noul``, the
+            probability of yes. ``choice``: ``choice``, ``confidence`` and
+            ``probabilities`` by option. ``score``: ``score``, ``confidence``,
+            and ``legend`` and ``probabilities`` by level index (``"0"``...).
+        usage: Tokens the model read.
+    """
+
+    model: str
+    answers: dict[str, dict[str, Any]]
+    usage: SystemOneUsage
 
 
 # Streaming generation result. Streaming happens inside the gateway/worker;

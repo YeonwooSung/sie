@@ -9,6 +9,7 @@ import torch
 from fastapi import FastAPI
 
 from sie_server import __version__
+from sie_server.api.decisions import router as decisions_router
 from sie_server.api.encode import router as encode_router
 from sie_server.api.extract import router as extract_router
 from sie_server.api.generate import router as generate_router
@@ -22,6 +23,7 @@ from sie_server.api.openai_responses import router as openai_responses_router
 from sie_server.api.openapi import setup_custom_openapi_schema
 from sie_server.api.root import router as root_router
 from sie_server.api.score import router as score_router
+from sie_server.api.systemone import router as systemone_router
 from sie_server.api.ws import init_server_start_time
 from sie_server.api.ws import router as ws_router
 from sie_server.app.app_state_config import AppStateConfig
@@ -132,6 +134,8 @@ class AppFactory:
         app.include_router(openai_router)  # OpenAI-compatible /v1/embeddings
         app.include_router(openai_completions_router)  # OpenAI-compatible /v1/completions
         app.include_router(openai_responses_router)  # OpenAI-compatible /v1/responses
+        app.include_router(systemone_router)  # System One-compatible /v1/systemone
+        app.include_router(decisions_router)
         # Local-only convenience (single-node/dev); intentionally NOT in the published
         # openapi.json — see cli.openapi_export. The Rust gateway is the prod API authority.
         app.include_router(openai_local_router)  # local /v1/chat/completions + /v1/rerank

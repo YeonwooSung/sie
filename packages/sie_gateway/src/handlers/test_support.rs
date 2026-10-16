@@ -32,7 +32,7 @@ pub(crate) const LOCAL_LANE: (&str, &str, &str) = ("default", "l4", "default");
 /// The remote lane's `(pool, machine_profile, bundle)`.
 pub(crate) const REMOTE_LANE: (&str, &str, &str) = ("default", "cpu", "remote");
 
-const DEFAULT_BUNDLE: &str = "name: default\ndefault: true\nadapters:\n  - sie_server.adapters.bert_flash\n  - sie_server.adapters.sglang\n  - sie_server.adapters.whisper.adapter\n  - sie_server.adapters.remote.sie\n";
+const DEFAULT_BUNDLE: &str = "name: default\ndefault: true\nadapters:\n  - sie_server.adapters.bert_flash\n  - sie_server.adapters.sglang\n  - sie_server.adapters.whisper.adapter\n  - sie_server.adapters.gliner2.decide\n  - sie_server.adapters.remote.sie\n";
 const REMOTE_BUNDLE: &str =
     "name: remote\npriority: 1\ndefault: false\nadapters:\n  - sie_server.adapters.remote.sie\n";
 
@@ -127,6 +127,18 @@ profiles:
       loadtime:
         upstream: team-sie
         upstream_model: acme/extract
+";
+
+/// A local typed-decision model (GLiNER2.5-Decide) for `/v1/systemone`.
+pub(crate) const LOCAL_DECISION_MODEL: &str = "\
+sie_id: acme/decide
+hf_id: acme/decide
+tasks:
+  extract: {}
+profiles:
+  default:
+    adapter_path: sie_server.adapters.gliner2.decide:GLiNER2DecideAdapter
+    max_batch_tokens: 8192
 ";
 
 /// One request as the transport received it.

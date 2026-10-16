@@ -42,6 +42,7 @@ from sie_sdk.bundle_utils import (
 )
 
 import sie_server
+from sie_server.api.decisions import router as decisions_router
 from sie_server.api.generate import router as generate_router
 from sie_server.api.openai_audio import router as openai_audio_router
 from sie_server.app.app_state_config import (
@@ -404,6 +405,7 @@ def openapi_export(
     from sie_server.api.openapi import setup_custom_openapi_schema
     from sie_server.api.root import router as root_router
     from sie_server.api.score import router as score_router
+    from sie_server.api.systemone import router as systemone_router
     from sie_server.api.ws import router as ws_router
 
     # Build a lightweight FastAPI app for the PUBLISHED API surface — no lifespan (no GPU
@@ -429,6 +431,8 @@ def openapi_export(
     app_.include_router(openai_router)
     app_.include_router(openai_completions_router)
     app_.include_router(openai_responses_router)
+    app_.include_router(systemone_router)
+    app_.include_router(decisions_router)
     setup_custom_openapi_schema(app_)
 
     spec = app_.openapi()

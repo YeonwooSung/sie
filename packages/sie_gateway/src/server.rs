@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
-use crate::handlers::{audio, config_api, health, messages, models, pools, proxy};
+use crate::handlers::{
+    audio, config_api, decisions, health, messages, models, pools, proxy, systemone,
+};
 use crate::middleware::audit::AuditLayer;
 use crate::middleware::auth::AuthLayer;
 use crate::middleware::metrics::apply_request_telemetry;
@@ -635,6 +637,9 @@ pub fn create_router_core(
         .route("/v1/embeddings", post(proxy::proxy_openai_embeddings))
         .route("/v1/rerank", post(proxy::proxy_rerank))
         .route("/v2/rerank", post(proxy::proxy_rerank_v2))
+        // System One-compatible typed decisions over the native extract primitive.
+        .route("/v1/systemone", post(systemone::proxy_systemone))
+        .route("/v1/decisions", post(decisions::proxy_decisions))
         .route("/v1/chat/completions", post(proxy::proxy_chat))
         // OpenAI legacy Completions — raw-prompt continuation (non-streaming).
         .route("/v1/completions", post(proxy::proxy_completions))
