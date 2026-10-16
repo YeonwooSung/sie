@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import os
+import threading
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -141,6 +143,102 @@ class TestGetOrCreateWorkerId:
         worker_id = _get_or_create_worker_id(data_dir)
         uuid.UUID(worker_id)  # valid UUID
         assert worker_id != "not-a-uuid"
+
+    @pytest.mark.parametrize("content", ["not-a-uuid", "", "\n"])
+    def test_bad_content_is_repaired_once_and_then_stable(self, tmp_path: Path, content: str) -> None:
+        id_path = tmp_path / "worker-id"
+        id_path.write_text(content)
+
+        repaired = _get_or_create_worker_id(str(tmp_path))
+
+        uuid.UUID(repaired)
+        assert id_path.read_text() == repaired
+        assert _get_or_create_worker_id(str(tmp_path)) == repaired
+        assert [entry.name for entry in tmp_path.iterdir()] == ["worker-id"]
+
+    def test_a_fifo_does_not_block_and_is_replaced(self, tmp_path: Path) -> None:
+        id_path = tmp_path / "worker-id"
+        os.mkfifo(id_path, 0o600)
+        outcome: list[str] = []
+        reader = threading.Thread(target=lambda: outcome.append(_get_or_create_worker_id(str(tmp_path))), daemon=True)
+        reader.start()
+        reader.join(timeout=5)
+        try:
+            assert not reader.is_alive(), "reading a FIFO worker id blocked"
+        finally:
+            if reader.is_alive():
+                os.close(os.open(id_path, os.O_WRONLY | os.O_NONBLOCK))
+
+        uuid.UUID(outcome[0])
+        assert id_path.is_file()
+        assert _get_or_create_worker_id(str(tmp_path)) == outcome[0]
+
+    def test_a_fifo_is_never_read_as_the_worker_id(self, tmp_path: Path) -> None:
+        id_path = tmp_path / "worker-id"
+        os.mkfifo(id_path, 0o600)
+        planted = str(uuid.uuid4())
+        reader = os.open(id_path, os.O_RDONLY | os.O_NONBLOCK)
+        writer = os.open(id_path, os.O_WRONLY)
+        try:
+            os.write(writer, planted.encode())
+            worker_id = _get_or_create_worker_id(str(tmp_path))
+        finally:
+            os.close(writer)
+            os.close(reader)
+
+        assert worker_id != planted
+        assert id_path.is_file()
+        assert id_path.read_text() == worker_id
+
+    def test_only_old_temporary_files_of_the_server_are_cleaned_up(self, tmp_path: Path) -> None:
+        old = time.time() - 600
+        orphan = tmp_path / ".worker-id.sie-server-00000000000000aa"
+        in_flight = tmp_path / ".worker-id.sie-server-00000000000000bb"
+        users = tmp_path / ".worker-id.backup"
+        for path in (orphan, in_flight, users):
+            path.write_text(str(uuid.uuid4()))
+        for path in (orphan, users):
+            os.utime(path, (old, old))
+
+        _get_or_create_worker_id(str(tmp_path))
+
+        assert not orphan.exists()
+        assert in_flight.exists()
+        assert users.exists()
+
+    def test_a_write_interrupted_before_the_rename_is_swept_later(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class Interrupted(BaseException):
+            pass
+
+        def interrupted(self: Path, target: object) -> Path:
+            raise Interrupted
+
+        with monkeypatch.context() as patched:
+            patched.setattr(Path, "replace", interrupted)
+            with pytest.raises(Interrupted):
+                _get_or_create_worker_id(str(tmp_path))
+        (leftover,) = tmp_path.iterdir()
+        old = time.time() - 600
+        os.utime(leftover, (old, old))
+
+        worker_id = _get_or_create_worker_id(str(tmp_path))
+
+        assert not leftover.exists()
+        assert [entry.name for entry in tmp_path.iterdir()] == ["worker-id"]
+        assert (tmp_path / "worker-id").read_text() == worker_id
+
+    def test_temporary_files_of_another_user_are_kept(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        old = time.time() - 600
+        orphan = tmp_path / ".worker-id.sie-server-00000000000000aa"
+        orphan.write_text(str(uuid.uuid4()))
+        os.utime(orphan, (old, old))
+        monkeypatch.setattr(os, "getuid", lambda: orphan.stat().st_uid + 1)
+
+        _get_or_create_worker_id(str(tmp_path))
+
+        assert orphan.exists()
 
     def test_readonly_dir_falls_back_to_ephemeral(self, tmp_path: Path) -> None:
         nonexistent = os.path.join(str(tmp_path), "readonly", "nested", "deep")
