@@ -40,7 +40,9 @@ def main() -> None:
         }
     if locks[0] != locks[1] or locks[1] != (ROOT / "uv.lock").read_bytes():
         raise SystemExit("Both revisions and the execution workspace must use the same uv.lock")
-    manifest["source_diff"] = git("diff", "--stat", args.baseline, args.candidate, "--", *PATHS).decode()
+    manifest["source_diff"] = git(
+        "diff", "--stat", manifest["baseline"]["commit"], manifest["candidate"]["commit"], "--", *PATHS
+    ).decode()
     (INPUTS / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps(manifest, indent=2))
 

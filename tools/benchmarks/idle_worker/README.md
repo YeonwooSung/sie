@@ -43,10 +43,15 @@ batch only after normal dispatch completes; it does not replace scheduling or
 inference. The existing worker unit tests cover deterministic queued-burst
 formation.
 
-Each completed phase is written before the next starts. Batch records are
-flushed as JSONL after each dispatch, so SIGTERM during server shutdown cannot
+Each completed phase is written before the next starts. If a later phase fails,
+the trial is marked `failed` and its completed measurements remain available.
+Trial JSON is replaced atomically so an incomplete write preserves the last
+completed phase. Batch records are flushed as JSONL after each dispatch, so
+SIGTERM during server shutdown cannot
 discard them. If a trace is missing, request timings remain available and the
 trial is marked `timing_complete_trace_missing`.
+Reported p95 values use nearest rank: sort the samples and select rank
+`ceil(0.95 * n)`, counting from one.
 
 Use an otherwise idle GPU and reserve enough CPU for the client and server.
 The server uses four Torch CPU threads. Keep the GPU allocation, dependencies,

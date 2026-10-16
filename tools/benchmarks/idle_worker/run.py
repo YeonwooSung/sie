@@ -5,6 +5,7 @@ import hashlib
 import importlib.metadata
 import itertools
 import json
+import math
 import os
 import platform
 import shutil
@@ -36,11 +37,12 @@ TEXTS = [
 
 
 def distribution(values: list[float]) -> dict:
+    """Summarize samples using the nearest-rank definition of p95."""
     ordered = sorted(values)
     return {
         "n": len(values),
         "median": statistics.median(values),
-        "p95": ordered[min(len(values) - 1, int(len(values) * 0.95))],
+        "p95": ordered[math.ceil(len(values) * 0.95) - 1],
         "max": max(values),
     }
 
@@ -152,10 +154,16 @@ def trial(args: argparse.Namespace, arm: str, trial_index: int, source: Path, ou
     ]
     phases = []
     result = {"arm": arm, "trial": trial_index, "phases": phases, "status": "running"}
+    result_path = output / f"{name}.json"
+
+    def persist_result() -> None:
+        pending = result_path.with_suffix(".json.tmp")
+        pending.write_text(json.dumps(result, indent=2) + "\n")
+        pending.replace(result_path)
 
     def record_phase(phase: dict) -> None:
         phases.append(phase)
-        (output / f"{name}.json").write_text(json.dumps(result, indent=2) + "\n")
+        persist_result()
 
     with (output / f"{name}-server.log").open("w") as log:
         process = subprocess.Popen(argv, env=environment, stdout=log, stderr=subprocess.STDOUT)  # noqa: S603 — fixed local server, no shell.
@@ -190,6 +198,13 @@ def trial(args: argparse.Namespace, arm: str, trial_index: int, source: Path, ou
                     record_phase(
                         measure(client, args.model, f"throughput{concurrency}", concurrency, duration=args.duration)
                     )
+        except BaseException as error:
+            result["status"] = "failed"
+            try:
+                persist_result()
+            except OSError as persistence_error:
+                error.add_note(f"Could not persist failed trial: {persistence_error}")
+            raise
         finally:
             process.terminate()
             try:
@@ -207,7 +222,7 @@ def trial(args: argparse.Namespace, arm: str, trial_index: int, source: Path, ou
             ]
     else:
         result["status"] = "timing_complete_trace_missing"
-    (output / f"{name}.json").write_text(json.dumps(result, indent=2) + "\n")
+    persist_result()
     return result
 
 
