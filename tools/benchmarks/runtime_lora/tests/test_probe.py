@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -18,7 +19,7 @@ import torch
 from peft import PeftModel
 from safetensors.torch import load_file
 from sie_sdk._msgpack import packb as pack_msgpack
-from sie_sdk.client.errors import ServerError
+from sie_sdk.client.errors import RequestError, ServerError
 from sie_server.adapters.sglang import _server
 from sie_server.adapters.sglang.embedding import SGLangEmbeddingAdapter
 from sie_server.adapters.sglang.generation import SGLangGenerationAdapter
@@ -26,6 +27,7 @@ from sie_server.config.model import ModelConfig
 from sie_server.core.loader import load_adapter, resolve_adapter_class, validate_loadtime_options
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
+from tools.benchmarks.runtime_lora import probe
 from tools.benchmarks.runtime_lora.adapters import ObservedGenerationAdapter
 from tools.benchmarks.runtime_lora.fixtures import MODELS, digest, write_adapter
 from tools.benchmarks.runtime_lora.observer import patch_scheduler
@@ -37,6 +39,7 @@ from tools.benchmarks.runtime_lora.probe import (
     check_buffered_native,
     check_effect,
     configs,
+    embedding_delta,
     mixed_batches,
     probability,
     record_check,
@@ -448,6 +451,94 @@ def test_effect_checks_fail_for_ignored_adapters_and_contaminated_base() -> None
     with pytest.raises(AssertionError, match="not restored"):
         check_effect("embedding", base, a, b, a)
     assert np.isfinite(check_effect("embedding", base, a, b, base)["a_vs_b_max_abs"])
+
+
+def test_embedding_warm_baseline_is_stable_and_sets_effect_floor() -> None:
+    def result(value: float) -> dict:
+        return {"vectors": [[0.1, value]]}
+
+    base, a, b = result(0.5), result(0.6), result(0.7)
+    effects = check_effect("embedding", base, a, b, base, result(0.50001))
+    assert effects["baseline_max_abs"] == pytest.approx(1e-5)
+    assert effects["required_effect_minimum"] == pytest.approx(5e-5)
+    with pytest.raises(AssertionError, match="baseline was not stable"):
+        check_effect("embedding", base, a, b, base, result(0.5001))
+    with pytest.raises(AssertionError, match="not restored"):
+        check_effect("embedding", base, a, b, result(0.5001), base)
+    with pytest.raises(AssertionError, match="beyond base drift"):
+        check_effect("embedding", base, result(0.5001), result(0.5003), base, result(0.50004))
+
+
+@pytest.mark.parametrize("invalid", [math.nan, math.inf, -math.inf])
+def test_embedding_comparison_rejects_nonfinite_baseline_or_output(invalid: float) -> None:
+    base = {"vectors": [[0.1, 0.5]]}
+    a, b = {"vectors": [[0.1, 0.6]]}, {"vectors": [[0.1, 0.7]]}
+    invalid_result = {"vectors": [[0.1, invalid]]}
+    with pytest.raises(AssertionError, match="non-finite"):
+        embedding_delta(base, invalid_result)
+    with pytest.raises(AssertionError, match="non-finite"):
+        check_effect("embedding", base, a, b, base, invalid_result)
+    with pytest.raises(AssertionError, match="non-finite"):
+        check_effect("embedding", base, a, b, invalid_result, base)
+
+
+@pytest.mark.parametrize("vectors", [[], [[0.1]], [[0.1, 0.5], [0.1, 0.5]]])
+def test_embedding_comparison_rejects_empty_or_broadcastable_shape_mismatch(vectors: list) -> None:
+    with pytest.raises(AssertionError, match="shapes differ or are empty"):
+        embedding_delta({"vectors": [[0.1, 0.5]]}, {"vectors": vectors})
+
+
+def test_embedding_probe_chooses_warm_reference_before_adapter_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selections = []
+    ready = ["pin"]
+    model = MODELS["embedding"][0]
+    process = SimpleNamespace(pid=123, returncode=None)
+    process.poll = lambda: process.returncode
+
+    class FakeClient:
+        def __init__(self, *args):
+            self.sdk = self
+            self.responses = []
+
+        def call(self, kind, name, selection, route):
+            assert kind == "embedding"
+            assert name == model
+            if selection == "undeclared":
+                raise RequestError("undeclared", "INVALID_INPUT", 400)
+            selections.append(selection)
+            if selection is None:
+                return {"vectors": [[0.48 if len(selections) == 1 else 0.5]]}
+            if selection not in ready:
+                self.responses.append({"selection": selection, "status": 503, "code": "LORA_LOADING"})
+                ready.append(selection)
+                if len(ready) > 3:
+                    del ready[1]
+            return {"vectors": [[0.6 if selection == "a" else 0.7]]}
+
+        def list_models(self):
+            return [{"name": model, "lora_adapters": list(ready)}]
+
+        def close(self):
+            pass
+
+    async def unload(name):
+        assert name == model
+        process.returncode = 0
+
+    monkeypatch.setattr(probe, "Client", FakeClient)
+    registry = SimpleNamespace(get=lambda name: SimpleNamespace(_process=process), unload_async=unload)
+    result = asyncio.run(
+        probe.run_model("embedding", registry, "http://unused", Evidence(tmp_path), tmp_path / "trace")
+    )
+    assert selections[:5] == [None, None, None, "a", "b"]
+    assert result["passed"] is True
+    assert result["effects"]["baseline_max_abs"] == result["effects"]["base_reset_max_abs"] == 0
+    rows = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    baseline = next(row for row in rows if row["event"] == "baseline_comparison")
+    assert baseline["first_vs_warm_max_abs"] == pytest.approx(0.02)
+    assert baseline["warm_repeat_max_abs"] == 0
 
 
 def test_effect_checks_require_delta_beyond_observed_numeric_drift() -> None:

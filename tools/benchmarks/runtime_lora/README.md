@@ -41,17 +41,20 @@ The acceptance run checks:
   refusal, so the probe records and makes bounded fresh SDK calls only for
   pre-execution `503 LORA_LOADING`; it never retries a failed open stream.
 - Adapter effects in native/chat token log probabilities and embedding vectors;
-  base restoration after switching and after eviction. Generation records a
+  base restoration after switching and after eviction. Both engines record a
   first response and two warm baseline repeats before any runtime selection.
-  Restored warm text must match exactly. At every matching token context, chosen
-  and shared top-token probability drift must stay below the fixed `1e-3` bound.
+  For generation, restored warm text must match exactly. At every matching token
+  context, chosen and shared top-token probability drift must stay below the fixed `1e-3` bound.
   Top-k support changes are recorded: absent tokens have probability bounded by
   the other top-k cutoff, and conservative difference lower bounds also must stay
   below `1e-3`. Unreported tail probabilities remain unmeasured; small lower bounds
   do not establish upper bounds on their drift. First-token
   pairwise selection effects must exceed `1e-4` and five times baseline/reset
-  first-token drift. Embeddings retain fixed `1e-5` effect and `5e-5` reset bounds.
-  All full text and token probabilities are retained, including cold/warm
+  first-token drift. Embeddings compare raw SDK vectors without extra
+  normalization: warm-repeat and reset maximum absolute error must stay below
+  `5e-5`, while all pairwise selection effects must exceed `1e-5` and five times
+  the larger warm-repeat/reset error. Non-finite vectors and shape changes fail.
+  All full text, vectors, and token probabilities are retained, including cold/warm
   differences. Native streaming also probes one token after a fixed common
   prefix where an earlier run diverged; this holds context constant when
   comparing base/A/B/reset. These fixtures establish selection, not quality.

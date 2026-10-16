@@ -43,6 +43,7 @@ PROMPT = "The sky appears blue because"
 BOUNDARY_PROMPT = PROMPT + " of the reflection of light. This is an example of"
 TEXTS = ["A red fox walks through the forest.", "Neural networks encode text as vectors."]
 MAX_RESIDENT = 3
+EMBEDDING_ARRAY_NDIM = 2
 MIN_EMBEDDING_EFFECT = 1e-5
 MAX_EMBEDDING_RESET_ERROR = 5e-5
 MIN_PROBABILITY_EFFECT = 1e-4
@@ -298,6 +299,17 @@ def sequence_comparison(left: dict[str, Any], right: dict[str, Any]) -> dict[str
     }
 
 
+def embedding_delta(left: dict[str, Any], right: dict[str, Any]) -> float:
+    """Compare raw SDK vectors without normalizing away output differences."""
+    a, b = (np.asarray(value["vectors"], dtype=np.float64) for value in (left, right))
+    require(
+        a.ndim == b.ndim == EMBEDDING_ARRAY_NDIM and a.shape == b.shape and a.size > 0,
+        "embedding shapes differ or are empty",
+    )
+    require(np.isfinite(a).all() and np.isfinite(b).all(), "non-finite embedding")
+    return float(np.max(np.abs(a - b)))
+
+
 def check_effect(
     kind: str,
     base: dict[str, Any],
@@ -306,27 +318,25 @@ def check_effect(
     restored: dict[str, Any],
     baseline_repeat: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    baseline = baseline_repeat if baseline_repeat is not None else base
     if kind == "embedding":
-        vectors = [np.asarray(value["vectors"], dtype=np.float64) for value in (base, a, b, restored)]
-        require(all(np.isfinite(value).all() for value in vectors), "non-finite embedding")
-        ab, aa, bb = (
-            float(np.max(np.abs(x - y)))
-            for x, y in ((vectors[1], vectors[2]), (vectors[0], vectors[1]), (vectors[0], vectors[2]))
-        )
-        reset = float(np.max(np.abs(vectors[0] - vectors[3])))
+        ab, aa, bb = (embedding_delta(x, y) for x, y in ((a, b), (base, a), (base, b)))
+        baseline_drift = embedding_delta(base, baseline)
+        reset = embedding_delta(base, restored)
+        require(baseline_drift < MAX_EMBEDDING_RESET_ERROR, "warm embedding baseline was not stable")
         require(reset < MAX_EMBEDDING_RESET_ERROR, "base embeddings were not restored")
-        minimum = max(MIN_EMBEDDING_EFFECT, EFFECT_DRIFT_MULTIPLIER * reset)
+        minimum = max(MIN_EMBEDDING_EFFECT, EFFECT_DRIFT_MULTIPLIER * max(reset, baseline_drift))
         require(min(ab, aa, bb) > minimum, "LoRA embeddings did not differ beyond base drift from base and each other")
         return {
             "a_vs_b_max_abs": ab,
             "a_vs_base_max_abs": aa,
             "b_vs_base_max_abs": bb,
             "base_reset_max_abs": reset,
+            "baseline_max_abs": baseline_drift,
             "required_effect_minimum": minimum,
         }
     aa, bb, ab = (distribution_delta(x, y) for x, y in ((base, a), (base, b), (a, b)))
     reset = distribution_delta(base, restored)
-    baseline = baseline_repeat if baseline_repeat is not None else base
     baseline_drift = distribution_delta(base, baseline)
     repeat_comparison = sequence_comparison(base, baseline)
     reset_comparison = sequence_comparison(base, restored)
@@ -516,7 +526,17 @@ async def run_model(kind: str, registry: Any, url: str, evidence: Evidence, trac
             raise AssertionError("undeclared adapter was accepted")
         native: dict[str, dict[str, dict[str, Any]]] = {}
         baseline_repeat = None
-        if kind == "generation":
+        if kind == "embedding":
+            baseline_repeat = await call(None, "embedding_base_warm_1")
+            warm = await call(None, "embedding_base_warm_2")
+            evidence.emit(
+                "baseline_comparison",
+                route="embedding",
+                first_vs_warm_max_abs=embedding_delta(base, warm),
+                warm_repeat_max_abs=embedding_delta(baseline_repeat, warm),
+            )
+            base = warm
+        else:
             baseline_repeat = await call(None, "chat_base_warm_1")
             warm = await call(None, "chat_base_warm_2")
             evidence.emit(
