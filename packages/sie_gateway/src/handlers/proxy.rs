@@ -41,7 +41,7 @@ use crate::state::worker_registry::{QueueRoute, WorkerRegistry};
 use crate::types::model::FallbackTrigger;
 use crate::types::AuditEntry;
 
-use crate::middleware::auth::{extract_bearer_token, mask_token};
+use crate::middleware::auth::request_token_id;
 
 use super::serving_disclosure::{
     remote_forbidden, DeferredFallbackFinish, FallbackAttempt, ServingDisclosure,
@@ -3895,9 +3895,7 @@ async fn proxy_request_inner(
         }
     };
 
-    let token_id = extract_bearer_token(req.headers())
-        .map(|t| mask_token(&t))
-        .unwrap_or_default();
+    let token_id = request_token_id(req.headers());
     let content_length = req
         .headers()
         .get("content-length")
@@ -9256,9 +9254,7 @@ async fn resolve_generation_route(
         }
     }
 
-    let token_id = extract_bearer_token(hdr)
-        .map(|t| mask_token(&t))
-        .unwrap_or_default();
+    let token_id = request_token_id(hdr);
     let content_length = hdr
         .get("content-length")
         .and_then(|v| v.to_str().ok())
@@ -12245,6 +12241,7 @@ pub(crate) fn is_openai_compat_forwarded_header(name: &str) -> bool {
 pub(crate) fn is_openai_compat_inner_request_header(name: &str) -> bool {
     [
         "authorization",
+        "x-api-key",
         "x-sie-machine-profile",
         "x-sie-pool",
         "x-sie-engine",
@@ -23376,6 +23373,7 @@ mod tests {
         // path — every other endpoint injects queue trace context).
         for name in [
             "authorization",
+            "x-api-key",
             "x-sie-machine-profile",
             "x-sie-pool",
             "x-sie-engine",
