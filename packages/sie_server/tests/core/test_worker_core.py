@@ -658,6 +658,63 @@ class TestModelWorker:
             await worker.stop()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("warmup", [False, True])
+    async def test_ready_submissions_join_the_idle_head(self, mock_adapter: MagicMock, warmup: bool) -> None:
+        """A runnable submit joins the head without adding a fixed idle delay."""
+        call_sizes: list[int] = []
+
+        def counting_encode(items, output_types, **kwargs):
+            call_sizes.append(len(items))
+            return EncodeOutput(
+                dense=np.array([[0.1, 0.2, 0.3]] * len(items)),
+                batch_size=len(items),
+            )
+
+        mock_adapter.encode.side_effect = counting_encode
+        worker = ModelWorker(
+            mock_adapter,
+            WorkerConfig(
+                max_batch_tokens=1000,
+                max_batch_requests=64,
+                max_batch_wait_ms=500,
+                coalesce_ms=400,
+                coalesce_ratio=1.0,
+                idle_coalesce_ms=3,
+            ),
+        )
+        await worker.start()
+
+        async def submit_ready():
+            return await worker.submit(
+                [make_text_item([1, 2], 0)],
+                [Item(text="second")],
+                ["dense"],
+            )
+
+        try:
+            if warmup:
+                warmed = await worker.submit(
+                    [make_text_item([1, 2], 0)],
+                    [Item(text="warmup")],
+                    ["dense"],
+                )
+                await asyncio.wait_for(warmed, timeout=2.0)
+                call_sizes.clear()
+
+            first = await worker.submit(
+                [make_text_item([1, 2], 0)],
+                [Item(text="first")],
+                ["dense"],
+            )
+            # The process loop is already runnable ahead of this submit. Both
+            # are ready before this task suspends; no timed arrival is required.
+            second = await asyncio.create_task(submit_ready())
+            await asyncio.wait_for(asyncio.gather(first, second), timeout=2.0)
+            assert call_sizes == [2]
+        finally:
+            await worker.stop()
+
+    @pytest.mark.asyncio
     async def test_already_queued_burst_fuses(self, mock_adapter: MagicMock) -> None:
         """Several items already pending when an idle worker selects still fuse.
 

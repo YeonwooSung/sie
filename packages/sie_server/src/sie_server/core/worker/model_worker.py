@@ -1093,7 +1093,9 @@ class ModelWorker:
 
         When the worker was idle, one pending request is dispatched immediately
         (#373), however many items it carries. It is not held for
-        ``idle_coalesce_ms``. A follow-up is a tail only while another request
+        ``idle_coalesce_ms``. A lone head yields one event-loop turn so already
+        runnable submissions can join it, without waiting for a timer. A
+        follow-up is a tail only while another request
         on that same batcher is still pending (arrived and not yet dispatched);
         the idle window can then catch a straggler. A finished request is no
         longer pending, so it does not hold the next one, and another LoRA's
@@ -1133,6 +1135,13 @@ class ModelWorker:
                 selected_lora = oldest_lora if oldest_lora is not None else None
                 selected = self._batchers[selected_lora]
                 idle_window_ms = self._config.idle_coalesce_ms
+                if was_idle and idle_window_ms > 0 and selected.pending_request_count == 1:
+                    # Let submissions already runnable on this loop join the
+                    # head before deciding whether it is a lone request. This
+                    # yields once without waiting for a timer or later arrival.
+                    await asyncio.sleep(0)
+                    if not self._running:
+                        return None, FormattedBatch(items=[], metadata=[], total_cost=0), was_idle
                 # Alone is one request, not one item: ``submit_many`` queues
                 # an entry per item. The distinct-request count is only the
                 # idle tail check. A busy worker, and ``idle_coalesce_ms=0``,
