@@ -82,7 +82,7 @@ class RequestProbe:
         self.request_started = started
         error = None
         try:
-            kwargs = {
+            kwargs: dict[str, Any] = {
                 "temperature": 0.0,
                 "wait_for_capacity": warm,
                 "max_oom_retries": 0,
@@ -350,12 +350,24 @@ async def run(args: argparse.Namespace, evidence: Evidence) -> bool:
             await asyncio.gather(recovery_task, return_exceptions=True)
         for client in clients:
             client.close()
-        for child in psutil.Process(os.getpid()).children(recursive=True):
+        inspection_errors: list[dict[str, Any]] = []
+        try:
+            children = psutil.Process(os.getpid()).children(recursive=True)
+        except psutil.Error as exc:
+            children = []
+            inspection_errors.append({"stage": "enumerate", "error_type": type(exc).__name__})
+        for child in children:
             try:
                 child_identities.add((child.pid, child.create_time()))
             except psutil.NoSuchProcess:
                 pass
-        evidence.emit("before_shutdown", tracked_child_pids=sorted(pid for pid, _ in child_identities))
+            except psutil.Error as exc:
+                inspection_errors.append({"stage": "identity", "pid": child.pid, "error_type": type(exc).__name__})
+        evidence.emit(
+            "before_shutdown",
+            tracked_child_pids=sorted(pid for pid, _ in child_identities),
+            inspection_errors=inspection_errors,
+        )
         server.should_exit = True
         try:
             await asyncio.wait_for(asyncio.shield(serve_task), timeout=90)
@@ -367,7 +379,7 @@ async def run(args: argparse.Namespace, evidence: Evidence) -> bool:
                         alive.append(pid)
                 except psutil.NoSuchProcess:
                     pass
-            cleanup_ok = not alive and (registry is None or not registry.loaded_model_names)
+            cleanup_ok = not inspection_errors and not alive and (registry is None or not registry.loaded_model_names)
             evidence.emit(
                 "cleanup",
                 okay=cleanup_ok,
