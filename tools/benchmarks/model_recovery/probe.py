@@ -366,7 +366,7 @@ async def run(args: argparse.Namespace, evidence: Evidence) -> bool:
         evidence.emit(
             "before_shutdown",
             tracked_child_pids=sorted(pid for pid, _ in child_identities),
-            inspection_errors=inspection_errors,
+            inspection_errors=list(inspection_errors),
         )
         server.should_exit = True
         try:
@@ -379,11 +379,14 @@ async def run(args: argparse.Namespace, evidence: Evidence) -> bool:
                         alive.append(pid)
                 except psutil.NoSuchProcess:
                     pass
+                except psutil.Error as exc:
+                    inspection_errors.append({"stage": "liveness", "pid": pid, "error_type": type(exc).__name__})
             cleanup_ok = not inspection_errors and not alive and (registry is None or not registry.loaded_model_names)
             evidence.emit(
                 "cleanup",
                 okay=cleanup_ok,
                 owned_children_alive=alive,
+                inspection_errors=list(inspection_errors),
                 state=snapshot(registry) if registry is not None else None,
             )
         except Exception as exc:  # noqa: BLE001 - Keep cleanup failure evidence even when shutdown raises.
