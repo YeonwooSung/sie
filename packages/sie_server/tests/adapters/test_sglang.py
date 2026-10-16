@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
-from sie_server.adapters.sglang import _server
+from sie_server.adapters.sglang import _memory, _server
 from sie_server.adapters.sglang._server import STARTUP_TIMEOUT_S as _STARTUP_TIMEOUT_S
 from sie_server.adapters.sglang._server import parse_device_index
 from sie_server.adapters.sglang.embedding import SGLangEmbeddingAdapter
@@ -1130,3 +1130,10 @@ class TestEmbeddingGroupLaunch:
     def test_a_declared_collective_port_at_width_one_is_refused(self) -> None:
         with pytest.raises(ValueError, match="nccl_port applies only above"):
             SGLangEmbeddingAdapter(model_name_or_path="Qwen/Qwen3-Embedding-8B", nccl_port=30499)
+
+
+@pytest.fixture(autouse=True)
+def mock_memory_hardware(monkeypatch):
+    """Launch lifecycle tests use synthetic weight metadata and CUDA capacity."""
+    monkeypatch.setattr(_memory, "device_memory", lambda _: (80 * _memory.GIB, 80 * _memory.GIB))
+    monkeypatch.setattr(_memory.SGLangMemoryBudget, "static_bytes", 8 * _memory.GIB)

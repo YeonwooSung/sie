@@ -32,7 +32,7 @@ from sie_server.adapters._generation_base import (
     suppress_thinking_blocks,
 )
 from sie_server.adapters._types import ERR_NOT_LOADED
-from sie_server.adapters.sglang import _server
+from sie_server.adapters.sglang import _memory, _server
 from sie_server.adapters.sglang import generation as generation_module
 from sie_server.adapters.sglang.cuda13 import SGLangCuda13Adapter, SGLangStrictThinkingAdapter
 from sie_server.adapters.sglang.gemma import SGLangGemmaAdapter
@@ -4189,3 +4189,10 @@ def test_reasoning_control_tokens_must_be_single_tokens() -> None:
         generation_module._reasoning_control_token_ids(
             "org/model", revision=None, trust_remote_code=False, reasoning_format="qwen3"
         )
+
+
+@pytest.fixture(autouse=True)
+def mock_memory_hardware(monkeypatch):
+    """Launch lifecycle tests use synthetic weight metadata and CUDA capacity."""
+    monkeypatch.setattr(_memory, "device_memory", lambda _: (80 * _memory.GIB, 80 * _memory.GIB))
+    monkeypatch.setattr(_memory.SGLangMemoryBudget, "static_bytes", 8 * _memory.GIB)

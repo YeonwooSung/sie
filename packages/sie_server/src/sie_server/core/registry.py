@@ -1123,17 +1123,14 @@ class ModelRegistry:
         against memory this model already holds, and the eviction that would
         have prevented the collision never fires.
 
-        The estimate is divided across members because sharding divides the
-        weights, so the total across the group is the figure a single-device
-        load of the same model would have registered, to within the truncation
-        of an integer division.
+        The adapter reports a group-wide estimate, which is divided across
+        members. SGLang's explicit-fraction budget is per device, so its adapter
+        multiplies by the group width before reporting it.
 
-        For the engine this work exists for that figure is zero by design: the
-        SGLang adapter reports no footprint because its child allocates in a
-        subprocess, and the registry reads the device instead. So the division
-        matters only for adapters that do report one. What matters on every
-        adapter is the registration itself, which is what placement scoring,
-        the eviction order and the group-free check all read.
+        SGLang reports its reservation across the full group because its child
+        processes own the allocations. Device pressure still comes from actual
+        free memory. Registration also feeds placement scoring, the eviction
+        order and the group-free check.
         """
         members = self._claimed_members(name) or [loaded.device]
         share = loaded.memory_bytes // len(members) if loaded.memory_bytes else 0
