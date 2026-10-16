@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod config_api;
+pub mod decisions;
 pub mod grammar;
 pub mod health;
 pub mod messages;

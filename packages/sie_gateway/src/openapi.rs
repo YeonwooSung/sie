@@ -55,6 +55,7 @@ static OPENAPI_JSON: LazyLock<String> = LazyLock::new(|| {
         crate::handlers::proxy::proxy_rerank,
         crate::handlers::proxy::proxy_rerank_v2,
         crate::handlers::systemone::proxy_systemone,
+        crate::handlers::decisions::proxy_decisions,
         crate::handlers::proxy::proxy_score,
         crate::handlers::proxy::proxy_extract,
         crate::handlers::proxy::proxy_generate,
@@ -177,6 +178,9 @@ static OPENAPI_JSON: LazyLock<String> = LazyLock::new(|| {
         SystemOneRequest,
         SystemOneResponse,
         SystemOneUsage,
+        DecisionRequest,
+        DecisionResponse,
+        DecisionUsage,
         ScoreUsage,
         ScoreEntry,
         crate::handlers::config_api::ResolveRequest,
@@ -1455,6 +1459,7 @@ fn inject_remote_control_header(paths: &mut serde_json::Map<String, Value>) {
         "/v1/chat/completions",
         "/v1/completions",
         "/v1/responses",
+        "/v1/decisions",
         "/v1/messages",
         "/v1/audio/transcriptions",
     ] {
@@ -1559,6 +1564,7 @@ fn inject_inference_response_headers(paths: &mut serde_json::Map<String, Value>)
         "/v1/chat/completions",
         "/v1/completions",
         "/v1/responses",
+        "/v1/decisions",
         "/v1/messages",
     ] {
         let Some(responses) = paths
@@ -3176,6 +3182,49 @@ pub struct SystemOneResponse {
     pub usage: SystemOneUsage,
 }
 
+/// OpenAI-compatible text decisions. Unsupported fields are rejected.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionRequest {
+    /// SIE decision model id, e.g. `fastino/GLiNER2.5-Decide`.
+    pub model: String,
+    /// A text string or 1 to 4096 text-only messages. Roles: user, developer,
+    /// system, assistant. User/developer/system parts use input_text; assistant
+    /// parts use output_text or refusal. Images, tools, and cache fields fail.
+    pub input: Value,
+    /// Ordered predicate, choice, or score questions with required instructions
+    /// and optional name. Choices contain 2 to 255 unique string/boolean values;
+    /// score levels contain 1 to 10 labels. Both accept optional descriptions.
+    #[schema(min_items = 1, max_items = 200)]
+    pub questions: Vec<Value>,
+    /// Caller-provided identifier; never used as authenticated identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 128)]
+    pub safety_identifier: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct DecisionUsage {
+    pub input_tokens: u64,
+    /// cached_tokens and cache_write_tokens, both zero.
+    pub input_tokens_details: std::collections::BTreeMap<String, u64>,
+    /// Decision models generate no tokens.
+    pub output_tokens: u64,
+    /// reasoning_tokens, always zero.
+    pub output_tokens_details: std::collections::BTreeMap<String, u64>,
+    pub total_tokens: u64,
+}
+
+/// Ordered OpenAI-style answers retaining boolean/string choice identities.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct DecisionResponse {
+    pub model: String,
+    /// One predicate, choice, score, or refusal answer per question. Names are
+    /// echoed, including null for unnamed questions and repeated names.
+    pub answers: Vec<Value>,
+    pub usage: DecisionUsage,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RerankRequest {
@@ -3987,6 +4036,7 @@ mod tests {
             ("/v1/rerank", &["post"][..]),
             ("/v2/rerank", &["post"][..]),
             ("/v1/systemone", &["post"][..]),
+            ("/v1/decisions", &["post"][..]),
             ("/ws/cluster-status", &["get"][..]),
             ("/v1/encode/{model}", &["post"][..]),
             ("/v1/score/{model}", &["post"][..]),
@@ -4007,6 +4057,43 @@ mod tests {
             let expected_methods: std::collections::BTreeSet<_> = methods.iter().copied().collect();
             assert_eq!(actual_methods, expected_methods, "{path} methods differ");
         }
+    }
+
+    #[test]
+    fn decisions_contract_documents_bounds_and_routing_headers() {
+        let spec = serde_json::to_value(openapi_document()).unwrap();
+        let operation = &spec["paths"]["/v1/decisions"]["post"];
+        assert_eq!(
+            operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/DecisionRequest"
+        );
+        let request = &spec["components"]["schemas"]["DecisionRequest"];
+        assert_eq!(request["additionalProperties"], false);
+        assert_eq!(request["properties"]["questions"]["minItems"], 1);
+        assert_eq!(request["properties"]["questions"]["maxItems"], 200);
+        assert_eq!(request["properties"]["safety_identifier"]["maxLength"], 128);
+        for status in ["400", "404", "413", "500", "502", "503"] {
+            assert_eq!(
+                operation["responses"][status]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/OpenAIErrorEnvelope"
+            );
+        }
+        let exported: Value = serde_json::from_str(&OPENAPI_JSON).unwrap();
+        let operation = &exported["paths"]["/v1/decisions"]["post"];
+        assert!(operation["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|parameter| {
+                parameter["name"] == "X-SIE-Remote"
+                    && parameter["schema"]["enum"] == json!(["forbid"])
+            }));
+        assert!(operation["responses"]["200"]["headers"]
+            .get("X-SIE-Request-Id")
+            .is_some());
+        assert!(operation["responses"]["503"]["headers"]
+            .get("Retry-After")
+            .is_some());
     }
 
     #[test]

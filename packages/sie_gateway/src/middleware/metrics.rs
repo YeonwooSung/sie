@@ -340,7 +340,10 @@ fn classify_endpoint(path: &str) -> Option<&'static str> {
         Some("embeddings")
     } else if path == "/v1/moderations" {
         Some("moderations")
-    } else if matches!(path, "/v1/audio/transcriptions" | "/v1/systemone") {
+    } else if matches!(
+        path,
+        "/v1/audio/transcriptions" | "/v1/systemone" | "/v1/decisions"
+    ) {
         Some("extract")
     } else {
         None
@@ -902,6 +905,8 @@ mod tests {
         );
         assert_eq!(classify_endpoint("/v1/systemone"), Some("extract"));
         assert_eq!(classify_endpoint("/v1/systemone/extra"), None);
+        assert_eq!(classify_endpoint("/v1/decisions"), Some("extract"));
+        assert_eq!(classify_endpoint("/v1/decisions/extra"), None);
         assert_eq!(classify_endpoint("/health"), None);
         assert_eq!(classify_endpoint("/healthz"), None);
         assert_eq!(classify_endpoint("/readyz"), None);
