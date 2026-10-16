@@ -12,6 +12,7 @@ import json
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -63,7 +64,7 @@ def _systemone(body: dict[str, Any], authorization: str | None) -> tuple[int, di
     answers = {qid: _answer(question) for qid, question in questions.items()}
     if KNOBS.get("drop_answer"):
         answers.popitem()
-    tokens: Any = 12.0 if KNOBS.get("float_tokens") else 12
+    tokens: Any = KNOBS.get("input_tokens", 12.0 if KNOBS.get("float_tokens") else 12)
     return 200, {"model": MODEL, "answers": answers, "usage": {"input_tokens": tokens, "output_tokens": 0}}
 
 
@@ -150,3 +151,20 @@ def test_report_lists_every_case(server: str) -> None:
     results = conformance.run()
     text = conformance.report(results)
     assert text.splitlines()[-1] == f"{len(results)}/{len(results)} passed"
+
+
+@pytest.mark.parametrize("gateway", [False, True])
+@pytest.mark.parametrize("tokens", [None, -1, 0, 12])
+def test_envelope_requires_explicit_gateway_for_zero_usage(server: str, gateway: bool, tokens: int | None) -> None:
+    KNOBS["input_tokens"] = tokens
+    assert _verdicts(gateway=gateway)["envelope"] is (tokens is not None and tokens >= (0 if gateway else 1))
+
+
+def test_gateway_flag_is_explicit_and_recorded(server: str, tmp_path: Path) -> None:
+    KNOBS["input_tokens"] = 0
+    assert conformance.main([]) == 1
+    output = tmp_path / "gateway.json"
+    assert conformance.main(["--gateway", "--json", str(output)]) == 0
+    payload = json.loads(output.read_text())
+    assert payload["gateway"] is True
+    assert all(case["passed"] for case in payload["cases"])

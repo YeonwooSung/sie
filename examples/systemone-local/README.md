@@ -60,8 +60,13 @@ Use the same three variables with the Serverless endpoint and your SIE key:
 export TYPESAFE_BASE_URL=<your SIE Serverless URL>
 export TYPESAFE_DEFAULT_MODEL=fastino/GLiNER2.5-Decide
 export TYPESAFE_API_KEY=$SIE_API_KEY
-uv run conformance.py --check-auth
+uv run conformance.py --gateway --check-auth
 ```
+
+`--gateway` allows the gateway's current `usage.input_tokens=0` placeholder
+until native extract usage is available. Without it, the checker requires a
+positive input-token count from a direct server. `--check-auth` separately
+checks that an invalid key is refused.
 
 A Serverless model that has gone cold takes minutes to load. SIE answers
 `503` with a `Retry-After` of at most 60 seconds while it loads, and the

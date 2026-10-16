@@ -2993,6 +2993,8 @@ impl ModelRegistry {
             && config.tasks.is_none()
             && config.max_sequence_length.is_none()
             && config.hf_revision.is_none()
+            && config.description.is_none()
+            && config.release_date.is_none()
             && !touches_profiles
         {
             return;
@@ -3001,6 +3003,12 @@ impl ModelRegistry {
         let refreshed = ModelInfoExtras::from_model_config(config);
         if config.hf_revision.is_some() {
             existing.revision = refreshed.revision;
+        }
+        if config.description.is_some() {
+            existing.description = refreshed.description;
+        }
+        if config.release_date.is_some() {
+            existing.release_date = refreshed.release_date;
         }
         if config.inputs.is_some() {
             existing.inputs = refreshed.inputs;
@@ -5751,6 +5759,108 @@ encode:
         assert_eq!(refreshed.info_extras.outputs, vec!["sparse"]);
         assert_eq!(refreshed.info_extras.dims["sparse"], 30000);
         assert_eq!(refreshed.info_extras.max_sequence_length, Some(1024));
+    }
+
+    #[test]
+    fn test_model_metadata_delta_refreshes_base_and_profile_variants() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            "name: default\npriority: 10\nadapters:\n  - module\n",
+        )
+        .unwrap();
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+        let initial: ModelConfig = serde_json::from_value(serde_json::json!({
+            "name": "test/model",
+            "description": "Original description",
+            "release_date": "2026-09-24",
+            "max_sequence_length": 512,
+            "tasks": {"encode": {"dense": {"dim": 384}}},
+            "profiles": {
+                "default": {"adapter_path": "module:Adapter", "max_batch_tokens": 4096},
+                "alt": {"adapter_path": "module:Adapter", "max_batch_tokens": 2048}
+            }
+        }))
+        .unwrap();
+        registry.add_model_config(initial).unwrap();
+
+        for (metadata, description, release_date) in [
+            (
+                serde_json::json!({"description": "Updated description"}),
+                "Updated description",
+                "2026-09-24",
+            ),
+            (
+                serde_json::json!({"release_date": "2026-10-16"}),
+                "Updated description",
+                "2026-10-16",
+            ),
+            (serde_json::json!({}), "Updated description", "2026-10-16"),
+            (
+                serde_json::json!({"description": "", "release_date": ""}),
+                "",
+                "",
+            ),
+        ] {
+            let mut delta = serde_json::json!({
+                "name": "test/model",
+                "profiles": {"default": {"adapter_path": "module:Adapter", "max_batch_tokens": 4096}}
+            });
+            delta
+                .as_object_mut()
+                .unwrap()
+                .extend(metadata.as_object().unwrap().clone());
+            registry
+                .add_model_config(serde_json::from_value(delta).unwrap())
+                .unwrap();
+
+            for name in ["test/model", "test/model:alt"] {
+                let info = registry.get_model_info(name).unwrap();
+                assert_eq!(info.info_extras.description.as_deref(), Some(description));
+                assert_eq!(info.info_extras.release_date.as_deref(), Some(release_date));
+                assert_eq!(info.info_extras.outputs, vec!["dense"]);
+                assert_eq!(info.info_extras.dims["dense"], 384);
+                assert_eq!(info.info_extras.max_sequence_length, Some(512));
+            }
+        }
+    }
+
+    #[test]
+    fn test_model_metadata_only_merge_preserves_omitted_fields() {
+        let initial: ModelConfig = serde_json::from_value(serde_json::json!({
+            "name": "test/model",
+            "description": "Original description",
+            "release_date": "2026-09-24",
+            "max_sequence_length": 512
+        }))
+        .unwrap();
+        let mut extras = ModelInfoExtras::from_model_config(&initial);
+        for (metadata, description, release_date) in [
+            (
+                serde_json::json!({"description": "Updated description"}),
+                "Updated description",
+                "2026-09-24",
+            ),
+            (
+                serde_json::json!({"release_date": "2026-10-16"}),
+                "Updated description",
+                "2026-10-16",
+            ),
+        ] {
+            let mut delta = serde_json::json!({"name": "test/model"});
+            delta
+                .as_object_mut()
+                .unwrap()
+                .extend(metadata.as_object().unwrap().clone());
+            ModelRegistry::merge_model_info_extras(
+                &mut extras,
+                &serde_json::from_value(delta).unwrap(),
+                &HashMap::new(),
+            );
+            assert_eq!(extras.description.as_deref(), Some(description));
+            assert_eq!(extras.release_date.as_deref(), Some(release_date));
+            assert_eq!(extras.max_sequence_length, Some(512));
+        }
     }
 
     #[test]

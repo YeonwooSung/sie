@@ -10,10 +10,12 @@ case fails.
     TYPESAFE_BASE_URL=http://localhost:8080 \\
     TYPESAFE_DEFAULT_MODEL=fastino/GLiNER2.5-Decide \\
     TYPESAFE_API_KEY=local \\
-    uv run conformance.py [--check-auth] [--json results.json]
+    uv run conformance.py [--gateway] [--check-auth] [--json results.json]
 
 ``--check-auth`` adds the bad-key case, for a deployment that checks keys
 (a cluster gateway or SIE Serverless); a local ``sie-server`` checks none.
+``--gateway`` accepts its current zero input-token usage placeholder. Direct
+server checks require a positive input-token count.
 """
 
 from __future__ import annotations
@@ -134,10 +136,13 @@ def case_extra_body(client: TypeSafeClient, model: str) -> str:
     return "unknown request fields ignored"
 
 
-def case_envelope(client: TypeSafeClient, model: str) -> str:
+def case_envelope(client: TypeSafeClient, model: str, *, gateway: bool = False) -> str:
     response = client.system_one(state=TICKET, questions={"spam": Noul(instructions="Is this spam?")})
     assert response.model == model, response.model
-    assert response.usage.input_tokens is not None and response.usage.input_tokens > 0, response.usage
+    minimum_input_tokens = 0 if gateway else 1
+    assert response.usage.input_tokens is not None and response.usage.input_tokens >= minimum_input_tokens, (
+        response.usage
+    )
     assert response.usage.output_tokens == 0, response.usage
     return f"model={response.model} input_tokens={response.usage.input_tokens}"
 
@@ -213,7 +218,7 @@ CASES: list[Callable[[TypeSafeClient, str], str]] = [
 ]
 
 
-def run(*, check_auth: bool = False) -> list[Case]:
+def run(*, check_auth: bool = False, gateway: bool = False) -> list[Case]:
     model = os.environ.get("TYPESAFE_DEFAULT_MODEL", "")
     if not model:
         raise SystemExit("Set TYPESAFE_DEFAULT_MODEL to an SIE decision model, e.g. fastino/GLiNER2.5-Decide")
@@ -223,7 +228,8 @@ def run(*, check_auth: bool = False) -> list[Case]:
         for case in cases:
             name = case.__name__.removeprefix("case_")
             try:
-                results.append(Case(name, True, case(client, model)))
+                detail = case_envelope(client, model, gateway=gateway) if case is case_envelope else case(client, model)
+                results.append(Case(name, True, detail))
             except Exception as error:  # noqa: BLE001 - every failure is reported, not raised
                 results.append(Case(name, False, f"{type(error).__name__}: {error}"))
     return results
@@ -240,14 +246,16 @@ def report(results: list[Case]) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--check-auth", action="store_true", help="also check that a bad key is refused")
+    parser.add_argument("--gateway", action="store_true", help="allow the gateway's zero input-token usage placeholder")
     parser.add_argument("--json", type=Path, help="write the results to this file")
     args = parser.parse_args(argv)
-    results = run(check_auth=args.check_auth)
+    results = run(check_auth=args.check_auth, gateway=args.gateway)
     print(report(results))
     if args.json:
         payload: dict[str, Any] = {
             "base_url": os.environ.get("TYPESAFE_BASE_URL"),
             "model": os.environ.get("TYPESAFE_DEFAULT_MODEL"),
+            "gateway": args.gateway,
             "cases": [asdict(result) for result in results],
         }
         args.json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
