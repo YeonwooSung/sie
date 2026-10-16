@@ -1157,7 +1157,6 @@ auto-retries; see `packages/sie_sdk/README.md` for client-side controls.
 | `SIE_MAX_BATCH_WAIT_MS` | `15.0` | Initial value for the adaptive first-request batch timeout. At runtime the PI batching controller steers it between `SIE_ADAPTIVE_BATCHING__MIN_WAIT_MS` and `SIE_ADAPTIVE_BATCHING__MAX_WAIT_MS`, so it is a starting point rather than a fixed wait. |
 | `SIE_MAX_CONCURRENT_REQUESTS` | `512` | Per-worker queue size; admission control returns `QUEUE_FULL` above this. |
 | `SIE_MAX_LORAS_PER_MODEL` | `10` | Maximum concurrent LoRA adapters per base model. A request loads or selects only the adapters its selected profile declares. `options.lora` or `options.lora_id` naming any other is rejected with HTTP 400: `INVALID_INPUT` from this server, and `INVALID_REQUEST` from the gateway (code `unknown_lora_adapter` where it answers in the OpenAI error envelope). |
-
 | `SIE_MAX_ITEM_TEXT_BYTES` | `2097152` (2 MiB) | Most bytes of UTF-8 one encode, score, or extract item may carry in its `text` and `metadata` together. A larger item is rejected with `INVALID_INPUT` (HTTP 400) before it is tokenized. Generation prompts are not items and are not affected. |
 
 SGLang generation and embedding profiles can defer declared LoRAs until a
@@ -1188,13 +1187,17 @@ options when changing only a child's preload selection.
 
 Deferred adapters require the maximum rank and target modules at engine launch
 because SGLang allocates its LoRA buffers then. LoRA profiles require an explicit
-memory fraction. The resolved `max_loras_per_model` engine setting (normally
-`SIE_MAX_LORAS_PER_MODEL`) bounds resident adapters, including pinned preloads
+memory fraction. For profiles with deferred adapters, the resolved
+`max_loras_per_model` engine setting (normally `SIE_MAX_LORAS_PER_MODEL`)
+bounds resident adapters, including pinned preloads
 and in-flight loads; `max_loras_per_batch` and the preload count cannot exceed
 it. When full, SIE drains and evicts the least-recently-used unpinned adapter. An
 adapter being loaded or drained retains its slot, and all-pinned/full capacity
 returns a retry response. Unconfirmed attach rollback or unload retains the
 slot and requires a model reload rather than risking unbounded residency.
+Startup-only profiles retain every declared adapter: their effective capacity
+is at least the pinned source count and `max_loras_per_batch`, even when the
+configured runtime limit is lower.
 
 Generation and chat requests select a selected-profile declared name with
 `lora_adapter` (a served alias or its declared source id);

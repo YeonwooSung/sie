@@ -150,11 +150,16 @@ class SGLangLoraManager:
         self.revisions = revisions or {}
         self.preloaded = frozenset(self.aliases[name] for name in (self.aliases if preload is None else preload))
         self.deferred = set(self.aliases.values()) - self.preloaded
-        self.max_loaded = max_loaded if max_loaded is not None else int(os.environ.get("SIE_MAX_LORAS_PER_MODEL", "10"))
-        if isinstance(self.max_loaded, bool) or not isinstance(self.max_loaded, int) or self.max_loaded < 1:
+        configured = max_loaded if max_loaded is not None else int(os.environ.get("SIE_MAX_LORAS_PER_MODEL", "10"))
+        if isinstance(configured, bool) or not isinstance(configured, int) or configured < 1:
             raise ValueError("SIE_MAX_LORAS_PER_MODEL must be positive")
         if isinstance(max_per_batch, bool) or not isinstance(max_per_batch, int) or max_per_batch < 1:
             raise ValueError("max_loras_per_batch must be a positive integer")
+        # Startup-only profiles historically load every declared adapter. The
+        # runtime residency limit must not reject their pinned set or batch size.
+        self.max_loaded = (
+            max(configured, len(self.preloaded), max_per_batch) if self.aliases and not self.deferred else configured
+        )
         if self.aliases and (max_per_batch > self.max_loaded or len(self.preloaded) > self.max_loaded):
             raise ValueError("LoRA batch capacity and preload count must not exceed SIE_MAX_LORAS_PER_MODEL")
         if self.deferred and len(self.preloaded) == self.max_loaded:

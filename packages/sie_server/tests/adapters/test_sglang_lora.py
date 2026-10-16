@@ -18,7 +18,7 @@ from sie_server.adapters.sglang.generation import SGLangGenerationAdapter
 
 def manager(**kwargs):
     return SGLangLoraManager(
-        {"a": "org/a", "b": "org/b"},
+        kwargs.pop("paths", {"a": "org/a", "b": "org/b"}),
         preload=kwargs.pop("preload", []),
         revisions={"org/a": "a" * 40},
         max_rank=8,
@@ -54,6 +54,50 @@ def test_omitted_selector_preloads_and_pins_existing_sources(monkeypatch):
     assert loras.available == ["a", "b"]
     with pytest.raises(ValueError, match="pinned"):
         loras.unload("a")
+
+
+@pytest.mark.parametrize("explicit_preload", [False, True])
+@pytest.mark.parametrize(
+    ("count", "max_per_batch", "configured", "expected"),
+    [(12, 2, None, 12), (2, 16, 3, 16), (2, 2, 1, 2)],
+)
+def test_startup_only_capacity_preserves_all_pinned_sources_and_batch_size(
+    monkeypatch, explicit_preload, count, max_per_batch, configured, expected
+):
+    monkeypatch.setenv("SIE_MAX_LORAS_PER_MODEL", "10")
+    paths = {f"adapter{i}": f"org/adapter{i}" for i in range(count)}
+    loras = manager(
+        paths=paths,
+        preload=list(paths) if explicit_preload else None,
+        max_loaded=configured,
+        max_per_batch=max_per_batch,
+    )
+    monkeypatch.setattr(loras, "fetch", lambda source: "/cache/" + source.rsplit("/", 1)[1])
+    args = loras.launch_args()
+    assert args[args.index("--max-loaded-loras") + 1] == str(expected)
+    assert args[args.index("--max-loras-per-batch") + 1] == str(max_per_batch)
+    assert set(args[args.index("--lora-paths") + 1 :]) == {f"{alias}=/cache/{alias}" for alias in paths}
+    config = loras.runtime_config()
+    assert config.max_loaded == expected
+    assert config.preloaded == config.pinned == frozenset(paths.values())
+
+
+@pytest.mark.parametrize("preload", [[], ["a"]])
+def test_deferred_capacity_remains_configured_even_with_more_declared_sources(preload):
+    paths = {"a": "org/a", "b": "org/b", "c": "org/c", "d": "org/d"}
+    loras = manager(paths=paths, preload=preload, max_loaded=3)
+    assert loras.runtime_config().max_loaded == 3
+    with pytest.raises(ValueError, match="must not exceed"):
+        manager(paths=paths, preload=preload, max_loaded=3, max_per_batch=4)
+    with pytest.raises(ValueError, match="must not exceed"):
+        manager(paths=paths, preload=["a", "b", "c"], max_loaded=2)
+
+
+@pytest.mark.parametrize("field", ["max_loaded", "max_per_batch"])
+@pytest.mark.parametrize("invalid", [True, 0, -1, 1.5, "3"])
+def test_startup_only_capacity_does_not_mask_invalid_limits(field, invalid):
+    with pytest.raises(ValueError, match="positive"):
+        manager(preload=None, **{field: invalid})
 
 
 def test_undeclared_source_never_fetches_or_calls_engine(monkeypatch):
