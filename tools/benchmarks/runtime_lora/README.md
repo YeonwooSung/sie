@@ -5,6 +5,14 @@ one CUDA device. It runs pinned Qwen3-0.6B generation and Qwen3-Embedding-0.6B
 embedding engines sequentially, each with `mem_fraction_static: 0.5`.
 It requires the runtime LoRA implementation and SGLang `0.5.10.post1`.
 
+Both engines receive an explicit `--max-total-tokens 4096` KV pool upper bound. The
+fraction remains the production admission/static-memory setting; it does not
+imply a 4096-token cap when explicitly overridden. Generation uses its supported
+`extra_launch_args` option. Embedding has no such option, so a benchmark-only
+subclass appends the same fixed flag to its memory arguments while preserving
+the production launch and inference paths. CPU tests capture both real launch
+commands and check that only the KV cap differs from the uncapped profile.
+
 The local fixtures are **untrained correctness fixtures**, not useful task
 adapters. Fixed-seed, nonzero rank-4 `q_proj`/`v_proj` weights make incorrect
 selection observable without depending on a mutable Hub adapter. No quality

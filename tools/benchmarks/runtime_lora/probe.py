@@ -33,6 +33,7 @@ from sie_server.app.app_factory import AppFactory
 from sie_server.app.app_state_config import AppStateConfig
 from sie_server.config.model import ModelConfig
 
+from tools.benchmarks.runtime_lora.adapters import KV_CAPACITY, STATIC_MEMORY_FRACTION
 from tools.benchmarks.runtime_lora.fixtures import ALIASES, MODELS, RANK, digest, prepare
 from tools.benchmarks.runtime_lora.observer import TRACE_ENV
 
@@ -393,17 +394,23 @@ def configs(directory: Path, fixtures: Path) -> dict[str, Any]:
         profile["adapter_path"] = (
             f"{Path(__file__).with_name('adapters.py')}:ObservedGenerationAdapter"
             if kind == "generation"
-            else "sie_server.adapters.sglang.embedding:SGLangEmbeddingAdapter"
+            else f"{Path(__file__).with_name('adapters.py')}:CappedEmbeddingAdapter"
         )
         profile["max_batch_tokens"] = 4096
-        profile["kv_budget_tokens"] = 4096
+        profile["kv_budget_tokens"] = KV_CAPACITY
         loadtime = profile.setdefault("adapter_options", {}).setdefault("loadtime", {})
         if kind == "embedding":
             # The catalog's original PyTorch adapter owns the causal option.
             loadtime.pop("causal", None)
+        else:
+            loadtime["extra_launch_args"] = [
+                *loadtime.get("extra_launch_args", []),
+                "--max-total-tokens",
+                str(KV_CAPACITY),
+            ]
         loadtime.update(
             {
-                "mem_fraction_static": 0.5,
+                "mem_fraction_static": STATIC_MEMORY_FRACTION,
                 "max_seq_length": 4096,
                 "lora_paths": {alias: str((fixtures / kind / alias).resolve()) for alias in ALIASES},
                 "preload_loras": ["pin"],

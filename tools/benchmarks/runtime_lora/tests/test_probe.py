@@ -7,6 +7,7 @@ import math
 import os
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -18,6 +19,7 @@ from peft import PeftModel
 from safetensors.torch import load_file
 from sie_sdk._msgpack import packb as pack_msgpack
 from sie_sdk.client.errors import ServerError
+from sie_server.adapters.sglang import _server
 from sie_server.adapters.sglang.embedding import SGLangEmbeddingAdapter
 from sie_server.adapters.sglang.generation import SGLangGenerationAdapter
 from sie_server.config.model import ModelConfig
@@ -120,6 +122,62 @@ def test_generated_config_resolves_validates_and_constructs_without_engine_launc
             assert "causal" not in config.resolve_profile("default").loadtime
     finally:
         adapter._lora.close()
+
+
+@pytest.mark.parametrize("kind", ["generation", "embedding"])
+def test_generated_profiles_only_add_one_kv_cap_to_actual_engine_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    commands = []
+
+    class LaunchCapturedError(Exception):
+        pass
+
+    def capture_command(cmd, **kwargs):
+        commands.append(list(cmd))
+        raise LaunchCapturedError
+
+    monkeypatch.setattr(_server, "find_free_port", lambda *args: 30000)
+    monkeypatch.setattr(_server, "launch_sglang_server", capture_command)
+    directory = tmp_path / "models"
+    generated = configs(directory, tmp_path / "fixtures")[kind]
+    for capped in (False, True):
+        data = deepcopy(generated)
+        profile = data["profiles"]["default"]
+        if not capped:
+            if kind == "generation":
+                extra = profile["adapter_options"]["loadtime"]["extra_launch_args"]
+                assert extra[-2:] == ["--max-total-tokens", "4096"]
+                del extra[-2:]
+            else:
+                profile["adapter_path"] = "sie_server.adapters.sglang.embedding:SGLangEmbeddingAdapter"
+        config = ModelConfig.model_validate(data)
+        validate_loadtime_options(config, directory)
+        adapter = load_adapter(config, directory, device="cuda:0")
+        # Source materialization is separately tested; use the declared path so
+        # temporary snapshot names do not obscure the launch-argv comparison.
+        monkeypatch.setattr(adapter._lora, "fetch", lambda name: name)
+        expected_reservation = adapter._memory_budget.required_bytes(
+            device_type="cuda", device_total_bytes=80 * 1024**3
+        )
+        try:
+            with pytest.raises(LaunchCapturedError):
+                adapter.load("cuda:0")
+            assert adapter._process is None
+            assert (
+                adapter._memory_budget.required_bytes(device_type="cuda", device_total_bytes=80 * 1024**3)
+                == expected_reservation
+            )
+        finally:
+            adapter._lora.close()
+    uncapped, capped = commands
+    assert "--max-total-tokens" not in uncapped
+    assert capped.count("--max-total-tokens") == 1
+    index = capped.index("--max-total-tokens")
+    assert capped[index + 1] == "4096"
+    del capped[index : index + 2]
+    assert capped == uncapped
+    assert capped[capped.index("--mem-fraction-static") + 1] == "0.5"
 
 
 def test_sdk_observer_captures_cold_503_and_native_retry(tmp_path: Path) -> None:
