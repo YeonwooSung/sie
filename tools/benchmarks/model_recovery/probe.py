@@ -369,9 +369,9 @@ async def run(args: argparse.Namespace, evidence: Evidence) -> bool:
             inspection_errors=list(inspection_errors),
         )
         server.should_exit = True
+        alive: list[int] = []
         try:
             await asyncio.wait_for(asyncio.shield(serve_task), timeout=90)
-            alive = []
             for pid, created in child_identities:
                 try:
                     child = psutil.Process(pid)
@@ -390,7 +390,14 @@ async def run(args: argparse.Namespace, evidence: Evidence) -> bool:
                 state=snapshot(registry) if registry is not None else None,
             )
         except Exception as exc:  # noqa: BLE001 - Keep cleanup failure evidence even when shutdown raises.
-            evidence.emit("cleanup_failed", error_type=type(exc).__name__, message=str(exc))
+            cleanup_ok = False
+            evidence.emit(
+                "cleanup_failed",
+                error_type=type(exc).__name__,
+                message=str(exc),
+                owned_children_alive=alive,
+                inspection_errors=list(inspection_errors),
+            )
         sock.close()
         evidence.save(
             {

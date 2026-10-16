@@ -3,13 +3,16 @@
 import argparse
 import asyncio
 import json
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import psutil
 import pytest
 
 from tools.benchmarks.model_recovery import probe
+from tools.benchmarks.model_recovery.smoke import install_smoke
 
 
 @pytest.mark.asyncio
@@ -96,3 +99,47 @@ async def test_process_inspection_failure_does_not_skip_shutdown_or_summary(
     summary = json.loads((args.output / "summary.json").read_text())
     assert summary["passed"] is False
     assert summary["cleanup_ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_final_snapshot_failure_cannot_pass_a_successful_protocol(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(probe.os, "environ", probe.os.environ.copy())
+    args = argparse.Namespace(
+        smoke=True,
+        deadline_s=30,
+        output=tmp_path / "evidence",
+        phase_requests=1,
+        during_requests=1,
+        interval_s=0,
+        recovery_timeout_s=20,
+    )
+    evidence = probe.Evidence(args.output)
+    original_snapshot = probe.snapshot
+
+    def snapshot(registry: Any) -> dict[str, Any]:
+        state = original_snapshot(registry)
+        if evidence.rows[-1]["event"] == "before_shutdown":
+            assert state["resident_names"] == []
+            raise RuntimeError("final snapshot failed after shutdown")
+        return state
+
+    monkeypatch.setattr(probe, "snapshot", snapshot)
+    with ExitStack() as stack:
+        install_smoke(stack)
+        assert await probe.run(args, evidence) is False
+
+    summary = json.loads((args.output / "summary.json").read_text())
+    assert summary["protocol_passed"] is True
+    assert summary["crash_count"] == summary["successful_reloads"] == 1
+    assert summary["passed"] is False
+    assert summary["cleanup_ok"] is False
+    assert all(phase["errors"] == 0 for phase in summary["healthy_requests"].values())
+    failed = next(row for row in evidence.rows if row["event"] == "cleanup_failed")
+    assert failed["error_type"] == "RuntimeError"
+    assert failed["message"] == "final snapshot failed after shutdown"
+    assert failed["owned_children_alive"] == []
+    assert failed["inspection_errors"] == []
+    persisted = [json.loads(line) for line in (args.output / "events.jsonl").read_text().splitlines()]
+    assert next(row for row in persisted if row["event"] == "cleanup_failed") == failed
