@@ -132,7 +132,9 @@ def test_sdk_observer_captures_msgpack_selection_and_automatic_encode_retry(
         client.close()
 
 
-def test_observer_records_actual_successful_batch_and_does_not_change_result(tmp_path: Path) -> None:
+def test_observer_records_actual_successful_batch_and_does_not_change_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     trace = tmp_path / "batches.jsonl"
     result = object()
     seen = []
@@ -178,6 +180,18 @@ def test_observer_records_actual_successful_batch_and_does_not_change_result(tmp
     rows[0]["gpu_slots"][1]["slot"] = 1
     rows[0]["requests"][1]["lora"] = "a"
     assert mixed_batches(rows, 0, 2**64) == []
+    pool_module = ModuleType("sglang.srt.lora.mem_pool")
+    pool_module.EMPTY_SLOT = object()
+    monkeypatch.setitem(sys.modules, pool_module.__name__, pool_module)
+    pool = scheduler.tp_worker.model_runner.lora_manager.memory_pool
+    pool.buffer_id_to_uid = [None, pool_module.EMPTY_SLOT]
+    pool.uid_to_buffer_id = {None: 0}
+    batch.reqs = [SimpleNamespace(rid="base", lora_id=None)]
+    assert scheduler.run_batch(batch) is result
+    base_row = batch_rows(trace)[-1]
+    assert base_row["gpu_slot_uids"] == [None, {"empty_slot": True}]
+    assert base_row["gpu_slots"] == [{"lora": None, "slot": 0, "uid": None}]
+    assert mixed_batches([base_row], 0, 2**64) == []
 
 
 def test_child_observer_defers_import_and_preserves_production_hook(tmp_path: Path) -> None:

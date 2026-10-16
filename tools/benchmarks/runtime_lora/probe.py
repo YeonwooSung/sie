@@ -506,6 +506,7 @@ async def run(args: argparse.Namespace) -> None:
         summary["error"] = {"type": type(error).__name__, "message": str(error)}
         raise
     finally:
+        summary["assertions_passed"] = summary["passed"]
         summary["shutdown_complete"] = False
         (output / "evidence.json").write_text(json.dumps(summary, indent=2) + "\n")
         server.should_exit = True
@@ -514,6 +515,7 @@ async def run(args: argparse.Namespace) -> None:
                 await task
             summary["shutdown_complete"] = True
         except BaseException as error:
+            summary["passed"] = False
             summary["shutdown_error"] = {"type": type(error).__name__, "message": str(error)}
             raise
         finally:

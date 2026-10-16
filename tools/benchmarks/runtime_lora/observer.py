@@ -22,6 +22,15 @@ MARKER = "_sie_runtime_lora_benchmark"
 TRACE_ENV = "SIE_RUNTIME_LORA_BATCH_TRACE"
 
 
+def slot_uid(uid: Any) -> str | None | dict[str, bool]:
+    if uid is None or isinstance(uid, str):
+        return uid
+    module = sys.modules.get("sglang.srt.lora.mem_pool")
+    if module is not None and uid is getattr(module, "EMPTY_SLOT", None):
+        return {"empty_slot": True}
+    raise ValueError("Unexpected value in the SGLang LoRA GPU slot map")
+
+
 def append(path: str, row: dict[str, Any]) -> None:
     data = (json.dumps(row, sort_keys=True) + "\n").encode()
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -44,7 +53,7 @@ def patch_scheduler(module: ModuleType, path: str) -> None:
         def alias(uid: str | None) -> str | None:
             return manager.lora_refs[uid].lora_name if uid is not None else None
 
-        row = {
+        row: dict[str, Any] = {
             "event": "forward",
             "pid": os.getpid(),
             "start_ns": time.time_ns(),
@@ -55,7 +64,7 @@ def patch_scheduler(module: ModuleType, path: str) -> None:
         row["end_ns"] = time.time_ns()
         pool = manager.memory_pool
         row["gpu_slot_count"] = len(pool.buffer_id_to_uid)
-        row["gpu_slot_uids"] = list(pool.buffer_id_to_uid)
+        row["gpu_slot_uids"] = [slot_uid(uid) for uid in pool.buffer_id_to_uid]
         row["gpu_slots"] = [
             {"uid": uid, "lora": alias(uid), "slot": slot} for uid, slot in pool.uid_to_buffer_id.items()
         ]
