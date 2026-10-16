@@ -816,9 +816,11 @@ Below, `<fullname>` is the chart's full name: `<release>-sie-cluster`, or
   reaches it. The chart owns `SIE_UPSTREAMS_FILE`, `SIE_REMOTE_SERVING` and
   the credential variables, so `extraEnv` cannot set them, and an `extraEnv`
   entry that reads an upstream's Secret anywhere else fails the render. An
-  upstream's Secret key must also differ from every Secret key the chart
-  hands to another component (the Hugging Face token, the gateway tokens, the
-  sie-config tokens and the NATS passwords).
+  upstream's Secret key must also differ from the checked credential keys
+  listed in [Gateway token](#gateway-token), including the Hugging Face token,
+  gateway tokens, sie-config tokens, NATS passwords, and bundled Grafana admin
+  credentials. Optional dependency and arbitrary subchart configuration outside
+  that list needs operator separation; see [#767](https://github.com/superlinked/sie/issues/767).
 - sie-config receives the upstream names (`SIE_UPSTREAM_NAMES`), built from the
   same `upstreams` values as the remote lanes' file, and refuses with a `422` a
   model whose remote profile names any other upstream. Without a remote lane it
@@ -869,9 +871,12 @@ A remote lane needs this policy or `workers.networkPolicy`, and the render
 fails when both are off. The policy takes effect only with a CNI that enforces
 NetworkPolicy.
 
-- **Ingress:** only this release's gateway pods, on the worker ports. The worker
-  API has no authentication of its own, so without this rule any pod in the
-  cluster could call a remote lane directly and spend its upstream credentials.
+- **Ingress:** this release's gateway pods, on the worker ports, and, while the
+  workers require the worker token, the release-time worker token test's pods
+  (`app.kubernetes.io/component: worker-auth`). Without `workers.auth` the
+  worker API has no authentication of its own, so without this rule any pod in
+  the cluster could call a remote lane directly and spend its upstream
+  credentials.
   While this policy is on, `workers.networkPolicy` excludes the remote lanes, so
   its `extraIngress` sources cannot reach them. NetworkPolicies are additive:
   any other policy that selects these pods and admits more sources widens
@@ -1391,6 +1396,12 @@ write access, or of the read token, which every worker sidecar holds.
   cannot write.
 - **Gateway admin token (when set):** every gateway pod and the tooling that
   manages pools.
+- **Gateway client token (when set or generated):** API clients, every gateway
+  pod, and every worker sidecar, which presents it when it calls the gateway.
+  See [Securing the cluster](#securing-the-cluster).
+- **Worker token (when `workers.auth.enabled`):** every gateway pod and every
+  worker container that serves the worker API, which is the container that
+  runs model code. All workers share it.
 - **Upstream credentials (when remote backends are used):** the `worker`
   container of each `remote` lane, from the Secrets that `upstreams` names.
   Where each credential is sent is in the `<fullname>-upstreams` Secret, which
@@ -1512,6 +1523,260 @@ contain the generated tokens.
 >   to it and log a deprecation warning. Move them to `SIE_CONFIG_SERVICE_TOKEN`
 >   with a read token.
 
+## Securing the cluster
+
+By default the gateway and the workers accept requests without a token, and
+no NetworkPolicy limits who reaches the workers. The settings below close
+that, and each can be turned on now. 0.13.0 changes their defaults:
+
+| Setting | Default now | Default from 0.13.0 |
+| --- | --- | --- |
+| `gateway.auth.mode` | `none` | `token` |
+| `gateway.auth.generateToken` | `false` | `true` |
+| `workers.auth.enabled` | `false` | `true` |
+| `workers.networkPolicy.enabled` | `false` | `true` |
+| `telemetry.enabled` | `true` | `false` |
+
+To keep the current behavior after 0.13.0, set the "Default now" values
+explicitly. To adopt the 0.13.0 defaults now, which together are the secure
+combination, set:
+
+```yaml
+gateway:
+  auth:
+    mode: token
+    generateToken: true
+workers:
+  auth:
+    enabled: true
+  networkPolicy:
+    enabled: true
+telemetry:
+  enabled: false
+```
+
+An Ingress or a `LoadBalancer`/`NodePort` gateway Service also needs TLS; see
+[Authentication and TLS requirements](#authentication-and-tls-requirements).
+
+### Gateway token
+
+With `gateway.auth.mode` set to `token` (or `static`, which the gateway treats
+the same), the gateway requires a token on every request except its probes and
+API description. Clients send it as `Authorization: Bearer <token>` or
+`x-api-key: <token>`. When a request sends both, the gateway uses
+`Authorization` and ignores `x-api-key`; until 0.13.0, a repeated
+`Authorization` header uses its first value. SDK clients pass the token as
+`api_key`/`apiKey`, or read it from `SIE_API_KEY` when their base URL comes
+from `SIE_BASE_URL`. The tokens come from one Secret, generated or managed by
+the operator:
+
+- **Generated.** With `gateway.auth.tokenSecretName` empty and
+  `gateway.auth.generateToken=true`, the chart creates the Secret
+  `<fullname>-gateway-token` holding a random 64-character token under
+  `gateway.auth.tokenSecretKey` (`SIE_AUTH_TOKEN`). Like the
+  [sie-config tokens](#sie-config-tokens), upgrades read the existing Secret
+  and keep its token, the render fails if the token is missing or shorter than
+  32 characters, the Secret carries `helm.sh/resource-policy: keep`, and
+  renderers without cluster access generate a new token on every render (see
+  [GitOps and `helm template`](#gitops-and-helm-template); use
+  `gateway.auth.tokenSecretName` there). The install notes print the command
+  that reads it:
+
+  ```bash
+  FULLNAME=sie-cluster
+  kubectl get secret -n sie "${FULLNAME}-gateway-token" \
+    -o jsonpath='{.data.SIE_AUTH_TOKEN}' | base64 -d
+  ```
+
+- **Operator-managed.** Set `gateway.auth.tokenSecretName` to a Secret holding
+  comma-separated tokens. The chart uses it unchanged and ignores
+  `gateway.auth.generateToken`. Several tokens let you rotate one at a time.
+
+While the gateway receives the generated token, `gateway.extraEnv` cannot set
+`SIE_AUTH_TOKEN` or `SIE_AUTH_TOKENS`, which would replace it.
+
+The worker sidecars receive the same Secret as `SIE_GATEWAY_API_KEY` and
+present its first comma-separated token when they call the gateway, so
+`workers.common.workerSidecar.extraEnv` cannot set `SIE_GATEWAY_API_KEY`
+while the chart wires it. The MCP edge does not receive the Secret: set
+`mcpEdge.clusterApiKey.existingSecretName` and `mcpEdge.clusterApiKey.secretKey`
+to a Secret key holding one gateway token. The MCP edge presents the whole
+value, so that key must hold a single token. The render fails when the gateway
+requires a token, `mcpEdge.enabled` is set, `mcpEdge.clusterBaseUrl` is empty
+(the edge calls the in-cluster gateway), and no cluster API key is set. With
+token auth, pool create, renew, and delete also need the
+[gateway admin token](#gateway-admin-token). The render fails when the client
+token, a `gateway.extraEnv` token Secret, or the MCP edge cluster API key is
+the same Secret key as a checked credential: the Hugging Face
+token, a NATS password, the gateway admin token, either sie-config token, an
+image pull secret, an oauth2-proxy secret, the Better Stack token, a bundled
+Grafana admin username or password in the same namespace, the MCP connector
+secrets, or a chart-managed ingress TLS key. Gateway client credentials may
+share a key with each other. The guard checks this finite list; other optional
+dependency credentials and arbitrary subchart env/volume configuration need
+operator separation. Remaining dependency cases are tracked in
+[#767](https://github.com/superlinked/sie/issues/767).
+
+When `gateway.extraEnv` sets `SIE_AUTH_MODE` from `valueFrom`, the mode is
+unknown at render time. The gateway then receives the generated token, as it
+receives an operator-managed Secret, so a mode that resolves to `none` at run
+time is refused as a misconfiguration.
+
+To turn the generated token on for an existing release without locking out
+clients, upgrade twice. Pass your values as on every upgrade. First create the
+token; the gateway does not require it yet:
+
+```bash
+helm upgrade sie-cluster oci://ghcr.io/superlinked/charts/sie-cluster \
+  --namespace sie -f values.yaml \
+  --set gateway.auth.generateToken=true
+```
+
+This step rolls the worker StatefulSets, whose sidecars receive the token.
+Give the token to your clients, then require it:
+
+```bash
+helm upgrade sie-cluster oci://ghcr.io/superlinked/charts/sie-cluster \
+  --namespace sie -f values.yaml \
+  --set gateway.auth.generateToken=true \
+  --set gateway.auth.mode=token
+```
+
+The second step rolls only the gateway.
+
+**Rotating the gateway token.** Pods read the token at start, and deleting
+the generated Secret replaces every client's token at once. For a rotation
+without a cutover, use an operator-managed Secret:
+
+1. Put the new token first and keep the old one: `new-token,old-token`. Run
+   `helm upgrade` (with the Secret's name in `gateway.auth.tokenSecretName`)
+   and restart the gateway and the worker StatefulSets. The gateway accepts
+   both tokens, and the worker sidecars present the first one.
+2. Move every client, including the MCP edge's key, to the new token.
+3. Remove the old token from the Secret and restart the gateway.
+
+To leave a generated token, copy it into your own Secret as the old token in
+step 1, then set `gateway.auth.tokenSecretName`.
+
+### Worker token
+
+The workers serve an HTTP API that the gateway calls. With
+`workers.auth.enabled=true`, every worker container that serves it receives
+`SIE_AUTH_MODE=token` and `SIE_AUTH_TOKEN` and requires the token on every
+route except `/healthz`, `/livez`, and `/readyz`, which the kubelet probes
+call without credentials. The gateway receives the same token as
+`SIE_WORKER_AUTH_TOKEN` and presents it (the first one, when the Secret key
+lists several comma-separated tokens) when it opens a worker's `/ws/status`
+connection, which it does with `gateway.healthMode=ws` or when it falls back to
+WebSocket health because NATS is unavailable at start. With the default NATS
+health mode the gateway reaches the workers only through NATS. The Rust worker
+(`engine: candle`) serves only probes over HTTP and receives no token, and the
+worker sidecars do not serve the worker API.
+
+Worker auth needs `sie-server` and `sie-gateway` images from this chart's
+release (its `appVersion`) or later. Images of 0.10.1 and earlier ignore these
+variables, so their workers serve without a token. A post-install and
+post-upgrade hook Job, `<fullname>-worker-auth-test-<revision>`, checks this
+while the workers require the token: once a worker of each lane's current
+StatefulSet revision is ready, it sends `GET /v1/models` without a token and
+fails the release when a worker answers with anything but `401`, when a ready
+worker does not answer, when a lane's StatefulSet is missing, or when its pods
+cannot be listed. Both worker NetworkPolicies admit the hook pod to the worker
+ports while the workers require the token. A lane scaled to zero is skipped at
+once, and a lane with no ready worker of the current revision within three
+minutes (a cold start longer than that) is skipped with a warning. The check is
+best effort: a skipped lane is not checked until a later release finds it
+running. The Job stays for a day after it finishes, so its log
+(`kubectl logs -n <namespace> job/<fullname>-worker-auth-test-<revision>`)
+shows which workers it checked and which lanes it skipped. Keep the image tags
+at the chart default, or override `workers.common.image.tag` only with a tag of
+the same release or later: with `workers.auth.enabled`, the render fails when
+that tag is a version older than the chart's `appVersion`.
+
+With `workers.auth.tokenSecretName` empty, the chart creates
+`<fullname>-worker-token` holding a random 64-character token under
+`workers.auth.tokenSecretKey` (`SIE_AUTH_TOKEN`), with the same reuse check,
+keep policy, and `helm template` caveat as the gateway token. Otherwise it uses
+the named Secret unchanged. The render fails when the worker token is the same
+Secret key as another checked credential listed above, including the gateway
+client token (see [Gateway token](#gateway-token) for the list). While
+`workers.auth.enabled` is set, the worker `extraEnv` lists cannot set
+`SIE_AUTH_MODE`, `SIE_AUTH_TOKEN`, or `SIE_AUTH_TOKENS`, and `gateway.extraEnv`
+cannot set `SIE_WORKER_AUTH_TOKEN`. When the workers do not require the token,
+the chart sets `SIE_AUTH_MODE=none` on the containers that serve the worker
+API. That covers the first upgrade step below (`workers.auth.enabled=true`
+with `workers.auth.allowUnauthenticated=true`), where the three variables stay
+reserved, and worker auth off, where a worker `extraEnv` list that sets one of
+them is left in charge instead. A worker therefore never generates a token of
+its own.
+
+All workers share one token, so a worker container can call the other
+workers' APIs. Keep `workers.networkPolicy` on with it, so that only the
+gateway reaches the worker ports.
+
+**Upgrading an existing release.** A single upgrade with
+`--set workers.auth.enabled=true` rolls the gateway and the workers together.
+With the default NATS health mode that is enough. With WebSocket health, a
+gateway pod that has not been replaced yet has no token, and the workers that
+restarted before it refuse its connections until it is replaced. To avoid that
+gap, upgrade in two steps. First let the gateway present the token while the
+workers do not require it yet:
+
+```bash
+helm upgrade sie-cluster oci://ghcr.io/superlinked/charts/sie-cluster \
+  --namespace sie -f values.yaml \
+  --set workers.auth.enabled=true \
+  --set workers.auth.allowUnauthenticated=true
+```
+
+This step rolls only the gateway. Once every gateway pod has restarted,
+require the token:
+
+```bash
+helm upgrade sie-cluster oci://ghcr.io/superlinked/charts/sie-cluster \
+  --namespace sie -f values.yaml \
+  --set workers.auth.enabled=true \
+  --set workers.auth.allowUnauthenticated=false
+```
+
+Set it explicitly: `--reuse-values` and `--reset-then-reuse-values` both keep
+the value from the first step. The second step rolls the workers. `helm status`
+prints a warning while `workers.auth.allowUnauthenticated` is on, and the
+render fails when it is set without `workers.auth.enabled`.
+
+**Rotating the worker token.** The gateway presents one worker token at a
+time:
+
+- With the default NATS health mode, nothing calls the worker API except the
+  probes. Delete the generated Secret (or change your own), run `helm upgrade`,
+  and restart the gateway and the worker StatefulSets.
+- With WebSocket health, use the upgrade aid: upgrade with
+  `workers.auth.allowUnauthenticated=true` and wait for the workers to restart,
+  replace the token, run `helm upgrade` and restart the gateway, then upgrade
+  with `workers.auth.allowUnauthenticated=false`. Keep `workers.networkPolicy`
+  on, since the workers accept unauthenticated requests between the first and
+  last step.
+- With your own Secret in `workers.auth.tokenSecretName`, rotate without a
+  gap: set the key to `old-token,new-token` and restart the worker
+  StatefulSets, so the workers accept both; set it to `new-token,old-token` and
+  restart the gateway, which presents the first; then set it to `new-token` and
+  restart the worker StatefulSets.
+
+### NetworkPolicy
+
+`workers.networkPolicy.enabled=true` admits this release's gateway pods to the
+worker HTTP ports (see [Worker NetworkPolicy](#worker-networkpolicy)). While
+the workers require the token, it also admits pods labelled
+`{app.kubernetes.io/name: sie-health-test, app.kubernetes.io/component: worker-auth, app.kubernetes.io/instance: <release>}`,
+the label of the release-time worker token test; any pod created with that
+label in the namespace is admitted, as for the gateway's labels. A
+NetworkPolicy takes effect only with a CNI that enforces it. Without one the
+policy admits every pod, and the worker token remains the only control. The
+kubelet probes, which the policy does not restrict, use the probe paths that
+need no token. Remote lanes have their own policy,
+`workers.remote.networkPolicy`, which admits the same pods (see
+[Network policy for remote lanes](#network-policy-for-remote-lanes)).
+
 ## Ingress
 
 The Ingress is off by default, including in the AWS, GKE, AKS, and ACK
@@ -1556,9 +1821,11 @@ certificates appear in Certificate Transparency logs. One of the following must
 hold:
 
 - the gateway requires a token: `gateway.auth.mode=static` with
-  `gateway.auth.tokenSecretName` naming a Secret of comma-separated tokens.
-  SDK clients pass one as `api_key`/`apiKey`, or read it from `SIE_API_KEY`
-  when their base URL comes from `SIE_BASE_URL`;
+  `gateway.auth.tokenSecretName` naming a Secret of comma-separated tokens, or
+  with `gateway.auth.generateToken=true` (see
+  [Securing the cluster](#securing-the-cluster)). SDK clients pass one as
+  `api_key`/`apiKey`, or read it from `SIE_API_KEY` when their base URL comes
+  from `SIE_BASE_URL`;
 - the oauth2-proxy edge is enabled (`auth.enabled=true`). It works through the
   `nginx.ingress.kubernetes.io/auth-*` annotations, which only the ingress-nginx
   controller honours; the NGINX Inc controller (`nginx.org/ingress-controller`)
@@ -1593,11 +1860,14 @@ you to create it, and `self-signed` mode does not issue it, so the chart refuses
 
 Both opt-ins accept only a YAML boolean; a quoted `"false"` fails the render.
 `gateway.auth.mode` must be `none`, `static`, or `token` exactly as the gateway
-reads it, and token auth without `gateway.auth.tokenSecretName` (or a
-`SIE_AUTH_TOKEN(S)` entry in `gateway.extraEnv`) fails the render because the
-gateway would refuse every request. `gateway.auth.tokenSecretName` with auth
-mode `none` fails for the same reason. A `gateway.extraEnv` entry that overrides
-`SIE_AUTH_MODE` takes precedence over `gateway.auth.mode`.
+reads it, and token auth without `gateway.auth.tokenSecretName`,
+`gateway.auth.generateToken=true`, or a `SIE_AUTH_TOKEN(S)` entry in
+`gateway.extraEnv` fails the render because the gateway would refuse every
+request. `gateway.auth.tokenSecretName` with auth mode `none` fails for the
+same reason; a generated token with auth mode `none` does not, because the
+gateway does not receive it until the mode is `token` or `static`. A
+`gateway.extraEnv` entry that overrides `SIE_AUTH_MODE` takes precedence over
+`gateway.auth.mode`.
 
 The same authentication requirement applies to `gateway.service.type:
 LoadBalancer` or `NodePort`, which are reachable from outside the cluster on
@@ -1647,10 +1917,13 @@ Tune them with `SIE_GATEWAY_POOL_MAX_MINIMUM_WORKER_COUNT`,
 
 ### Worker NetworkPolicy
 
-Worker pods serve an HTTP API without authentication of their own; the gateway
-is the only in-chart caller. `workers.networkPolicy.enabled=true` renders an
-ingress `NetworkPolicy` whose only default rule admits this release's gateway
-pods to every worker HTTP port. Kubelet probes and traffic between containers
+Worker pods serve an HTTP API that requires no token unless
+`workers.auth.enabled` is set (see [Worker token](#worker-token)); the gateway
+is the only in-chart caller of the worker API, apart from the release-time
+worker token test. `workers.networkPolicy.enabled=true` renders an ingress
+`NetworkPolicy` whose default rule admits this release's gateway pods to every
+worker HTTP port and, while the workers require the token, the worker token
+test's pods (`app.kubernetes.io/component: worker-auth`). Kubelet probes and traffic between containers
 of the same pod are unaffected. It requires a CNI that enforces NetworkPolicy.
 NetworkPolicies are additive: if another policy selects the worker pods and
 admits more sources, those sources keep access, so it restricts worker ingress
