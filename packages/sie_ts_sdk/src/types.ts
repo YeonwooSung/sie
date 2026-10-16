@@ -369,6 +369,8 @@ export interface ModelInfo {
   revision?: string | null;
   /** Servable profiles keyed by name; address one as "model@profile" */
   profiles?: Record<string, ProfileInfo>;
+  /** Single-server ready LoRA names; absent on gateways (not fleet residency). */
+  lora_adapters?: string[];
   /** Advertised model capabilities; null for models with no `generate` task */
   capabilities?: ModelCapabilities | null;
   /** Gateway-only queue snapshot; absent when talking to a single server */
@@ -407,6 +409,7 @@ export interface WireModelInfo {
   max_sequence_length?: number | null;
   revision?: string | null;
   profiles?: Record<string, ProfileInfo>;
+  lora_adapters?: string[];
   capabilities?: ModelCapabilities | null;
   pending_generation?: PendingGeneration;
   routing?: ModelRouting;
@@ -427,6 +430,7 @@ const MODEL_INFO_WIRE_FIELD_SET: Record<keyof WireModelInfo, true> = {
   inputs: true,
   last_error: true,
   loaded: true,
+  lora_adapters: true,
   max_sequence_length: true,
   name: true,
   outputs: true,

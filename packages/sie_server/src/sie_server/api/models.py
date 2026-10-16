@@ -110,6 +110,8 @@ class ModelInfo(BaseModel):
 
     max_sequence_length: int | None = None
     profiles: dict[str, ProfileInfo] = {}
+    lora_adapters: list[str] = Field(default_factory=list)
+    """LoRA served names currently ready on this worker, excluding loading/evicting adapters."""
 
     revision: str | None = None
     """Pinned HF commit SHA for the model's weights (design §6.6).
@@ -250,6 +252,7 @@ async def list_models(http_request: Request) -> ModelsListResponse:
                 outputs=config.outputs,
                 dims=config.dims,
                 loaded=registry.is_loaded(name),
+                lora_adapters=registry.loaded_lora_names(name),
                 state=state,
                 last_error=last_error,
                 max_sequence_length=config.max_sequence_length,
@@ -300,6 +303,7 @@ async def get_model(model: str, http_request: Request) -> ModelInfo:
         outputs=config.outputs,
         dims=config.dims,
         loaded=registry.is_loaded(model),
+        lora_adapters=registry.loaded_lora_names(model),
         state=state,
         last_error=last_error,
         max_sequence_length=config.max_sequence_length,
