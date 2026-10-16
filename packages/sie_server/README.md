@@ -1095,6 +1095,44 @@ above, or turn on token authentication.
 
 ### Memory & OOM resilience
 
+SGLang generation, embedding and vision-extraction adapters size memory per
+model when `adapter_options.loadtime.mem_fraction_static` is omitted. SIE reads
+the pinned local safetensors headers at the serving precision and the model's
+attention geometry. It reserves the weights (with a 5% allowance), the KV pool,
+1 GiB for startup and 2 GiB for runtime work such as CUDA graphs. No weights are
+loaded onto a GPU to compute this estimate.
+
+The KV pool uses the resolved profile's `kv_budget_tokens`; embedding and
+extraction profiles without that field use `max_seq_length`. Capacity rounds
+up to 512 tokens, with another 512 tokens accounted for as allocation padding.
+SIE passes `--max-total-tokens` to bound the pool. SGLang's static fraction is
+derived from free memory immediately before launch, so loading a second model
+does not reduce its requested capacity. The load-staging check uses the same
+reservation and evicts idle eligible models when it cannot fit. Resident-model
+accounting reports the reservation; the pressure monitor continues to use
+actual device usage, including every SGLang subprocess.
+
+To dedicate most of a GPU to one model, explicitly set a fraction:
+
+```yaml
+profiles:
+  default:
+    # Other required profile fields omitted here.
+    kv_budget_tokens: 32768
+    adapter_options:
+      loadtime:
+        mem_fraction_static: 0.90
+```
+
+An explicit fraction keeps the previous SGLang launch and admission behavior:
+SIE requires that fraction of total GPU memory plus 1 GiB of load headroom,
+and does not cap the engine's KV pool to `kv_budget_tokens`. Explicit fractions
+are required for tensor-parallel engines, speculative or LoRA weights,
+quantized checkpoints and nonstandard KV layouts such as MLA or linear
+attention. Calibrated profiles for these configurations retain their overrides.
+Automatic sizing is an estimate; unusually large runtime workspaces can still
+invoke the existing OOM recovery path.
+
 | Env var | Default | Effect |
 |--|--|--|
 | `SIE_MEMORY_PRESSURE_THRESHOLD_PERCENT` | `95` | VRAM utilisation that triggers reactive LRU eviction by the pressure monitor. |

@@ -58,7 +58,6 @@ profiles:
     kv_budget_tokens: 32768
     adapter_options:
       loadtime:
-        mem_fraction_static: 0.85
         served_model_name: defog/sqlcoder-7b-2
       runtime:
         first_chunk_timeout_s: 30

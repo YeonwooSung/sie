@@ -35,6 +35,7 @@ from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ERR_REQUIRES_TEXT, ComputePrecision
 from sie_server.adapters.sglang import _server
+from sie_server.adapters.sglang._memory import SGLangMemoryBudget
 from sie_server.core.inference_output import EncodeOutput
 from sie_server.core.tokenizer import load_tokenizer
 
@@ -132,7 +133,8 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         *,
         normalize: bool = True,
         max_seq_length: int = 8192,
-        mem_fraction_static: float = 0.85,
+        mem_fraction_static: float | None = None,
+        kv_budget_tokens: int | None = None,
         compute_precision: ComputePrecision = "bfloat16",
         trust_remote_code: bool = True,
         revision: str | None = None,
@@ -162,8 +164,9 @@ class SGLangEmbeddingAdapter(BaseAdapter):
             model_name_or_path: HuggingFace model ID or local path.
             normalize: Whether to L2-normalize embeddings.
             max_seq_length: Maximum sequence length.
-            mem_fraction_static: Fraction of GPU memory to pre-allocate (0.0-1.0).
-                Lower values leave more headroom for other models. Default 0.85.
+            mem_fraction_static: Optional override for SGLang's static memory fraction.
+                When omitted, reserve weights plus the KV budget and runtime headroom.
+            kv_budget_tokens: KV pool capacity; defaults to max_seq_length.
             compute_precision: Compute precision (bfloat16 recommended).
             trust_remote_code: Whether to trust remote code in model files.
             revision: Pinned HuggingFace revision (commit SHA / branch / tag) to serve.
@@ -201,6 +204,16 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         self._normalize = normalize
         self._max_seq_length = max_seq_length
         self._mem_fraction_static = mem_fraction_static
+        self._memory_budget = SGLangMemoryBudget(
+            model_name_or_path=str(model_name_or_path),
+            revision=revision,
+            compute_precision=compute_precision,
+            max_seq_length=max_seq_length,
+            kv_budget_tokens=kv_budget_tokens,
+            mem_fraction_static=mem_fraction_static,
+            tensor_parallel_size=tensor_parallel_size,
+            has_auxiliary_weights=bool(lora_paths),
+        )
         self._compute_precision = compute_precision
         self._trust_remote_code = trust_remote_code
         self._revision = revision
@@ -326,8 +339,6 @@ class SGLangEmbeddingAdapter(BaseAdapter):
             self._compute_precision,
             "--context-length",
             str(self._max_seq_length),
-            "--mem-fraction-static",
-            str(self._mem_fraction_static),
             # Full flag name rather than the "--tp" abbreviation, which a
             # future upstream flag sharing that prefix would make ambiguous.
             "--tensor-parallel-size",
@@ -369,6 +380,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         # rather than leaking one slot of the 100-port span per attempt: a full
         # /tmp in open_output_log, a failed exec, or a cancelled load included.
         try:
+            cmd.extend(self._memory_budget.launch_args(device_indices[0]))
             # Only a group rendezvouses, so width one reserves nothing and its
             # launch argv is unchanged. Left to the engine it picks a random
             # port, which is the collision NCCL_BASE_PORT exists to prevent.
@@ -491,19 +503,14 @@ class SGLangEmbeddingAdapter(BaseAdapter):
             self._output_file = None
 
     def memory_footprint(self) -> int:
-        """Return the GPU memory usage in bytes.
-
-        SGLang pre-allocates memory in the subprocess. Return 0 and let the
-        registry use actual GPU memory monitoring instead.
-        """
-        return 0
+        """Return this engine's reservation, including runtime headroom."""
+        return self._memory_budget.reserved_bytes if self._process is not None else 0
 
     def load_required_memory_bytes(self, *, device_type: str, device_total_bytes: int) -> int | None:
         """Return SGLang's startup reservation requirement for load staging."""
-        return _server.estimate_load_required_memory_bytes(
+        return self._memory_budget.required_bytes(
             device_type=device_type,
             device_total_bytes=device_total_bytes,
-            mem_fraction_static=self._mem_fraction_static,
         )
 
     def encode(

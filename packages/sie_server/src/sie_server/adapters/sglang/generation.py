@@ -57,6 +57,7 @@ from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
 from sie_server.adapters.sglang import _server
 from sie_server.adapters.sglang._compat.sie_thinking_budget import PARAM as THINKING_BUDGET_PARAM
 from sie_server.adapters.sglang._compat.sie_thinking_budget import PROCESSOR_REFERENCE as THINKING_BUDGET_PROCESSOR
+from sie_server.adapters.sglang._memory import SGLangMemoryBudget
 from sie_server.observability.generation_diagnostics import GenerationStreamTimer
 from sie_server.types.grammar import (
     OUTLINES_JSON_SCHEMA_TYPE_DIAGNOSTIC,
@@ -483,7 +484,8 @@ class SGLangGenerationAdapter(GenerationAdapter):
         model_name_or_path: str,
         *,
         max_seq_length: int = 32768,
-        mem_fraction_static: float = 0.85,
+        mem_fraction_static: float | None = None,
+        kv_budget_tokens: int | None = None,
         compute_precision: ComputePrecision = "bfloat16",
         trust_remote_code: bool = True,
         # Pinned HuggingFace revision (commit SHA / branch / tag). Forwarded to
@@ -574,6 +576,16 @@ class SGLangGenerationAdapter(GenerationAdapter):
         self._max_seq_length = max_seq_length
         self._mem_fraction_static = mem_fraction_static
         self._tensor_parallel_size = _server.validate_tensor_parallel_size(tensor_parallel_size)
+        self._memory_budget = SGLangMemoryBudget(
+            model_name_or_path=str(model_name_or_path),
+            revision=revision,
+            compute_precision=compute_precision,
+            max_seq_length=max_seq_length,
+            kv_budget_tokens=kv_budget_tokens,
+            mem_fraction_static=mem_fraction_static,
+            tensor_parallel_size=self._tensor_parallel_size,
+            has_auxiliary_weights=bool(lora_paths or (speculative and speculative.get("enabled"))),
+        )
         self._watchdog_timeout_s = _server.validate_optional_positive(watchdog_timeout_s, field="watchdog_timeout_s")
         self._declared_nccl_port = _server.validate_optional_port(nccl_port)
         if self._declared_nccl_port is not None and self._tensor_parallel_size == 1:
@@ -638,6 +650,10 @@ class SGLangGenerationAdapter(GenerationAdapter):
         self._speculative = speculative
         self._speculative_needs_extra_buffer = speculative_needs_extra_buffer
         self._extra_launch_args = list(extra_launch_args or [])
+        if mem_fraction_static is None and any(
+            arg.partition("=")[0] in {"--mem-fraction-static", "--max-total-tokens"} for arg in self._extra_launch_args
+        ):
+            raise ValueError("Set mem_fraction_static or kv_budget_tokens in the profile instead of extra_launch_args")
         self._extra_env = dict(extra_env or {})
         self._startup_timeout_s = _resolve_profile_startup_timeout(
             startup_timeout_s,
@@ -882,8 +898,6 @@ class SGLangGenerationAdapter(GenerationAdapter):
             self._compute_precision,
             "--context-length",
             str(self._max_seq_length),
-            "--mem-fraction-static",
-            str(self._mem_fraction_static),
             # Full flag name, not the "--tp" abbreviation. Nothing upstream
             # disables abbreviation matching, so a future upstream flag sharing
             # that prefix would break every SIE launch with an ambiguous-option
@@ -895,6 +909,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
             "--served-model-name",
             self._served_model_name,
         ]
+        cmd.extend(self._memory_budget.launch_args(device_indices[0]))
         if self._trust_remote_code:
             cmd.append("--trust-remote-code")
         if self._revision is not None:
@@ -1391,15 +1406,13 @@ class SGLangGenerationAdapter(GenerationAdapter):
             self._output_file = None
 
     def memory_footprint(self) -> int:
-        # SGLang pre-allocates in the subprocess; let the registry measure GPU.
-        return 0
+        return self._memory_budget.reserved_bytes if self._process is not None else 0
 
     def load_required_memory_bytes(self, *, device_type: str, device_total_bytes: int) -> int | None:
         """Return SGLang's startup reservation requirement for load staging."""
-        return _server.estimate_load_required_memory_bytes(
+        return self._memory_budget.required_bytes(
             device_type=device_type,
             device_total_bytes=device_total_bytes,
-            mem_fraction_static=self._mem_fraction_static,
         )
 
     # -- Inference -----------------------------------------------------------

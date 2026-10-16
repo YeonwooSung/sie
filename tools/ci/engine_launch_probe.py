@@ -18,7 +18,7 @@ from typing import Any
 from unittest import mock
 
 import yaml
-from sie_server.adapters.sglang import _server, generation
+from sie_server.adapters.sglang import _memory, _server, generation
 from sie_server.adapters.sglang.embedding import SGLangEmbeddingAdapter
 from sie_server.adapters.sglang.generation import SGLangGenerationAdapter
 from sie_server.config.model import ModelConfig
@@ -74,6 +74,8 @@ def render_sglang_argv(config: ModelConfig, models_dir: Path) -> list[str]:
     with (
         mock.patch.object(_server, "launch_sglang_server", capture),
         mock.patch.object(generation, "_reasoning_control_token_ids", return_value={}),
+        mock.patch.object(_memory, "device_memory", return_value=(80 * _memory.GIB, 80 * _memory.GIB)),
+        mock.patch.object(_memory.SGLangMemoryBudget, "static_bytes", 8 * _memory.GIB),
     ):
         try:
             if isinstance(adapter, SGLangGenerationAdapter):

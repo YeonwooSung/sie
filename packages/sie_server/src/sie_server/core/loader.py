@@ -635,6 +635,10 @@ def load_adapter(
         constructor_parameters = inspect.signature(adapter_class.__init__).parameters
     except (TypeError, ValueError):
         constructor_parameters = {}
+    if "kv_budget_tokens" in constructor_parameters:
+        budget = config.resolve_profile("default").kv_budget_tokens
+        if budget is not None:
+            adapter_kwargs["kv_budget_tokens"] = budget
     for keyword, dim in (
         ("sparse_dim", config.dims.get("sparse")),
         ("multivector_dim", config.dims.get("multivector")),

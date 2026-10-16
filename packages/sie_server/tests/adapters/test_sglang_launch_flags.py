@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from sie_server.adapters.sglang import _memory
 
 _PACKAGE_DIR = Path(__file__).resolve().parents[2]
 _REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -133,3 +134,10 @@ def test_no_parallelism_abbreviation_is_emitted(abbreviation: str) -> None:
             if f'"{abbreviation}"' in line and not line.lstrip().startswith("#")
         ]
         assert not emitting, f"{source.name} emits the abbreviated parallelism flag {abbreviation!r}: {emitting}"
+
+
+@pytest.fixture(autouse=True)
+def mock_memory_hardware(monkeypatch):
+    """Launch lifecycle tests use synthetic weight metadata and CUDA capacity."""
+    monkeypatch.setattr(_memory, "device_memory", lambda _: (80 * _memory.GIB, 80 * _memory.GIB))
+    monkeypatch.setattr(_memory.SGLangMemoryBudget, "static_bytes", 8 * _memory.GIB)
