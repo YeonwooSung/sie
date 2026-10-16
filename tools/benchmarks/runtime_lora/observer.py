@@ -58,7 +58,20 @@ def patch_scheduler(module: ModuleType, path: str) -> None:
             "pid": os.getpid(),
             "start_ns": time.time_ns(),
             "mode": str(batch.forward_mode),
-            "requests": [{"rid": req.rid, "uid": req.lora_id, "lora": alias(req.lora_id)} for req in batch.reqs],
+            "requests": [
+                {
+                    "rid": req.rid,
+                    "uid": req.lora_id,
+                    "lora": alias(req.lora_id),
+                    "cache_key": req.extra_key,
+                    "cached_tokens": req.cached_tokens,
+                    "prefix_length": len(req.prefix_indices),
+                    "extend_input_length": req.extend_input_len,
+                    "input_length": len(req.origin_input_ids),
+                    "output_length": len(req.output_ids),
+                }
+                for req in batch.reqs
+            ],
         }
         result = original(self, batch, *args, **kwargs)
         row["end_ns"] = time.time_ns()

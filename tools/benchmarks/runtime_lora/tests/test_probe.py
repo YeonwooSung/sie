@@ -17,6 +17,7 @@ import torch
 from peft import PeftModel
 from safetensors.torch import load_file
 from sie_sdk._msgpack import packb as pack_msgpack
+from sie_sdk.client.errors import ServerError
 from sie_server.adapters.sglang.embedding import SGLangEmbeddingAdapter
 from sie_server.adapters.sglang.generation import SGLangGenerationAdapter
 from sie_server.config.model import ModelConfig
@@ -26,7 +27,20 @@ from transformers import Qwen3Config, Qwen3ForCausalLM
 from tools.benchmarks.runtime_lora.adapters import ObservedGenerationAdapter
 from tools.benchmarks.runtime_lora.fixtures import MODELS, digest, write_adapter
 from tools.benchmarks.runtime_lora.observer import patch_scheduler
-from tools.benchmarks.runtime_lora.probe import Client, Evidence, batch_rows, check_effect, configs, mixed_batches
+from tools.benchmarks.runtime_lora.probe import (
+    BOUNDARY_PROMPT,
+    Client,
+    Evidence,
+    batch_rows,
+    check_buffered_native,
+    check_effect,
+    configs,
+    mixed_batches,
+    probability,
+    record_check,
+    sequence_comparison,
+    token_distribution_comparison,
+)
 
 
 def tiny_config() -> Qwen3Config:
@@ -121,10 +135,78 @@ def test_sdk_observer_captures_cold_503_and_native_retry(tmp_path: Path) -> None
 
     client = Client("http://localhost", Evidence(tmp_path), transport=httpx.MockTransport(respond))
     try:
-        assert client.call("generation", MODELS["generation"][0], "a", "generate") == {"text": "ok"}
+        assert client.call("generation", MODELS["generation"][0], "a", "generate") == {"text": "ok", "usage": None}
         assert [row["status"] for row in client.responses] == [503, 200]
         assert all(request["lora_adapter"] == "a" for request in calls)
         assert client.responses[0]["code"] == "LORA_LOADING"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("route", ["native_stream", "native_boundary"])
+def test_native_stream_sdk_retains_terminal_logprobs_and_retries_only_http_cold_refusal(
+    tmp_path: Path, route: str
+) -> None:
+    calls = []
+    first = {"token": "one", "logprob": -0.1}
+    last = {"token": "two", "logprob": -0.2}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        if len(calls) == 1:
+            return httpx.Response(
+                503, json={"error": {"code": "LORA_LOADING", "message": "loading"}}, headers={"Retry-After": "0"}
+            )
+        chunks = [
+            {"text_delta": "one", "logprobs": [first], "done": False},
+            {
+                "text_delta": "two",
+                "logprobs": [last],
+                "done": True,
+                "finish_reason": "length",
+                "usage": {"completion_tokens": 2},
+            },
+        ]
+        return httpx.Response(
+            200,
+            text="".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n",
+            headers={"Content-Type": "text/event-stream"},
+        )
+
+    client = Client("http://localhost", Evidence(tmp_path), transport=httpx.MockTransport(respond))
+    try:
+        result = client.call("generation", MODELS["generation"][0], "a", route)
+        assert result["text"] == "onetwo"
+        assert result["logprobs"]["content"] == [first, last]
+        assert [row["status"] for row in client.responses] == [503, 200]
+        assert all(request["stream"] and request["logprobs"] and request["top_logprobs"] == 20 for request in calls)
+        assert all(
+            request["lora_adapter"] == "a" and request["temperature"] == 0 and request["seed"] == 17
+            for request in calls
+        )
+        assert calls[-1]["max_new_tokens"] == (1 if route == "native_boundary" else 24)
+        if route == "native_boundary":
+            assert calls[-1]["prompt"] == BOUNDARY_PROMPT
+    finally:
+        client.close()
+
+
+def test_native_stream_does_not_retry_an_error_after_http_success(tmp_path: Path) -> None:
+    calls = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        error = {"done": True, "finish_reason": "error", "error": {"code": "LORA_LOADING", "message": "late failure"}}
+        return httpx.Response(
+            200, text=f"data: {json.dumps(error)}\n\ndata: [DONE]\n\n", headers={"Content-Type": "text/event-stream"}
+        )
+
+    client = Client("http://localhost", Evidence(tmp_path), transport=httpx.MockTransport(respond))
+    try:
+        with pytest.raises(ServerError):
+            client.call("generation", MODELS["generation"][0], "a", "native_stream")
+        assert len(calls) == 1
+        assert "fresh_sdk_generation_retry" not in (tmp_path / "events.jsonl").read_text()
     finally:
         client.close()
 
@@ -188,9 +270,20 @@ def test_observer_records_actual_successful_batch_and_does_not_change_result(
             )
         )
     )
-    batch = SimpleNamespace(
-        forward_mode="DECODE", reqs=[SimpleNamespace(rid="1", lora_id=uid_a), SimpleNamespace(rid="2", lora_id=uid_b)]
-    )
+
+    def req(rid, uid):
+        return SimpleNamespace(
+            rid=rid,
+            lora_id=uid,
+            extra_key=uid,
+            cached_tokens=3,
+            prefix_indices=[0, 1, 2],
+            extend_input_len=2,
+            origin_input_ids=[1, 2, 3, 4, 5],
+            output_ids=[],
+        )
+
+    batch = SimpleNamespace(forward_mode="DECODE", reqs=[req("1", uid_a), req("2", uid_b)])
     assert scheduler.run_batch(batch, extra=3) is result
     assert seen == [(batch, 3)]
     with pytest.raises(ValueError, match="forward failed"):
@@ -198,7 +291,17 @@ def test_observer_records_actual_successful_batch_and_does_not_change_result(
     rows = batch_rows(trace)
     assert len(rows) == 1
     assert rows[0]["gpu_slot_count"] == 2
-    assert rows[0]["requests"][0] == {"rid": "1", "uid": uid_a, "lora": "a"}
+    assert rows[0]["requests"][0] == {
+        "rid": "1",
+        "uid": uid_a,
+        "lora": "a",
+        "cache_key": uid_a,
+        "cached_tokens": 3,
+        "prefix_length": 3,
+        "extend_input_length": 2,
+        "input_length": 5,
+        "output_length": 0,
+    }
     assert rows[0]["gpu_slots"] == [{"uid": uid_a, "lora": "a", "slot": 0}, {"uid": uid_b, "lora": "b", "slot": 1}]
     assert mixed_batches(rows, 0, 2**64) == rows
     rows[0]["gpu_slot_uids"][1] = uid_a
@@ -215,7 +318,7 @@ def test_observer_records_actual_successful_batch_and_does_not_change_result(
     pool = scheduler.tp_worker.model_runner.lora_manager.memory_pool
     pool.buffer_id_to_uid = [None, pool_module.EMPTY_SLOT]
     pool.uid_to_buffer_id = {None: 0}
-    batch.reqs = [SimpleNamespace(rid="base", lora_id=None)]
+    batch.reqs = [req("base", None)]
     assert scheduler.run_batch(batch) is result
     base_row = batch_rows(trace)[-1]
     assert base_row["gpu_slot_uids"] == [None, {"empty_slot": True}]
@@ -262,7 +365,9 @@ def test_child_observer_defers_import_and_preserves_production_hook(
         "scheduler = Scheduler()\n"
         "scheduler.tp_worker = S(model_runner=S(lora_manager=S(lora_refs={}, "
         "memory_pool=S(buffer_id_to_uid=[None], uid_to_buffer_id={None: 0}))))\n"
-        "assert scheduler.run_batch(S(forward_mode='DECODE', reqs=[S(rid='r', lora_id=None)])) == 47\n"
+        "req = S(rid='r', lora_id=None, extra_key=None, cached_tokens=0, prefix_indices=[], "
+        "extend_input_len=1, origin_input_ids=[1], output_ids=[])\n"
+        "assert scheduler.run_batch(S(forward_mode='DECODE', reqs=[req])) == 47\n"
     )
     result = subprocess.run(  # noqa: S603 — fixed synthetic package and script, no external input
         [sys.executable, "-c", script], cwd=tmp_path, env=environment, capture_output=True, text=True, check=False
@@ -271,7 +376,8 @@ def test_child_observer_defers_import_and_preserves_production_hook(
     rows = batch_rows(trace)
     assert [row["event"] for row in rows] == ["observer_installed", "forward"]
     assert rows[0]["slot_release_compat"] is True
-    assert rows[1]["requests"] == [{"rid": "r", "uid": None, "lora": None}]
+    assert rows[1]["requests"][0]["uid"] is None
+    assert rows[1]["requests"][0]["prefix_length"] == 0
 
 
 def test_effect_checks_fail_for_ignored_adapters_and_contaminated_base() -> None:
@@ -301,3 +407,109 @@ def test_effect_checks_require_delta_beyond_observed_numeric_drift() -> None:
         assert check_effect(kind, base, build(0.5 + a), build(0.5 + b), base)
         with pytest.raises(AssertionError, match="beyond base drift"):
             check_effect(kind, base, build(0.5 + a), build(0.5 + b), build(0.5 + reset))
+
+
+def test_generation_restoration_checks_later_tokens_and_pre_adapter_baseline() -> None:
+    def result(first: float, second: float = 0.6, text: str = "same") -> dict:
+        return {
+            "text": text,
+            "logprobs": {
+                "content": [
+                    {"token": "first", "logprob": math.log(first)},
+                    {"token": "second", "logprob": math.log(second)},
+                ]
+            },
+        }
+
+    base, a, b = result(0.5), result(0.6), result(0.7)
+    assert check_effect("generation", base, a, b, base, base)
+    with pytest.raises(AssertionError, match="not restored"):
+        check_effect("generation", base, a, b, result(0.5, second=0.55), base)
+    with pytest.raises(AssertionError, match="not restored"):
+        check_effect("generation", base, a, b, result(0.5, text="different later text"), base)
+    with pytest.raises(AssertionError, match="baseline was not stable"):
+        check_effect("generation", base, a, b, base, result(0.5, second=0.55))
+    with pytest.raises(AssertionError, match="beyond base drift"):
+        check_effect("generation", base, result(0.501), result(0.502), base, result(0.5003))
+    shifted_alternate = result(0.5)
+    base["logprobs"]["content"][1]["top_logprobs"] = [
+        {"token": "second", "logprob": math.log(0.6)},
+        {"token": "alternate", "logprob": math.log(0.2)},
+    ]
+    shifted_alternate["logprobs"]["content"][1]["top_logprobs"] = [
+        {"token": "second", "logprob": math.log(0.6)},
+        {"token": "alternate", "logprob": math.log(0.3)},
+    ]
+    with pytest.raises(AssertionError, match="not restored"):
+        check_effect("generation", base, a, b, shifted_alternate, base)
+    with pytest.raises(AssertionError, match="baseline was not stable"):
+        check_effect("generation", base, a, b, base, shifted_alternate)
+
+
+def test_sequence_comparison_stops_after_context_diverges() -> None:
+    def result(tokens: list[str]) -> dict:
+        return {
+            "text": "".join(tokens),
+            "logprobs": {"content": [{"token": token, "logprob": -0.2} for token in tokens]},
+        }
+
+    comparison = sequence_comparison(result(["same", "a", "suffix"]), result(["same", "b", "suffix"]))
+    assert comparison["same_token_sequence"] is False
+    assert len(comparison["matching_context_positions"]) == 2
+    assert comparison["matching_context_positions"][-1]["chosen_probability_delta"] is None
+
+
+def test_top_k_boundary_changes_do_not_imply_zero_probability() -> None:
+    def token(alternate: str, value: float) -> dict:
+        return {
+            "token": "chosen",
+            "logprob": math.log(0.6),
+            "top_logprobs": [
+                {"token": "chosen", "logprob": math.log(0.6)},
+                {"token": alternate, "logprob": math.log(value)},
+            ],
+        }
+
+    comparison = token_distribution_comparison(token("a", 0.01), token("b", 0.01001))
+    assert comparison["shared_probability_delta"] == 0
+    assert comparison["probability_delta_lower_bound"] == pytest.approx(0.00001)
+    assert len(comparison["support_changes"]) == 2
+    assert token_distribution_comparison(token("a", 0.01), token("b", 0.2))[
+        "probability_delta_lower_bound"
+    ] == pytest.approx(0.19)
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), 0.1])
+def test_later_invalid_logprobs_cannot_disappear_from_comparison(invalid: float) -> None:
+    base = {"text": "same", "logprobs": {"content": [{"token": "a", "logprob": -0.1}, {"token": "b", "logprob": -0.2}]}}
+    invalid_result = {
+        "text": "same",
+        "logprobs": {"content": [{"token": "a", "logprob": -0.1}, {"token": "b", "logprob": invalid}]},
+    }
+    with pytest.raises(AssertionError, match="invalid token log probability"):
+        sequence_comparison(base, invalid_result)
+    assert probability(float("-inf")) == 0
+
+
+def test_native_failure_survives_later_independent_success_and_runtime_errors_abort(tmp_path: Path) -> None:
+    evidence, failures = Evidence(tmp_path), []
+    values = {
+        name: {"text": text}
+        for name, text in (("first", "cold"), ("warm_1", "warm"), ("warm_2", "warm"), ("reset", "wrong"))
+    }
+    native = record_check(evidence, failures, "native", lambda: check_buffered_native(values))
+    assert native["passed"] is False
+    for phase in ("mixed", "churn", "embedding"):
+        assert record_check(evidence, failures, phase, lambda: {"independent_evidence": True})["passed"] is True
+    assert failures == [{"phase": "native", "message": "native buffered base text did not restore"}]
+    values["reset"]["text"] = "warm"
+    assert check_buffered_native(values)["first_vs_warm_text_equal"] is False
+    values["warm_1"]["text"] = "unstable"
+    with pytest.raises(AssertionError, match="warm baseline"):
+        check_buffered_native(values)
+
+    def runtime_failure() -> dict:
+        raise RuntimeError("engine stopped")
+
+    with pytest.raises(RuntimeError, match="engine stopped"):
+        record_check(evidence, failures, "runtime", runtime_failure)

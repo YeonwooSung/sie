@@ -13,6 +13,7 @@ import os
 import socket
 import threading
 import time
+from collections.abc import Callable
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any, cast
@@ -38,6 +39,7 @@ from tools.benchmarks.runtime_lora.observer import TRACE_ENV
 ROOT = Path(__file__).resolve().parents[3]
 MESSAGES: list[ChatMessage] = [{"role": "user", "content": "Explain why the sky is blue in two short sentences."}]
 PROMPT = "The sky appears blue because"
+BOUNDARY_PROMPT = PROMPT + " of the reflection of light. This is an example of"
 TEXTS = ["A red fox walks through the forest.", "Neural networks encode text as vectors."]
 MAX_RESIDENT = 3
 MIN_EMBEDDING_EFFECT = 1e-5
@@ -107,6 +109,7 @@ class Client:
 
     def call(self, kind: str, model: str, selection: str | None, route: str = "chat") -> dict[str, Any]:
         for attempt in range(MAX_GENERATION_RETRIES + 1):
+            response_start = len(self.responses)
             try:
                 return self._call(kind, model, selection, route)
             except ServerError as error:
@@ -114,6 +117,9 @@ class Client:
                     kind != "generation"
                     or error.status_code != HTTPStatus.SERVICE_UNAVAILABLE
                     or error.code != "LORA_LOADING"
+                    or len(self.responses) == response_start
+                    or self.responses[-1]["status"] != HTTPStatus.SERVICE_UNAVAILABLE
+                    or self.responses[-1]["code"] != "LORA_LOADING"
                     or attempt == MAX_GENERATION_RETRIES
                 ):
                     raise
@@ -145,7 +151,36 @@ class Client:
                 lora_adapter=selection,
                 max_oom_retries=0,
             )
-            return {"text": result["text"]}
+            return {"text": result["text"], "usage": result.get("usage")}
+        if route in {"native_stream", "native_boundary"}:
+            boundary = route == "native_boundary"
+            chunks = list(
+                self.sdk.stream_generate(
+                    model,
+                    BOUNDARY_PROMPT if boundary else PROMPT,
+                    max_new_tokens=1 if boundary else 24,
+                    temperature=0.0,
+                    seed=17,
+                    logprobs=True,
+                    top_logprobs=20,
+                    lora_adapter=selection,
+                    max_oom_retries=0,
+                )
+            )
+            require(chunks and chunks[-1].get("done"), "native stream had no successful terminal event")
+            require(chunks[-1].get("finish_reason") in {"stop", "length"}, "native stream did not finish successfully")
+            content = [item for chunk in chunks for item in chunk.get("logprobs", [])]
+            require(content, "native stream did not return token probabilities")
+            require(
+                len(content) == (chunks[-1].get("usage") or {}).get("completion_tokens"),
+                "native stream omitted token probabilities",
+            )
+            return {
+                "text": "".join(chunk.get("text_delta", "") for chunk in chunks),
+                "logprobs": {"content": content},
+                "usage": chunks[-1].get("usage"),
+                "chunk_count": len(chunks),
+            }
         result = self.sdk.chat_completions(
             model,
             MESSAGES,
@@ -186,22 +221,89 @@ class Client:
         self.sdk.close()
 
 
-def first_distribution(result: dict[str, Any]) -> dict[str, float]:
+def token_content(result: dict[str, Any]) -> list[dict[str, Any]]:
     content = (result.get("logprobs") or {}).get("content") or []
-    require(content, "chat must return token logprobs")
-    first = content[0]
-    return {item["token"]: float(item["logprob"]) for item in first.get("top_logprobs", [first])}
+    require(content, "generation must return token logprobs")
+    return content
+
+
+def probability(value: Any) -> float:
+    logprob = float(value)
+    require(not math.isnan(logprob) and logprob <= 0, "invalid token log probability")
+    return math.exp(logprob)
+
+
+def token_distribution_comparison(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    def observed(value: dict[str, Any]) -> tuple[dict[str, float], float]:
+        top = {item["token"]: probability(item["logprob"]) for item in value.get("top_logprobs") or []}
+        cutoff = min(top.values()) if top else 1.0
+        return {**top, value["token"]: probability(value["logprob"])}, cutoff
+
+    a, cutoff_a = observed(left)
+    b, cutoff_b = observed(right)
+    shared_delta = max((abs(a[token] - b[token]) for token in a.keys() & b.keys()), default=0.0)
+    changes: list[dict[str, Any]] = [
+        {"token": token, "observed_in": side, "probability": known[token], "other_upper_bound": cutoff}
+        for known, missing, side, cutoff in ((a, b, "left", cutoff_b), (b, a, "right", cutoff_a))
+        for token in sorted(known.keys() - missing.keys())
+    ]
+    # An absent token is below the other top-k cutoff, not probability zero.
+    lower_bound = max([shared_delta, *(max(0.0, item["probability"] - item["other_upper_bound"]) for item in changes)])
+    return {
+        "shared_probability_delta": shared_delta,
+        "probability_delta_lower_bound": lower_bound,
+        "support_changes": changes,
+    }
 
 
 def distribution_delta(left: dict[str, Any], right: dict[str, Any]) -> float:
-    a, b = first_distribution(left), first_distribution(right)
-    probabilities_a = {token: math.exp(value) for token, value in a.items()}
-    probabilities_b = {token: math.exp(value) for token, value in b.items()}
-    return max(abs(probabilities_a.get(token, 0.0) - probabilities_b.get(token, 0.0)) for token in a.keys() | b.keys())
+    return token_distribution_comparison(token_content(left)[0], token_content(right)[0])[
+        "probability_delta_lower_bound"
+    ]
+
+
+def sequence_comparison(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    """Compare probabilities only while the preceding token contexts match."""
+    a, b = token_content(left), token_content(right)
+    deltas = []
+    for index, (x, y) in enumerate(zip(a, b, strict=False)):
+        same_token = x["token"] == y["token"]
+        comparison = token_distribution_comparison(x, y)
+        deltas.append(
+            {
+                "index": index,
+                "same_token": same_token,
+                "chosen_probability_delta": abs(probability(x["logprob"]) - probability(y["logprob"]))
+                if same_token
+                else None,
+                **comparison,
+            }
+        )
+        if not same_token:
+            break
+    return {
+        "text_equal": left["text"] == right["text"],
+        "same_token_sequence": len(a) == len(b) == len(deltas) and all(row["same_token"] for row in deltas),
+        "max_aligned_chosen_probability_delta": max(
+            (row["chosen_probability_delta"] or 0.0 for row in deltas), default=0.0
+        ),
+        "max_aligned_shared_top_probability_delta": max(
+            (row["shared_probability_delta"] for row in deltas), default=0.0
+        ),
+        "max_aligned_probability_delta_lower_bound": max(
+            (row["probability_delta_lower_bound"] for row in deltas), default=0.0
+        ),
+        "matching_context_positions": deltas,
+    }
 
 
 def check_effect(
-    kind: str, base: dict[str, Any], a: dict[str, Any], b: dict[str, Any], restored: dict[str, Any]
+    kind: str,
+    base: dict[str, Any],
+    a: dict[str, Any],
+    b: dict[str, Any],
+    restored: dict[str, Any],
+    baseline_repeat: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if kind == "embedding":
         vectors = [np.asarray(value["vectors"], dtype=np.float64) for value in (base, a, b, restored)]
@@ -223,19 +325,61 @@ def check_effect(
         }
     aa, bb, ab = (distribution_delta(x, y) for x, y in ((base, a), (base, b), (a, b)))
     reset = distribution_delta(base, restored)
-    minimum = max(MIN_PROBABILITY_EFFECT, EFFECT_DRIFT_MULTIPLIER * reset)
+    baseline = baseline_repeat if baseline_repeat is not None else base
+    baseline_drift = distribution_delta(base, baseline)
+    repeat_comparison = sequence_comparison(base, baseline)
+    reset_comparison = sequence_comparison(base, restored)
+    minimum = max(MIN_PROBABILITY_EFFECT, EFFECT_DRIFT_MULTIPLIER * max(reset, baseline_drift))
     require(
-        base["text"] == restored["text"] and reset < MAX_PROBABILITY_RESET_ERROR,
+        repeat_comparison["text_equal"]
+        and repeat_comparison["same_token_sequence"]
+        and repeat_comparison["max_aligned_chosen_probability_delta"] < MAX_PROBABILITY_RESET_ERROR
+        and repeat_comparison["max_aligned_probability_delta_lower_bound"] < MAX_PROBABILITY_RESET_ERROR,
+        "warm generation baseline was not stable",
+    )
+    require(
+        reset_comparison["text_equal"]
+        and reset_comparison["same_token_sequence"]
+        and reset_comparison["max_aligned_chosen_probability_delta"] < MAX_PROBABILITY_RESET_ERROR
+        and reset_comparison["max_aligned_probability_delta_lower_bound"] < MAX_PROBABILITY_RESET_ERROR
+        and reset < MAX_PROBABILITY_RESET_ERROR,
         "base generation was not restored",
     )
     require(min(aa, bb, ab) > minimum, "LoRA generation had no observable effect beyond base drift")
     return {
-        "a_vs_base_first_token_probability_delta": aa,
-        "b_vs_base_first_token_probability_delta": bb,
-        "a_vs_b_first_token_probability_delta": ab,
-        "base_reset_first_token_probability_delta": reset,
+        "a_vs_base_first_token_probability_delta_lower_bound": aa,
+        "b_vs_base_first_token_probability_delta_lower_bound": bb,
+        "a_vs_b_first_token_probability_delta_lower_bound": ab,
+        "base_reset_first_token_probability_delta_lower_bound": reset,
+        "baseline_first_token_probability_delta_lower_bound": baseline_drift,
+        "baseline_comparison": repeat_comparison,
+        "reset_comparison": reset_comparison,
         "required_effect_minimum": minimum,
         "base_text_restored": True,
+    }
+
+
+def record_check(
+    evidence: Evidence, failures: list[dict[str, str]], phase: str, check: Callable[[], dict[str, Any]]
+) -> dict[str, Any]:
+    """Continue independent proof phases after numeric assertions, never runtime errors."""
+    try:
+        result = check()
+    except AssertionError as error:
+        failure = {"phase": phase, "message": str(error)}
+        failures.append(failure)
+        evidence.emit("assertion_failed", **failure)
+        return {"passed": False, **failure}
+    evidence.emit("assertion_pass", phase=phase, **result)
+    return {"passed": True, **result}
+
+
+def check_buffered_native(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    require(results["warm_1"]["text"] == results["warm_2"]["text"], "native buffered warm baseline text was not stable")
+    require(results["warm_2"]["text"] == results["reset"]["text"], "native buffered base text did not restore")
+    return {
+        "first_vs_warm_text_equal": results["first"]["text"] == results["warm_2"]["text"],
+        "warm_text_restored": True,
     }
 
 
@@ -320,6 +464,7 @@ async def run_model(kind: str, registry: Any, url: str, evidence: Evidence, trac
     client = Client(url, evidence)
     others = []
     pid = None
+    failures: list[dict[str, str]] = []
 
     async def call(selection: str | None, phase: str, route: str = "chat") -> dict[str, Any]:
         start = time.time_ns()
@@ -362,21 +507,64 @@ async def run_model(kind: str, registry: Any, url: str, evidence: Evidence, trac
             evidence.emit("undeclared_denied", kind=kind, status=error.status_code, code=error.code)
         else:
             raise AssertionError("undeclared adapter was accepted")
-        native_base = None
+        native: dict[str, dict[str, dict[str, Any]]] = {}
+        baseline_repeat = None
         if kind == "generation":
-            native_base = await call(None, "native_base", "generate")
-            await call("a", "native_cold_a", "generate")
+            baseline_repeat = await call(None, "chat_base_warm_1")
+            warm = await call(None, "chat_base_warm_2")
+            evidence.emit(
+                "baseline_comparison",
+                route="chat",
+                first_vs_warm=sequence_comparison(base, warm),
+                warm_repeat=sequence_comparison(baseline_repeat, warm),
+            )
+            base = warm
+            for route in ("generate", "native_stream", "native_boundary"):
+                native[route] = {
+                    phase: await call(None, f"{route}_base_{phase}", route) for phase in ("first", "warm_1", "warm_2")
+                }
+                if route != "generate":
+                    evidence.emit(
+                        "baseline_comparison",
+                        route=route,
+                        first_vs_warm=sequence_comparison(native[route]["first"], native[route]["warm_2"]),
+                        warm_repeat=sequence_comparison(native[route]["warm_1"], native[route]["warm_2"]),
+                    )
+            for route, values in native.items():
+                values["a"] = await call("a", f"{route}_a", route)
         a = await call("a", "a")
         b = await call("b", "cold_b")
         require(await listing("a_b_ready") == {"pin", "a", "b"}, "ready listing omitted a selected adapter")
         reset = await call(None, "base_after_a_b")
-        effects = check_effect(kind, base, a, b, reset)
-        evidence.emit("effect_pass", kind=kind, **effects)
-
         if kind == "generation":
-            await call("b", "native_b", "generate")
-            native_reset = await call(None, "native_reset", "generate")
-            require(native_base == native_reset, "native generation base did not restore")
+            evidence.emit("restoration_comparison", route="chat", comparison=sequence_comparison(base, reset))
+        effects = record_check(
+            evidence, failures, f"{kind}_effects", lambda: check_effect(kind, base, a, b, reset, baseline_repeat)
+        )
+
+        native_effects = {}
+        if kind == "generation":
+            for route, values in native.items():
+                values["b"] = await call("b", f"{route}_b", route)
+                values["reset"] = await call(None, f"{route}_reset", route)
+                if route == "generate":
+                    native_effects[route] = record_check(
+                        evidence, failures, route, lambda: check_buffered_native(values)
+                    )
+                else:
+                    evidence.emit(
+                        "restoration_comparison",
+                        route=route,
+                        comparison=sequence_comparison(values["warm_2"], values["reset"]),
+                    )
+                    native_effects[route] = record_check(
+                        evidence,
+                        failures,
+                        route,
+                        lambda: check_effect(
+                            "generation", values["warm_2"], values["a"], values["b"], values["reset"], values["warm_1"]
+                        ),
+                    )
             barrier = threading.Barrier(2)
             others = [Client(url, evidence), Client(url, evidence)]
             streams = await asyncio.gather(
@@ -403,8 +591,16 @@ async def run_model(kind: str, registry: Any, url: str, evidence: Evidence, trac
             previous = ready
         require(evicted and "pin" not in evicted, "churn did not evict dynamic adapters while preserving pin")
         restored = await call(None, "base_after_churn")
-        post_churn_effects = check_effect(kind, base, a, b, restored)
-        evidence.emit("post_churn_effect_pass", kind=kind, **post_churn_effects)
+        if kind == "generation":
+            evidence.emit(
+                "restoration_comparison", route="chat_after_churn", comparison=sequence_comparison(base, restored)
+            )
+        post_churn_effects = record_check(
+            evidence,
+            failures,
+            f"{kind}_post_churn_effects",
+            lambda: check_effect(kind, base, a, b, restored, baseline_repeat),
+        )
         cold = {
             row["selection"]
             for row in client.responses
@@ -422,6 +618,8 @@ async def run_model(kind: str, registry: Any, url: str, evidence: Evidence, trac
             "cold_retried": sorted(cold),
             "evicted": sorted(evicted),
             "pin_preserved": True,
+            "assertion_failures": failures,
+            "passed": not failures,
         }
         if kind == "generation":
             forwards = [row for row in batch_rows(trace) if row.get("event") == "forward"]
@@ -431,8 +629,14 @@ async def run_model(kind: str, registry: Any, url: str, evidence: Evidence, trac
                 set(ALIASES).issubset(seen) and len(seen) > capacity,
                 "successful churn did not exceed actual GPU slot count",
             )
-            result.update({"gpu_slot_count": capacity, "distinct_forward_adapters": sorted(seen)})
-        evidence.emit("model_pass", kind=kind, **result)
+            result.update(
+                {
+                    "gpu_slot_count": capacity,
+                    "distinct_forward_adapters": sorted(seen),
+                    "native_effects": native_effects,
+                }
+            )
+        evidence.emit("model_result", kind=kind, **result)
         await registry.unload_async(model)
         require(process.poll() is not None, "owned engine still running after sequential unload")
         evidence.emit("engine_stopped", kind=kind, pid=pid, returncode=process.poll())
@@ -504,6 +708,10 @@ async def run(args: argparse.Namespace) -> None:
                 summary["models"][kind] = await run_model(
                     kind, app.state.registry, url, evidence, output / "batches.jsonl"
                 )
+            require(
+                all(result["passed"] for result in summary["models"].values()),
+                "required acceptance assertions failed; see model results and events",
+            )
             summary["passed"] = True
     except BaseException as error:
         summary["error"] = {"type": type(error).__name__, "message": str(error)}

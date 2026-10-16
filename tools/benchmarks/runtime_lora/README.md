@@ -32,10 +32,21 @@ The acceptance run checks:
   Encode retries automatically. The current generation SDK surfaces this
   refusal, so the probe records and makes bounded fresh SDK calls only for
   pre-execution `503 LORA_LOADING`; it never retries a failed open stream.
-- Adapter effects in chat token log probabilities and embedding vectors; base
-  restoration after switching and after eviction. Pairwise effects must exceed
-  the fixed minimum and five times measured base-repeat drift. These untrained
-  fixtures provide selection evidence, not model-quality evidence.
+- Adapter effects in native/chat token log probabilities and embedding vectors;
+  base restoration after switching and after eviction. Generation records a
+  first response and two warm baseline repeats before any runtime selection.
+  Restored warm text must match exactly. At every matching token context, chosen
+  and shared top-token probability drift must stay below the fixed `1e-3` bound.
+  Top-k support changes are recorded: absent tokens have probability bounded by
+  the other top-k cutoff, and conservative difference lower bounds also must stay
+  below `1e-3`. Unreported tail probabilities remain unmeasured; small lower bounds
+  do not establish upper bounds on their drift. First-token
+  pairwise selection effects must exceed `1e-4` and five times baseline/reset
+  first-token drift. Embeddings retain fixed `1e-5` effect and `5e-5` reset bounds.
+  All full text and token probabilities are retained, including cold/warm
+  differences. Native streaming also probes one token after a fixed common
+  prefix where an earlier run diverged; this holds context constant when
+  comparing base/A/B/reset. These fixtures establish selection, not quality.
 - Stable engine PID, rejection of undeclared adapters, ready-name listing,
   preservation of one pinned adapter, and churn across four dynamic adapters.
 - Overlapping A/B streams **and a successful engine forward containing both**.
@@ -46,7 +57,9 @@ The acceptance run checks:
   distinct valid slots, with consistent inverse mappings. Completed SDK streams
   establish completion; the hook timestamp is not a GPU timing measurement.
   It also requires SIE's slot-release compatibility hook to be present.
-  Observation does not alter scheduling or model tensors.
+  Cache-prefix/input/output lengths are captured before the forward, using
+  scalar fields and tensor shape metadata only. Observation does not alter
+  scheduling, cache settings, or model tensors.
 
 `evidence.json` contains the final verdict. `events.jsonl`, `batches.jsonl`,
 fixture hashes, generated model configurations, and `source-manifest.json`
@@ -54,6 +67,9 @@ provide the supporting record. Use a fresh output directory. The run has a
 780-second default deadline and unloads each owned engine before starting the
 next; any external compute allocation must have its own finite lifetime and
 be stopped and verified separately by its owner.
+Numeric/restoration assertion failures are recorded while independent phases
+continue on a healthy engine; the final verdict remains failed and the process
+exits unsuccessfully. Transport, observer, or lifecycle failures stop the run.
 
 Pinned primary sources: [generation config](https://huggingface.co/Qwen/Qwen3-0.6B/blob/c1899de289a04d12100db370d81485cdf75e47ca/config.json),
 [embedding config](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/blob/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3/config.json),
