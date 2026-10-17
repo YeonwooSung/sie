@@ -296,7 +296,7 @@ preparation above, the prospective baseline-only invocation is:
 
 ```console
 mise exec -- uv run --no-sync python -m tools.benchmarks.cross_encoder_lora.interleaved \
-  --inputs /tmp/ce-inputs --fixtures /tmp/ce-fixtures --output /tmp/ce-baseline-pilot \
+  --inputs /tmp/ce-sources --fixtures /tmp/ce-fixtures --output /tmp/ce-baseline-pilot \
   --mode baseline-pilot --deadline-s 3900 --group-work-s 600
 ```
 

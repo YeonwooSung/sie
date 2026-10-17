@@ -28,6 +28,12 @@ from tools.benchmarks.cross_encoder_lora.runner import ROOT, source_environment
 from tools.benchmarks.cross_encoder_lora.tests.test_probe import tiny_snapshot
 
 
+def require_baseline_history() -> None:
+    available = subprocess.run(["git", "cat-file", "-e", BASE_REVISION], cwd=ROOT, capture_output=True, check=False)  # noqa: S607
+    if available.returncode:
+        pytest.skip("immutable archive smoke requires the documented baseline commit in git history")
+
+
 def test_strict_group_admission() -> None:
     assert not interleaved.admission(100, 789)["admitted"]
     assert not interleaved.admission(100, 790)["admitted"]
@@ -120,6 +126,7 @@ def test_manifest_and_extracted_source_hashes_checked_before_load(tmp_path: Path
 
 @pytest.mark.parametrize("mode", ["baseline-pilot", "qualification"])
 def test_real_archived_whole_phase_triplet(tmp_path: Path, mode: str) -> None:
+    require_baseline_history()
     snapshot = tiny_snapshot(tmp_path / "model")
     fixtures = tmp_path / "fixtures"
     fixtures_prepare(fixtures, snapshot, smoke=True)
@@ -295,6 +302,7 @@ def test_coordinator_full_file_hashes_wait_for_all_nine_timers(tmp_path: Path, m
 
 
 def test_actual_coordinator_term_reaps_archived_workers_and_sdk_children(tmp_path: Path) -> None:
+    require_baseline_history()
     snapshot = tiny_snapshot(tmp_path / "model")
     fixtures = tmp_path / "fixtures"
     fixtures_prepare(fixtures, snapshot, smoke=True)
