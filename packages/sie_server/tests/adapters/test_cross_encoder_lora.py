@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import builtins
+import gc
 import json
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -60,13 +62,13 @@ def checkpoint(tmp_path_factory):
     return directory
 
 
-def save_adapter(path, seed=1, **overrides):
+def save_adapter(path, seed=1, *, targets=("query", "value"), **overrides):
     path.mkdir()
     LoraConfig(
         task_type="SEQ_CLS",
         r=4,
         lora_alpha=8,
-        target_modules=["query", "value"],
+        target_modules=list(targets),
         bias="none",
         lora_dropout=0,
         inference_mode=True,
@@ -79,7 +81,7 @@ def save_adapter(path, seed=1, **overrides):
     generator = torch.Generator().manual_seed(seed)
     weights = {}
     for layer in range(2):
-        for target in ("query", "value"):
+        for target in targets:
             prefix = f"base_model.model.bert.encoder.layer.{layer}.attention.self.{target}"
             weights[f"{prefix}.lora_A.weight"] = torch.randn(4, 16, generator=generator) * 0.4
             weights[f"{prefix}.lora_B.weight"] = torch.randn(16, 4, generator=generator) * 0.4
@@ -210,6 +212,173 @@ def test_actual_effect_restoration_head_and_final_module_identity(adapter):
     np.testing.assert_array_equal(scores(adapter), a)
 
 
+def test_resident_adapters_leave_the_exact_base_tree_and_preserve_layer_hooks(adapter):
+    snapshot = base_snapshot(adapter)
+    baseline = scores(adapter)
+    original_query = snapshot[1].bert.encoder.layer[0].attention.self.query
+    original_calls, wrapper_calls = [], []
+    base_hook = original_query.register_forward_hook(lambda *_: original_calls.append(True))
+    adapter.load_lora("a")
+    manager = adapter._lora
+    assert dict(snapshot[1].named_modules()) == snapshot[5]
+    wrapper = manager._resident_layers["bert.encoder.layer.0.attention.self.query"]
+    wrapper_hook = wrapper.register_forward_hook(lambda *_: wrapper_calls.append(True))
+    adapter.load_lora("b")
+    identities = {name: id(layer) for name, layer in manager._resident_layers.items()}
+    assert dict(snapshot[1].named_modules()) == snapshot[5]
+    assert len(manager._loaded) == 2
+    assert sum(manager._loaded.values()) == 4096
+    expected = {None: baseline}
+    for selection in ("a", None, "b", None, "a", None, "b", None):
+        old_wrapper_calls = len(wrapper_calls)
+        old_original_calls = len(original_calls)
+        adapter.set_active_lora(selection)
+        actual = scores(adapter)
+        assert len(original_calls) > old_original_calls
+        if selection is None:
+            assert dict(snapshot[1].named_modules()) == snapshot[5]
+            assert len(wrapper_calls) == old_wrapper_calls
+        else:
+            assert len(wrapper_calls) > old_wrapper_calls
+            assert all(id(snapshot[1].get_submodule(name)) == identity for name, identity in identities.items())
+            assert np.max(np.abs(actual - baseline)) > 1e-6
+        if selection in expected:
+            np.testing.assert_array_equal(actual, expected[selection])
+        expected[selection] = actual
+        assert_base_preserved(adapter, snapshot)
+        assert {name: id(layer) for name, layer in manager._resident_layers.items()} == identities
+    assert np.max(np.abs(expected["a"] - expected["b"])) > 1e-6
+    base_hook.remove()
+    wrapper_hook.remove()
+
+
+def test_disjoint_targets_evict_only_their_wrappers_and_final_unload_releases_weights(checkpoint, tmp_path):
+    paths = {
+        "a": save_adapter(tmp_path / "a", 1, targets=("query",)),
+        "b": save_adapter(tmp_path / "b", 2, targets=("value",)),
+    }
+    adapter = CrossEncoderAdapter(checkpoint, lora_paths=paths, max_loaded_loras=2)
+    adapter.load("cpu")
+    try:
+        snapshot, baseline = base_snapshot(adapter), scores(adapter)
+        adapter.load_lora("a")
+        adapter.set_active_lora("a")
+        a = scores(adapter)
+        adapter.load_lora("b")
+        manager = adapter._lora
+        refs = {name: weakref.ref(layer) for name, layer in manager._resident_layers.items()}
+        parameter_refs = [weakref.ref(p) for parameters in manager._parameters.values() for p in parameters]
+        assert dict(snapshot[1].named_modules()) == snapshot[5]
+        assert set(refs) == {
+            f"bert.encoder.layer.{i}.attention.self.{target}" for i in range(2) for target in ("query", "value")
+        }
+        adapter.set_active_lora("b")
+        b = scores(adapter)
+        assert np.max(np.abs(a - baseline)) > 1e-6
+        assert np.max(np.abs(b - baseline)) > 1e-6
+        adapter.set_active_lora(None)
+        np.testing.assert_array_equal(scores(adapter), baseline)
+        adapter.unload_lora("a")
+        gc.collect()
+        assert all(ref() is None for name, ref in refs.items() if name.endswith("query"))
+        assert all(ref() is not None for name, ref in refs.items() if name.endswith("value"))
+        assert dict(snapshot[1].named_modules()) == snapshot[5]
+        assert sum(manager._loaded.values()) == 1024
+        adapter.set_active_lora("b")
+        np.testing.assert_array_equal(scores(adapter), b)
+        adapter.unload_lora("b")
+        gc.collect()
+        assert all(ref() is None for ref in refs.values())
+        assert all(ref() is None for ref in parameter_refs)
+        assert not manager._resident_layers
+        assert_base_preserved(adapter, snapshot, unwrapped=True)
+        adapter.load_lora("a")
+        adapter.set_active_lora("a")
+        np.testing.assert_array_equal(scores(adapter), a)
+    finally:
+        adapter.unload()
+
+
+@pytest.mark.parametrize("operation", ["attach", "detach"])
+def test_partial_tree_swap_failure_poisoning_preserves_residency_until_teardown(adapter, monkeypatch, operation):
+    snapshot = base_snapshot(adapter)
+    adapter.load_lora("a")
+    adapter.load_lora("b")
+    manager = adapter._lora
+    if operation == "detach":
+        adapter.set_active_lora("a")
+    refs = [weakref.ref(layer) for layer in manager._resident_layers.values()]
+
+    def partial_swap():
+        name, layer = next(iter(manager._resident_layers.items()))
+        parent_name, _, child = name.rpartition(".")
+        setattr(
+            manager._model.get_submodule(parent_name),
+            child,
+            layer if operation == "attach" else manager._originals[name],
+        )
+        raise RuntimeError("injected partial tree swap")
+
+    with monkeypatch.context() as context:
+        context.setattr(manager, f"_{operation}_layers", partial_swap)
+        with pytest.raises(LoraStateUncertainError, match="Failed to select"):
+            adapter.set_active_lora("a" if operation == "attach" else None)
+    assert len(manager._loaded) == 2
+    assert sum(manager._loaded.values()) == 4096
+    with pytest.raises(LoraStateUncertainError, match="uncertain"):
+        adapter.set_active_lora(None)
+    adapter.unload()
+    gc.collect()
+    assert all(ref() is None for ref in refs)
+    assert dict(snapshot[1].named_modules()) == snapshot[5]
+    assert not manager._resident_layers
+    assert not manager._loaded
+
+
+def test_external_precision_change_with_detached_adapters_fails_closed(adapter):
+    adapter.load_lora("a")
+    adapter._model.to(dtype=torch.float64)
+    with pytest.raises(LoraStateUncertainError, match="Failed to select"):
+        adapter.set_active_lora("a")
+    assert len(adapter._lora._loaded) == 1
+    with pytest.raises(LoraStateUncertainError, match="uncertain"):
+        adapter.set_active_lora(None)
+
+
+def test_partial_detach_failure_during_load_removes_all_failed_adapter_weights(adapter, monkeypatch):
+    snapshot, baseline = base_snapshot(adapter), scores(adapter)
+    adapter.load_lora("a")
+    adapter.set_active_lora("a")
+    a = scores(adapter)
+    manager = adapter._lora
+    original = manager._detach_layers
+    failed = False
+
+    def fail_after_first_detached_layer():
+        nonlocal failed
+        if failed:
+            return original()
+        failed = True
+        name, layer = next(iter(manager._resident_layers.items()))
+        parent_name, _, child = name.rpartition(".")
+        setattr(manager._model.get_submodule(parent_name), child, manager._originals[name])
+        assert len(layer.lora_A) == 2
+        raise RuntimeError("injected failure after detaching one updated layer")
+
+    with monkeypatch.context() as context:
+        context.setattr(manager, "_detach_layers", fail_after_first_detached_layer)
+        with pytest.raises(RuntimeError, match="after detaching"):
+            adapter.load_lora("b")
+    assert len(manager._loaded) == 1
+    assert all(len(layer.lora_A) == len(layer.lora_B) == 1 for layer in manager._resident_layers.values())
+    assert dict(snapshot[1].named_modules()) == snapshot[5]
+    np.testing.assert_array_equal(scores(adapter), baseline)
+    adapter.set_active_lora("a")
+    np.testing.assert_array_equal(scores(adapter), a)
+    adapter.load_lora("b")
+    assert len(manager._loaded) == 2
+
+
 @pytest.mark.parametrize("existing", [False, True])
 def test_failed_attachment_rolls_back_entire_base_or_only_failed_adapter(adapter, monkeypatch, existing):
     snapshot = base_snapshot(adapter)
@@ -229,6 +398,7 @@ def test_failed_attachment_rolls_back_entire_base_or_only_failed_adapter(adapter
         with pytest.raises(RuntimeError, match="injected post-load"):
             adapter.load_lora("b")
     assert_base_preserved(adapter, snapshot, unwrapped=not existing)
+    assert dict(snapshot[1].named_modules()) == snapshot[5]
     np.testing.assert_array_equal(scores(adapter), baseline)
     assert adapter._lora._prepared == {}
     with pytest.raises(LoraUnavailableError):
@@ -394,11 +564,20 @@ def test_fetch_rechecks_model_generation_before_publishing_source(adapter, monke
 
 
 @pytest.mark.parametrize("existing", [False, True])
-def test_partial_injection_failure_preserves_old_adapters_and_base(adapter, monkeypatch, existing):
+@pytest.mark.parametrize("disjoint", [False, True])
+def test_partial_injection_failure_preserves_old_adapters_and_base(adapter, monkeypatch, existing, disjoint):
     from peft.tuners.lora.model import LoraModel
 
     snapshot = base_snapshot(adapter)
     baseline = scores(adapter)
+    if disjoint:
+        for alias, target in (("a", "query"), ("b", "value")):
+            path = Path(adapter._lora._aliases[alias])
+            config = json.loads((path / "adapter_config.json").read_text())
+            config["target_modules"] = [target]
+            (path / "adapter_config.json").write_text(json.dumps(config))
+            weights = {k: v for k, v in load_file(path / "adapter_model.safetensors").items() if f".{target}." in k}
+            save_file(weights, path / "adapter_model.safetensors")
     if existing:
         adapter.load_lora("a")
         adapter.set_active_lora("a")
@@ -419,6 +598,9 @@ def test_partial_injection_failure_preserves_old_adapters_and_base(adapter, monk
             adapter.load_lora("b")
     assert calls == 2
     assert_base_preserved(adapter, snapshot, unwrapped=not existing)
+    assert dict(snapshot[1].named_modules()) == snapshot[5]
+    if disjoint:
+        assert all(name.endswith("query") for name in adapter._lora._resident_layers)
     np.testing.assert_array_equal(scores(adapter), baseline)
     if existing:
         adapter.set_active_lora("a")

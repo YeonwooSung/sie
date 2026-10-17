@@ -3,7 +3,8 @@
 The outer wrapper, tokenizer, classifier and activation are never replaced.
 Transformers injects ordinary LoRA layers into declared BERT encoder Linear
 modules. The worker owns selection/mutation exclusion; only background source
-preparation needs a separate lock here. No scoring code calls into this module.
+preparation needs a separate lock here. Resident layers stay outside the model's
+module tree while base is selected. No scoring code calls into this module.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import torch
 from huggingface_hub import snapshot_download
 from peft import LoraConfig, PeftConfig
 from peft.functional import delete_adapter
+from peft.tuners.lora.layer import Linear as LoraLinear
 from safetensors.torch import load_file
 from sentence_transformers import CrossEncoder
 from transformers import BertForSequenceClassification
@@ -92,6 +94,10 @@ class CrossEncoderLora:
         self._outer: CrossEncoder | None = None
         self._model: Any = None
         self._originals: dict[str, torch.nn.Linear] = {}
+        # An ordinary dict deliberately keeps resident adapters outside nn.Module's
+        # traversal while base is selected. CrossEncoder.predict calls to()/eval()
+        # on every batch, even when the model is already on the requested device.
+        self._resident_layers: dict[str, LoraLinear] = {}
         self._grad_flags: list[tuple[torch.nn.Parameter, bool]] = []
         self._closed = True
         self._uncertain = False
@@ -237,6 +243,42 @@ class CrossEncoderLora:
         for parameter, requires_grad in self._grad_flags:
             parameter.requires_grad_(requires_grad)
 
+    def _attach_layers(self) -> None:
+        """Expose all resident layers only during a guarded adapter operation."""
+        for name, layer in self._resident_layers.items():
+            original = self._originals[name]
+            current = self._model.get_submodule(name)
+            if current is not original and current is not layer:
+                raise RuntimeError(f"CrossEncoder module {name!r} changed outside the LoRA lifecycle")
+            if layer.get_base_layer() is not original:
+                raise RuntimeError(f"CrossEncoder LoRA base layer {name!r} changed")
+            # Serving keeps the model's device and precision fixed after loading.
+            # Do not silently migrate detached weights or invalidate their memory
+            # reservation if an external caller moves or casts the base model.
+            for parameter in layer.parameters():
+                if parameter.device != original.weight.device or parameter.dtype != original.weight.dtype:
+                    raise RuntimeError("CrossEncoder device or precision changed with resident LoRAs")
+            parent_name, _, child = name.rpartition(".")
+            setattr(self._model.get_submodule(parent_name), child, layer)
+
+    def _detach_layers(self) -> None:
+        """Restore the exact base forward/tree while retaining adapter residency."""
+        for name, original in self._originals.items():
+            current = self._model.get_submodule(name)
+            if current is original:
+                continue
+            if not isinstance(current, LoraLinear) or current.get_base_layer() is not original:
+                raise RuntimeError(f"CrossEncoder module {name!r} is not its owned LoRA layer")
+            if current.lora_A:
+                self._resident_layers[name] = current
+            else:
+                # Upstream deletion leaves empty tuner layers in the tree. A
+                # disjoint-target eviction must release those wrappers too.
+                self._resident_layers.pop(name, None)
+            parent_name, _, child = name.rpartition(".")
+            setattr(self._model.get_submodule(parent_name), child, original)
+        self._active = None
+
     def _restore_tree(self) -> None:
         for name, original in self._originals.items():
             parent_name, _, child = name.rpartition(".")
@@ -244,6 +286,7 @@ class CrossEncoderLora:
         if hasattr(self._model, "peft_config"):
             del self._model.peft_config
         self._model._hf_peft_config_loaded = False
+        self._resident_layers.clear()
         self._restore_grad_flags()
         self._active = None
 
@@ -269,6 +312,7 @@ class CrossEncoderLora:
         adapter_name = PEFTLoRAMixin._peft_adapter_name(canonical)
         try:
             assert self._outer is not None
+            self._attach_layers()
             self._outer.load_adapter(
                 adapter_name=adapter_name,
                 peft_config=prepared.config,
@@ -291,17 +335,20 @@ class CrossEncoderLora:
                 memory += parameter.numel() * parameter.element_size()
             self._outer.disable_adapters()
             self._restore_grad_flags()
-            self._active = None
+            self._detach_layers()
             self._loaded[canonical] = memory
             self._parameters[canonical] = parameters
         except BaseException:
             try:
                 if self._loaded:
+                    # A failed detach may have already saved part of the new
+                    # injection off-tree. Include it in rollback deletion too.
+                    self._attach_layers()
                     self._remove(adapter_name)
                     assert self._outer is not None
                     self._outer.disable_adapters()
                     self._restore_grad_flags()
-                    self._active = None
+                    self._detach_layers()
                 else:
                     self._restore_tree()
             except BaseException as rollback:
@@ -327,7 +374,9 @@ class CrossEncoderLora:
         try:
             if canonical is None:
                 self._outer.disable_adapters()
+                self._detach_layers()
             else:
+                self._attach_layers()
                 self._outer.set_adapter(PEFTLoRAMixin._peft_adapter_name(canonical))
                 self._outer.enable_adapters()
                 # Transformers' enable/set hooks default to trainable adapters.
@@ -345,6 +394,7 @@ class CrossEncoderLora:
         if canonical not in self._loaded:
             raise LoraUnavailableError(f"LoRA {name!r} is not resident")
         try:
+            self._attach_layers()
             self._remove(PEFTLoRAMixin._peft_adapter_name(canonical))
             if len(self._loaded) == 1:
                 self._restore_tree()
@@ -352,7 +402,7 @@ class CrossEncoderLora:
                 assert self._outer is not None
                 self._outer.disable_adapters()
                 self._restore_grad_flags()
-                self._active = None
+                self._detach_layers()
         except BaseException as exc:
             self._uncertain = True
             raise LoraStateUncertainError("Failed to unload CrossEncoder LoRA; reload the model") from exc
@@ -376,6 +426,7 @@ class CrossEncoderLora:
         finally:
             self._loaded.clear()
             self._parameters.clear()
+            self._resident_layers.clear()
             self._originals.clear()
             self._grad_flags.clear()
             self._outer = self._model = None
