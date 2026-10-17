@@ -20,7 +20,7 @@ from tools.benchmarks.cross_encoder_lora import stability as probe
 from tools.benchmarks.cross_encoder_lora import worker
 from tools.benchmarks.cross_encoder_lora.evidence import digest, fingerprint
 from tools.benchmarks.cross_encoder_lora.fixtures import prepare
-from tools.benchmarks.cross_encoder_lora.protocol import BASE_REVISION, SEQUENTIAL
+from tools.benchmarks.cross_encoder_lora.protocol import BASE_REVISION
 from tools.benchmarks.cross_encoder_lora.runner import ROOT, extract, source_environment
 from tools.benchmarks.cross_encoder_lora.tests.test_probe import tiny_snapshot
 
@@ -225,8 +225,8 @@ def response(label: str, index: int) -> dict[str, Any]:
 
 def stub_performance(_url: str, concurrency: int, evidence: probe.DiagnosticEvidence, *, smoke: bool) -> dict[str, Any]:
     warmups = [response(f"warm-{i}", i) for i in range(2 if smoke else worker.WARMUP)]
-    samples = [response(f"sample-{i}", i) for i in range(4 if smoke else SEQUENTIAL)]
-    elapsed = 0.2 if smoke else 12.0
+    samples = [response(f"sample-{i}", i) for i in range(4 if smoke else worker.SEQUENTIAL)]
+    elapsed = 0.2 if smoke else float(worker.STEADY_SECONDS)
     evidence.emit(
         "performance_attempt",
         concurrency=concurrency,
@@ -252,18 +252,28 @@ def install_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(worker, "performance", stub_performance)
 
 
-def test_raw_retention_reopen_and_warmup_restoration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def current_workload() -> tuple[Any, ...]:
+    return tuple(
+        getattr(worker, name, None)
+        for name in ("WARMUP", "SEQUENTIAL", "STEADY_SECONDS", "PERFORMANCE_FUTURE_TIMEOUT_S")
+    )
+
+
+def test_raw_retention_reopen_and_workload_restoration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     install_stub(monkeypatch)
-    original = worker.WARMUP
+    monkeypatch.setattr(worker, "PERFORMANCE_FUTURE_TIMEOUT_S", 120, raising=False)
+    original = current_workload()
     continuity = observed(0)
     continuity["core"]["wall_ns"] = continuity["core"]["monotonic_ns"] = 1
     oracles = {"shape": {"copies": 1, "scores": [[4.0, 3.0, 2.0, 1.0][index] for index in worker.ORDER]}}
     compact = probe.measure_window(
         "unused", 1, "L1", 200, tmp_path / "C1/L1", [4.0, 3.0, 2.0, 1.0], oracles, smoke=False, continuity=continuity
     )
-    assert original == worker.WARMUP
+    assert original == current_workload()
     raw = probe.reopen_window(tmp_path, compact)
     assert len(raw["performance"]["samples"]) == 200
+    assert raw["measurement_method"]["concurrent_measured_seconds"] == 12
+    assert raw["measurement_method"]["future_wait_seconds"] == 90
     assert len(raw["chronological_quartiles"]) == 4
     assert continuity == raw["telemetry_after"]
     assert all(row["diagnostic_matching_oracle"]["workload_sha256"] == "shape" for row in raw["performance"]["samples"])
@@ -280,12 +290,13 @@ def test_raw_retention_reopen_and_warmup_restoration(tmp_path: Path, monkeypatch
         probe.reopen_window(tmp_path, compact)
 
 
-def test_failed_window_keeps_partial_raw_and_restores_warmup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_failed_window_keeps_partial_raw_and_restores_workload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     install_stub(monkeypatch)
-    original = worker.WARMUP
+    monkeypatch.setattr(worker, "PERFORMANCE_FUTURE_TIMEOUT_S", 120, raising=False)
+    original = current_workload()
 
     def failed(_url: str, _concurrency: int, evidence: probe.DiagnosticEvidence, *, smoke: bool) -> None:
-        assert worker.WARMUP == 200
+        assert current_workload() == (200, 200, 12, 90)
         assert not smoke
         evidence.emit("performance_attempt", completed_samples=[{"error": "retained"}])
         raise RuntimeError("request failed")
@@ -293,12 +304,28 @@ def test_failed_window_keeps_partial_raw_and_restores_warmup(tmp_path: Path, mon
     monkeypatch.setattr(worker, "performance", failed)
     with pytest.raises(RuntimeError, match="request failed"):
         probe.measure_window("unused", 1, "L2", 200, tmp_path / "C1/L2", [4.0, 3.0, 2.0, 1.0], {}, smoke=False)
-    assert original == worker.WARMUP
+    assert original == current_workload()
     terminal = json.loads((tmp_path / "C1/L2/window.json").read_text())
     assert not terminal["qualification"]
     assert not terminal["completed"]
     assert terminal["error"]["message"] == "request failed"
     assert json.loads((tmp_path / "C1/L2/events.jsonl").read_text())["completed_samples"] == [{"error": "retained"}]
+
+
+def test_diagnostic_settings_restore_absent_attribute(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delattr(worker, "PERFORMANCE_FUTURE_TIMEOUT_S", raising=False)
+    with probe.diagnostic_settings(30):
+        assert current_workload() == (30, 200, 12, 90)
+    assert not hasattr(worker, "PERFORMANCE_FUTURE_TIMEOUT_S")
+
+
+def test_diagnostic_records_current_observer_and_exact_historical_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worker, "RESPONSE_CAPTURE_MODE", "success-status-header-snapshots", raising=False)
+    method = probe.measurement_method()
+    assert method["response_capture"] == "success-status-header-snapshots"
+    assert method["worker_source_sha256"] == digest(Path(worker.__file__))
+    assert method["exact_historical_replay_commit"] == "482b599224920a97bb2fce4a740317efb89351ab"
+    assert not method["historical_byte_identity_claimed"]
 
 
 def test_full_cleanup_budget_is_strict() -> None:
@@ -320,7 +347,7 @@ def test_negative_raw_latency_cannot_hide_in_positive_aggregates() -> None:
         probe.metrics(phase)
 
 
-def test_shared_timed_code_and_gc_are_unmodified() -> None:
+def test_serving_observer_timed_loop_and_gc_are_unmodified() -> None:
     baseline = subprocess.run(
         ["git", "show", "f06f414a:tools/benchmarks/cross_encoder_lora/worker.py"],  # noqa: S607
         cwd=ROOT,
@@ -330,11 +357,44 @@ def test_shared_timed_code_and_gc_are_unmodified() -> None:
     )
     if baseline.returncode:
         pytest.skip("timed-code invariant control requires its documented parent commit in git history")
-    names = {"performance", "Client", "unobserved"}
+    # The Client capture lifecycle is intentionally amended. Preserve the
+    # production observation boundary and actual timed loop, allowing only
+    # the named wait limit that gained scheduling headroom for the longer run.
+    names = {"performance", "unobserved"}
+
+    class TimedCore(ast.NodeTransformer):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+            if node.name == "performance":
+                timed = next(value for value in node.body if isinstance(value, ast.Try))
+                end = next(
+                    index
+                    for index, value in enumerate(timed.body)
+                    if isinstance(value, ast.Assign)
+                    and any(isinstance(target, ast.Name) and target.id == "elapsed" for target in value.targets)
+                )
+                timed.body = timed.body[: end + 1]
+                timed.finalbody = []
+            self.generic_visit(node)
+            return node
+
+        def visit_Call(self, node: ast.Call) -> ast.Call:
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "result"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "future"
+            ):
+                timeout = next(value for value in node.keywords if value.arg == "timeout")
+                assert (isinstance(timeout.value, ast.Constant) and timeout.value.value == 90) or (
+                    isinstance(timeout.value, ast.Name) and timeout.value.id == "PERFORMANCE_FUTURE_TIMEOUT_S"
+                )
+                timeout.value = ast.Constant(value=90)
+            self.generic_visit(node)
+            return node
 
     def code(text: str) -> dict[str, str]:
         return {
-            node.name: ast.dump(node)
+            node.name: ast.dump(TimedCore().visit(node))
             for node in ast.parse(text).body
             if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names
         }

@@ -2,9 +2,10 @@
 
 Run with --inputs, --fixtures and --output. Six fresh baseline processes each
 execute C1/C4/C16 with fixed S/L1/L2 windows: 30/200/200 sequential warmup
-requests followed by the existing 200-request/12-second measurement. Later
+requests followed by a fixed 200-request/12-second measurement. Later
 window agreement is tested symmetrically; between-process dispersion remains
-descriptive. The original timed methods and automatic GC behavior are reused.
+descriptive. The current checkout's client observer and automatic GC are used;
+exact historical replay requires the recorded original source commit.
 """
 
 # Only this checkout's Python worker runs; no shell or allocation.
@@ -25,6 +26,8 @@ import statistics
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
@@ -42,8 +45,6 @@ from tools.benchmarks.cross_encoder_lora.protocol import (
     MODEL,
     ORACLE_ATOL,
     RESTORE_ATOL,
-    SEQUENTIAL,
-    STEADY_SECONDS,
     THREADS,
     WEIGHTS_SHA256,
     paired_gate,
@@ -64,6 +65,11 @@ from tools.benchmarks.cross_encoder_lora.runner import (
 PROCESSES = 6
 WINDOWS = (("S", 30), ("L1", 200), ("L2", 200))
 CONCURRENCIES = (1, 4, 16)
+# Keep this diagnostic bounded independently of later qualification amendments.
+SEQUENTIAL = 200
+STEADY_SECONDS = 12
+PERFORMANCE_FUTURE_TIMEOUT_S = 90
+HISTORICAL_SOURCE_REVISION = "482b599224920a97bb2fce4a740317efb89351ab"
 METRICS = ((1, "mean_ms"), (1, "p95_ms"), (4, "rps"), (4, "p95_ms"), (16, "rps"), (16, "p95_ms"))
 RUNNER_LIMIT = 1200
 WORKER_LIMIT = 180
@@ -85,6 +91,41 @@ class DiagnosticEvidence(Evidence):
             fields["hardware_preflight_only"] = True
         fields["qualification"] = False
         return super().emit(event, **fields)
+
+
+def measurement_method() -> dict[str, Any]:
+    return {
+        "sequential_measured_requests": SEQUENTIAL,
+        "concurrent_measured_seconds": STEADY_SECONDS,
+        "future_wait_seconds": PERFORMANCE_FUTURE_TIMEOUT_S,
+        "response_capture": getattr(worker, "RESPONSE_CAPTURE_MODE", "response-reference-retention"),
+        "worker_source_sha256": digest(Path(worker.__file__)),
+        "exact_historical_replay_commit": HISTORICAL_SOURCE_REVISION,
+        "historical_byte_identity_claimed": False,
+    }
+
+
+@contextmanager
+def diagnostic_settings(warmups: int) -> Iterator[None]:
+    """Pin the old workload without leaking settings into qualification calls."""
+    values = {
+        "WARMUP": warmups,
+        "SEQUENTIAL": SEQUENTIAL,
+        "STEADY_SECONDS": STEADY_SECONDS,
+        "PERFORMANCE_FUTURE_TIMEOUT_S": PERFORMANCE_FUTURE_TIMEOUT_S,
+    }
+    missing = object()
+    original = {name: getattr(worker, name, missing) for name in values}
+    try:
+        for name, value in values.items():
+            setattr(worker, name, value)
+        yield
+    finally:
+        for name, value in original.items():
+            if value is missing:
+                delattr(worker, name)
+            else:
+                setattr(worker, name, value)
 
 
 def unified_cgroup(proc: Path = Path("/proc/self")) -> dict[str, Any]:
@@ -406,18 +447,15 @@ def measure_window(
         "concurrency": concurrency,
         "warmups": 2 if smoke else warmups,
         "smoke": smoke,
+        "measurement_method": measurement_method(),
     }
-    original_warmups = worker.WARMUP
     try:
         record["gpu_before"] = worker.telemetry()
         record["telemetry_before"] = snapshot()
         if continuity is not None:
             telemetry_delta(continuity, record["telemetry_before"])
-        worker.WARMUP = warmups  # ty: ignore[invalid-assignment] -- scoped diagnostic value, always restored
-        try:
+        with diagnostic_settings(warmups):
             measured = worker.performance(url, concurrency, evidence, smoke=smoke)
-        finally:
-            worker.WARMUP = original_warmups
         record["telemetry_after"] = snapshot()
         record["gpu_after"] = worker.telemetry()
         record["telemetry_delta"] = telemetry_delta(record["telemetry_before"], record["telemetry_after"])
@@ -439,7 +477,6 @@ def measure_window(
         record["error"] = worker.error_record(error)
         raise
     finally:
-        worker.WARMUP = original_warmups
         atomic_json(directory / "window.json", record)
     return {
         "qualification": False,
@@ -579,6 +616,7 @@ async def child(args: argparse.Namespace) -> dict[str, Any]:
         "pid": os.getpid(),
         "source_commit": BASE_REVISION,
         "smoke": args.smoke,
+        "measurement_method": measurement_method(),
     }
     os.environ.update(
         {
@@ -811,6 +849,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "budget_s": args.deadline_s,
     }
     summary["methods"] = {
+        **measurement_method(),
         "window_order": [{"name": name, "sequential_warmup_calls": count} for name, count in WINDOWS],
         "phase_order": list(CONCURRENCIES),
         "fresh_baseline_processes": PROCESSES,

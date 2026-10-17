@@ -1,4 +1,4 @@
-"""Preregistered workload and paired non-inferiority gates (2026-10-16)."""
+"""Pinned workload and paired gates; README records the longer-window amendment."""
 
 from __future__ import annotations
 
@@ -25,13 +25,15 @@ EFFECT_FLOOR = 1e-5
 EFFECT_DRIFT_MULTIPLIER = 5
 ORDERS = ("BNR", "NRB", "RBN", "BRN", "RNB", "NBR")
 WARMUP = 30
-SEQUENTIAL = 200
-STEADY_SECONDS = 12
+SEQUENTIAL = 2000
+STEADY_SECONDS = 60
 CONCURRENCIES = (4, 16)
 THREADS = 4
 MAX_BATCH_ITEMS = 64
-MAX_TRIAL_SECONDS = 300
-MAX_EXPERIMENT_SECONDS = 3600
+MAX_TRIAL_SECONDS = 270
+MAX_EXPERIMENT_SECONDS = 4200
+# Measured concurrent phase + request timeout + scheduling margin.
+PERFORMANCE_FUTURE_TIMEOUT_S = 120
 EXPECTED_VERSIONS = {
     "torch": "2.9.1+cu129",
     "transformers": "4.57.6",

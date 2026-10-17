@@ -43,15 +43,21 @@ benchmark only inspects them and fails on a mismatch.
 ```console
 mise exec -- uv run --no-sync python -m tools.benchmarks.cross_encoder_lora.runner \
   --inputs /tmp/ce-sources --fixtures /tmp/ce-fixtures \
-  --output /tmp/ce-evidence --deadline-s 1740 --trial-deadline-s 120
+  --output /tmp/ce-evidence --deadline-s 4200 --trial-deadline-s 270
 ```
 
 Use a fresh output directory. Set the outer compute-session deadline before
 launching, allowing bounded startup and cleanup. The runner owns and joins only
 its subprocesses; it cannot terminate an external GPU session. The operator
 must stop that exact session and record cleanup. A failed or incomplete trial
-stops the experiment and retains its evidence. Never change thresholds or drop
-failed trials to obtain a pass.
+stops the experiment and retains its evidence. Each new trial requires strictly
+more than its 270-second limit plus 90 seconds for wait, termination and kill
+grace (45/35/10). The proposed outer limits are 4,500 seconds for the operator
+and 4,800 seconds from provider start, with a 300-second startup cutoff and an
+additional absolute ceiling of application creation plus 5,100 seconds. The
+operator must reserve export time before starting the runner; these settings
+do not themselves authorize or allocate compute. Never change thresholds or
+drop failed trials to obtain a pass, or retry the same failed protocol unchanged.
 
 ## Frozen comparison
 
@@ -61,11 +67,13 @@ N uses the candidate with no declared LoRA. R uses the candidate after A/B
 activity, with base selected and two adapters resident but disabled.
 
 Every arm uses the same password-reset query and four documents in `protocol.py`.
-Each phase starts with 30 sequential warmup requests. C1 measures 200 sequential
-requests; C4 and C16 each run a 12-second closed loop with one SDK client per
+Each phase starts with 30 sequential warmup requests. C1 measures 2,000 sequential
+requests; C4 and C16 each run a 60-second closed loop with one SDK client per
 lane. Throughput includes draining requests admitted before the deadline.
 Latencies use the nearest-rank p95. Neither warmup nor correctness calls enter
-the primary statistics.
+the primary statistics. Concurrent futures have a 120-second wait limit: the
+60-second measurement, the existing 30-second request timeout, and 30 seconds
+of scheduling margin. The worker and outer process limits still bound failures.
 
 All six metrics are required for **both** N/B and R/B: C1 mean and p95 latency,
 C4/C16 requests per second and p95 latency. The statistical unit is the six
@@ -105,11 +113,13 @@ forward attribute lookup is restored: an original instance override is restored
 exactly, or the temporary instance attribute is deleted to restore descriptor
 lookup. Production `score_pairs` and `set_active_lora` are bound directly.
 The harness checks the original forward target and that no observer activity
-occurred, including restoration after an exceptional exit. Response
-validation and header decoding happen after the phase clock stops; exactly one
-successful HTTP response is required per warmup/measured SDK call, excluding
-hidden retries. The timed client retains timer, result-list and raw-response
-list-append overhead; this is an SDK workload measurement.
+occurred, including restoration after an exceptional exit. Successful response
+status and timing headers are captured as small metadata snapshots in the HTTP
+observer, without retaining the successful HTTPX response. Error responses stay
+available for deferred body and retry evidence. Validation happens after the
+phase clock stops; exactly one successful HTTP response is required per
+warmup/measured SDK call, excluding hidden retries. The timed client retains
+timer, result-list and snapshot overhead; this is an SDK workload measurement.
 
 Actual timed C4/C16 batch shapes are **unknown**. Their raw four-score vectors
 are compared diagnostically against complete preselection oracle vectors at
@@ -132,11 +142,49 @@ live parameter allocation. The memory reference is captured after finite
 preselection base and shape-oracle warmup, before any LoRA attachment, to keep
 one-time CUDA library initialization separate from adapter storage.
 
-These observation changes are an explicit **preallocation protocol amendment**
-to the original plan of observing every timed forward. All trial orders,
-warmup/request counts, phase durations, numerical tolerances and statistical
-gates remain unchanged. The original timed batch-attribution claim is withdrawn;
-the observed untimed replays supply that evidence instead.
+Removing timed forward observation was an earlier **preallocation protocol
+amendment**. It preserved that version's trial order, workload and gates, and
+withdrew its timed batch-attribution claim. Observed untimed replays supply that
+evidence instead.
+
+## Longer-window amendment
+
+The original qualification used 200 C1 requests and 12-second C4/C16 phases.
+Its failed full-run evidence and the failed baseline-only stability diagnostic
+remain separate, with their original source and artifact hashes. Those outcomes
+are not reinterpreted as passes. The diagnostic's longer warmup did not establish
+stability, so qualification retains 30 sequential warmup requests.
+
+The revised workload uses 2,000 C1 requests and 60-second concurrent phases to
+observe longer intervals. The six balanced fresh-process triplets, checkpoint,
+precision, dependencies, request payloads, numerical tolerances and all twelve
+statistical gates stay fixed. Longer windows may reduce within-window sampling
+variation; they do not guarantee comparability across fresh processes. There
+are still only six independent paired units, not thousands of independent
+latency samples for the t interval.
+
+A model-free lifetime probe separately established that the old observer held
+successful responses for the whole phase and kept its client alive through a
+bound callback. Metadata snapshots and removal of the owned hook/history on
+close address that benchmark-owned retention. Normal HTTPX response-stream and
+SDK namespace cycles remain, with automatic GC enabled. This finding does not
+identify the cause of earlier GPU timing variation. Snapshot capture adds timed
+metadata work; its CPU cost must be recorded, without subtracting it from the
+measurements or claiming zero overhead. Client and server still share a process,
+so the result includes their normal GC and GIL interactions.
+
+Freeze the reviewed source and operator bounds before one complete amended
+18-process run. A separate baseline-readiness allocation is not required. Every
+N/B and R/B gate and every correctness/lifecycle check must pass. If any fails,
+retain all evidence and investigate before another method change; do not retry
+unchanged, select favorable windows or pairs, waive N failures, or loosen gates.
+
+The optional `stability` diagnostic keeps its original 200-request/12-second
+windows and 90-second future wait through scoped settings that are restored on
+success and failure. It records the current observer mode and worker source
+hash. A new invocation uses this checkout's snapshot observer and is **not** a
+byte-identical replay of the earlier diagnostic. Exact historical replay uses
+commit `482b599224920a97bb2fce4a740317efb89351ab` and its original protocol.
 
 ## Evidence and CPU checks
 
@@ -145,6 +193,8 @@ gates and source hashes. Each entry links its complete `trial.json` by relative
 path and SHA-256; raw request arrays and oracle corpora stay in those per-trial
 files instead of being copied into the growing summary. Final cross-process
 checks reopen the complete records and verify their hashes and identities.
+The runner records its monotonic start/deadline and every admission timestamp,
+full cleanup reserve and remaining margin, including a refused admission.
 The summary also hashes the complete benchmark file manifest. Each trial
 captures the full installed-distribution manifest; its digest must remain
 identical across arms. An optional `--environment-receipt` attaches a separate

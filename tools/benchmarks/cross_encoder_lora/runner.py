@@ -193,9 +193,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "smoke": args.smoke,
         "orders": ORDERS,
         "trials": [],
+        "admissions": [],
     }
     summary_path = args.output / "summary.json"
-    absolute_deadline = time.monotonic() + args.deadline_s
+    started = time.monotonic()
+    absolute_deadline = started + args.deadline_s
+    summary["runner_clock"] = {
+        "monotonic_start_s": started,
+        "wall_start_ns": time.time_ns(),
+        "deadline_monotonic_s": absolute_deadline,
+        "budget_s": args.deadline_s,
+    }
     if args.environment_receipt is not None:
         summary["environment_preparation"] = {
             "sha256": digest(args.environment_receipt),
@@ -204,15 +212,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     try:
         schedule = [(0, "R")] if args.smoke else [(pair, arm) for pair, order in enumerate(ORDERS) for arm in order]
         for pair, arm in schedule:
-            require(
-                time.monotonic()
-                + args.trial_deadline_s
-                + WAIT_GRACE_SECONDS
-                + TERMINATE_GRACE_SECONDS
-                + KILL_GRACE_SECONDS
-                < absolute_deadline,
-                "insufficient time for a complete bounded next trial and cleanup",
+            admitted_at = time.monotonic()
+            cleanup_deadline = (
+                admitted_at + args.trial_deadline_s + WAIT_GRACE_SECONDS + TERMINATE_GRACE_SECONDS + KILL_GRACE_SECONDS
             )
+            admitted = cleanup_deadline < absolute_deadline
+            summary["admissions"].append(
+                {
+                    "pair": pair,
+                    "arm": arm,
+                    "monotonic_s": admitted_at,
+                    "deadline_monotonic_s": absolute_deadline,
+                    "trial_limit_s": args.trial_deadline_s,
+                    "reserve_s": (
+                        args.trial_deadline_s + WAIT_GRACE_SECONDS + TERMINATE_GRACE_SECONDS + KILL_GRACE_SECONDS
+                    ),
+                    "margin_s": absolute_deadline - cleanup_deadline,
+                    "admitted": admitted,
+                }
+            )
+            require(admitted, "insufficient time for a complete bounded next trial and cleanup")
             directory = args.output / f"trial-{pair}-{arm}"
             source = (args.output / "sources" / ("B" if arm == "B" else "candidate")).resolve()
             command = [
@@ -313,8 +332,8 @@ def main() -> None:
         help="Optional operator-owned JSON receipt of environment preparation (no secrets)",
     )
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--deadline-s", type=float, default=2400)
-    parser.add_argument("--trial-deadline-s", type=float, default=120)
+    parser.add_argument("--deadline-s", type=float, default=MAX_EXPERIMENT_SECONDS)
+    parser.add_argument("--trial-deadline-s", type=float, default=MAX_TRIAL_SECONDS)
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
     require(
