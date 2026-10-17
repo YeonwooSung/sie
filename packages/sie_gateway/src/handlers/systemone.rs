@@ -459,6 +459,13 @@ async fn translate_error(response: Response) -> Response {
         Err(_) => Value::Null,
     };
     let (code, message) = error_parts(&parsed);
+    let code = code.map(|code| {
+        if parts.status == StatusCode::NOT_FOUND && code.eq_ignore_ascii_case("MODEL_NOT_FOUND") {
+            "MODEL_NOT_FOUND"
+        } else {
+            code
+        }
+    });
     if message.is_none() {
         warn!(
             status = parts.status.as_u16(),
@@ -992,6 +999,54 @@ mod tests {
                 }
             );
             assert_eq!(dispatched[0].endpoint, "extract");
+        }
+    }
+
+    struct HiddenModels;
+
+    impl crate::server::ModelAccessPolicy for HiddenModels {
+        fn visible(&self, _: &str, _: &axum::http::Extensions) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn hidden_and_absent_aliases_have_identical_not_found_responses() {
+        for populated in [false, true] {
+            let hidden_models = if populated {
+                vec![LOCAL_DECISION_MODEL]
+            } else {
+                vec![]
+            };
+            let absent_models = if populated {
+                vec![LOCAL_ENCODE_MODEL]
+            } else {
+                vec![]
+            };
+            let mut hidden = TestGateway::new(&hidden_models).await;
+            let mut absent = TestGateway::new(&absent_models).await;
+            hidden.add_model_alias("decision", "acme/decide");
+            absent.add_model_alias("decision", "acme/decide");
+            hidden.install_policy(Arc::new(HiddenModels));
+            for model in ["decision", "DECISION"] {
+                let payload = json!({"model": model, "state": "Continue?", "questions": {"q": {"type": "noul"}}});
+                let denied = proxy_systemone(
+                    State(Arc::clone(&hidden.state)),
+                    systemone_request(payload.clone()),
+                )
+                .await;
+                let missing =
+                    proxy_systemone(State(Arc::clone(&absent.state)), systemone_request(payload))
+                        .await;
+                assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+                assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+                let denied = body_json(denied).await;
+                assert_eq!(denied["detail"]["code"], "MODEL_NOT_FOUND");
+                assert_eq!(denied, body_json(missing).await);
+                assert!(!denied.to_string().contains("acme/"));
+            }
+            assert!(hidden.dispatcher.dispatched().is_empty());
+            assert!(absent.dispatcher.dispatched().is_empty());
         }
     }
 

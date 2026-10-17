@@ -867,6 +867,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hidden_and_absent_aliases_have_identical_not_found_responses() {
+        for populated in [false, true] {
+            let hidden_models = if populated {
+                vec![LOCAL_DECISION_MODEL]
+            } else {
+                vec![]
+            };
+            let absent_models = if populated {
+                vec![LOCAL_ENCODE_MODEL]
+            } else {
+                vec![]
+            };
+            let mut hidden = TestGateway::new(&hidden_models).await;
+            let mut absent = TestGateway::new(&absent_models).await;
+            hidden.add_model_alias("decision", "acme/decide");
+            absent.add_model_alias("decision", "acme/decide");
+            hidden.install_policy(Arc::new(RequireCaller));
+            for model in ["decision", "DECISION"] {
+                let mut payload = predicate_request();
+                payload["model"] = json!(model);
+                let denied =
+                    proxy_decisions(State(Arc::clone(&hidden.state)), request(payload.clone()))
+                        .await;
+                let missing =
+                    proxy_decisions(State(Arc::clone(&absent.state)), request(payload)).await;
+                assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+                assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+                let denied = body_json(denied).await;
+                assert_eq!(denied["error"]["code"], "MODEL_NOT_FOUND");
+                assert_eq!(denied, body_json(missing).await);
+                assert!(!denied.to_string().contains("acme/"));
+            }
+            assert!(hidden.dispatcher.dispatched().is_empty());
+            assert!(absent.dispatcher.dispatched().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn alias_visibility_precedes_decision_capability_checks() {
         let mut gateway = TestGateway::new(&[LOCAL_DECISION_MODEL, LOCAL_ENCODE_MODEL]).await;
         gateway.add_model_alias("decision", "acme/decide");
