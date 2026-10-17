@@ -12,7 +12,6 @@ import math
 import os
 import resource
 import socket
-import statistics
 import subprocess
 import sys
 import threading
@@ -20,26 +19,30 @@ import time
 import weakref
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 
-import httpx
 import torch
 import uvicorn
 import yaml
-from sie_sdk import SIEClient
-from sie_sdk._msgpack import unpackb
-from sie_sdk.client.errors import RequestError, ServerError
+from sie_sdk.client.errors import RequestError
 from sie_server.adapters.cross_encoder import CrossEncoderAdapter
 from sie_server.adapters.peft_lora_mixin import PEFTLoRAMixin
 from sie_server.app.app_factory import AppFactory
 from sie_server.app.app_state_config import AppStateConfig
 from sie_server.types.inputs import Item
 
+from tools.benchmarks.cross_encoder_lora import client as client_workload
 from tools.benchmarks.cross_encoder_lora.adapter import require_forward_selection
+from tools.benchmarks.cross_encoder_lora.client import (
+    REQUEST_ITEMS,
+    Client,
+    describe_response,
+)
 from tools.benchmarks.cross_encoder_lora.evidence import Evidence, atomic_json, digest, fingerprint, vector_delta
+from tools.benchmarks.cross_encoder_lora.isolation import IsolatedLoadgen
 from tools.benchmarks.cross_encoder_lora.protocol import (
     CONCURRENCIES,
     CPU_ORACLE,
@@ -59,17 +62,13 @@ from tools.benchmarks.cross_encoder_lora.protocol import (
     THREADS,
     WARMUP,
     WEIGHTS_SHA256,
-    percentile,
     require,
 )
 
+RESPONSE_CAPTURE_MODE = client_workload.RESPONSE_CAPTURE_MODE
 HERE = Path(__file__).resolve().parent
 ORDER = sorted(range(len(DOCUMENTS)), key=lambda index: len(DOCUMENTS[index]))
-MAX_LOADING_RETRIES = 10
-MAX_LOADING_DELAY = 5
 RESIDENT_CAPACITY = 2
-REQUEST_ITEMS = len(DOCUMENTS)
-RESPONSE_CAPTURE_MODE = "success-status-header-snapshots"
 
 
 def error_record(error: BaseException) -> dict[str, Any]:
@@ -204,152 +203,6 @@ def adapter_storage(adapter: Any) -> dict[str, int]:
     }
 
 
-class Client:
-    def __init__(self, url: str) -> None:
-        self.responses: list[dict[str, Any] | httpx.Response] = []
-        http = httpx.Client(base_url=url, timeout=30, event_hooks={"response": [self.observe]})
-        self._http = http
-        self.sdk = SIEClient(url, timeout_s=30, http_client=http)
-
-    def observe(self, response: httpx.Response) -> None:
-        # Keep successful wire evidence without retaining its Response/Request/
-        # stream graph for the whole phase. Failure bodies are decoded later.
-        self.responses.append(describe_response(response) if response.status_code == HTTPStatus.OK else response)
-
-    def score(self, selection: str | None, label: str, *, cold: bool = False, timed: bool = False) -> dict[str, Any]:
-        started = time.perf_counter_ns()
-        wall_started = time.time_ns()
-        first = len(self.responses)
-        # score() currently does not retry LORA_LOADING. These are explicitly
-        # fresh SDK calls for this pre-execution status, never transport retries.
-        for attempt in range(MAX_LOADING_RETRIES + 1):
-            try:
-                result = self.sdk.score(
-                    MODEL,
-                    {"text": QUERY["text"]},
-                    [{"id": f"{label}:{index}", "text": text} for index, text in enumerate(DOCUMENTS)],
-                    options={"lora": selection},
-                    wait_for_capacity=False,
-                    max_oom_retries=0,
-                    provision_timeout_s=30,
-                )
-                break
-            except ServerError as error:
-                if (
-                    not cold
-                    or error.status_code != HTTPStatus.SERVICE_UNAVAILABLE
-                    or error.code != "LORA_LOADING"
-                    or attempt == MAX_LOADING_RETRIES
-                ):
-                    raise
-                delay = error.retry_after if error.retry_after is not None else 0.2
-                require(0 <= delay <= MAX_LOADING_DELAY, "unexpected loading retry delay")
-                time.sleep(delay)
-        elapsed = (time.perf_counter_ns() - started) / 1e6
-        row = {
-            "label": label,
-            "selection": selection,
-            "latency_ms": elapsed,
-            "start_ns": wall_started,
-            "end_ns": time.time_ns(),
-            "result": result,
-            "responses": self.responses[first:],
-        }
-        if not timed:
-            validate_response(row, allow_loading=cold)
-        return row
-
-    def close(self) -> None:
-        try:
-            self.sdk.close()
-        finally:
-            # Callers serialize their evidence before closing. Preserve unrelated
-            # hooks, and break only the observer/history this benchmark owns.
-            hooks = self._http.event_hooks["response"]
-            hooks[:] = [
-                hook
-                for hook in hooks
-                if not (
-                    getattr(hook, "__self__", None) is self and getattr(hook, "__func__", None) is type(self).observe
-                )
-            ]
-            self.responses.clear()
-
-
-def describe_response(response: httpx.Response | dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(response, httpx.Response):
-        return response
-    row: dict[str, Any] = {
-        "status": response.status_code,
-        "timing_headers": {
-            name: response.headers[name]
-            for name in (
-                "x-queue-time",
-                "x-tokenization-time",
-                "x-inference-time",
-                "x-postprocessing-time",
-                "x-total-time",
-            )
-            if name in response.headers
-        },
-    }
-    if response.status_code >= HTTPStatus.BAD_REQUEST:
-        row["content_type"] = response.headers.get("content-type")
-        row["retry_after"] = response.headers.get("retry-after")
-        try:
-            response.read()
-        except (httpx.StreamError, httpx.HTTPError) as error:
-            # A partially read error stream can already have failed in the SDK.
-            # Preserve that original failure and its wire metadata; diagnostic
-            # re-reading must not replace it or discard earlier attempts.
-            row.update(body_unavailable=True, body_read_error=type(error).__name__, code=None)
-            return row
-        row["body_hex"] = response.content.hex()
-        try:
-            body = (
-                unpackb(response.content, numeric_arrays=False)
-                if "msgpack" in response.headers.get("content-type", "")
-                else response.json()
-            )
-        except ValueError as error:
-            row["body_decode_error"] = type(error).__name__
-            body = None
-        error = body.get("error", body.get("detail", body)) if isinstance(body, dict) else None
-        row["code"] = error.get("code") if isinstance(error, dict) else None
-    return row
-
-
-def serialize_responses(row: dict[str, Any]) -> None:
-    row["responses"] = [
-        describe_response(value) if isinstance(value, httpx.Response) else value for value in row["responses"]
-    ]
-
-
-def validate_response(row: dict[str, Any], *, allow_loading: bool = False) -> None:
-    serialize_responses(row)
-    statuses = row["responses"]
-    require(statuses and statuses[-1]["status"] == HTTPStatus.OK, "missing successful HTTP response")
-    if allow_loading:
-        require(
-            all(
-                value["status"] == HTTPStatus.SERVICE_UNAVAILABLE and value.get("code") == "LORA_LOADING"
-                for value in statuses[:-1]
-            ),
-            "unexpected retry during cold adapter request",
-        )
-    else:
-        require(len(statuses) == 1, "hidden SDK retry disqualifies this request")
-    scores = row["result"]["scores"]
-    expected_ids = [f"{row['label']}:{i}" for i in range(REQUEST_ITEMS)]
-    by_id = {item["item_id"]: item["score"] for item in scores}
-    require(len(scores) == REQUEST_ITEMS and set(by_id) == set(expected_ids), "score result lost or changed item IDs")
-    require([item["rank"] for item in scores] == list(range(REQUEST_ITEMS)), "score ranks changed")
-    values = [by_id[key] for key in expected_ids]
-    row["scores"] = values
-    require(all(math.isfinite(value) for value in values), "nonfinite SDK score")
-    require([item["score"] for item in scores] == sorted(values, reverse=True), "score ranks are unordered")
-
-
 @contextmanager
 def unobserved(adapter: Any) -> Iterator[None]:
     """Time production methods with the original forward attribute lookup restored."""
@@ -395,60 +248,17 @@ def matching_vector(scores: list[float], oracles: dict[str, Any]) -> dict[str, A
 
 
 def performance(url: str, concurrency: int, evidence: Evidence, *, smoke: bool) -> dict[str, Any]:
-    clients = [Client(url) for _ in range(concurrency)]
-    samples: list[dict[str, Any]] = []
-    warmups: list[dict[str, Any]] = []
-    lock = threading.Lock()
-    try:
-        for i in range(2 if smoke else WARMUP):
-            warmups.append(clients[0].score(None, f"warm-C{concurrency}-{i}", timed=True))
-        barrier = threading.Barrier(concurrency + 1)
-        clock: dict[str, float] = {}
-
-        def lane(index: int) -> None:
-            barrier.wait(timeout=30)
-            counter = 0
-            while (
-                counter < (4 if smoke else SEQUENTIAL) if concurrency == 1 else time.perf_counter() < clock["deadline"]
-            ):
-                row = clients[index].score(None, f"C{concurrency}-lane{index}-{counter}", timed=True)
-                with lock:
-                    samples.append(row)
-                counter += 1
-
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = [executor.submit(lane, i) for i in range(concurrency)]
-            clock["start"] = time.perf_counter()
-            clock["deadline"] = clock["start"] + (0.15 if smoke else STEADY_SECONDS)
-            barrier.wait(timeout=30)
-            for future in futures:
-                future.result(timeout=PERFORMANCE_FUTURE_TIMEOUT_S)
-        elapsed = time.perf_counter() - clock["start"]
-        for row in [*warmups, *samples]:
-            validate_response(row)
-        latencies = [row["latency_ms"] for row in samples]
-        return {
-            "concurrency": concurrency,
-            "count": len(samples),
-            "elapsed_s": elapsed,
-            "mean_ms": statistics.mean(latencies),
-            "p95_ms": percentile(latencies, 0.95),
-            "rps": len(samples) / elapsed,
-            "samples": samples,
-        }
-    finally:
-        with ExitStack() as cleanup:
-            for client in clients:
-                cleanup.callback(client.close)
-            for row in [*warmups, *samples]:
-                serialize_responses(row)
-            evidence.emit(
-                "performance_attempt",
-                concurrency=concurrency,
-                completed_samples=samples,
-                warmups=warmups,
-                wire_responses=[describe_response(response) for client in clients for response in client.responses],
-            )
+    """Retain the historical in-process diagnostic with its explicit settings."""
+    return client_workload.performance(
+        url,
+        concurrency,
+        evidence,
+        smoke=smoke,
+        warmup=WARMUP,
+        sequential=SEQUENTIAL,
+        steady_seconds=STEADY_SECONDS,
+        future_timeout=PERFORMANCE_FUTURE_TIMEOUT_S,
+    )
 
 
 def validate_usage(rows: list[dict[str, Any]], batches: list[dict[str, Any]]) -> None:
@@ -766,29 +576,43 @@ async def experiment(args: argparse.Namespace, evidence: Evidence, summary: dict
                 )
         summary["resident_memory"] = memory()
         summary["performance"] = {}
+        summary["pre_timing_history"] = {
+            "batches": len(adapter.batch_observations),
+            "selections": len(adapter.selection_observations),
+            "fetches": len(adapter.fetch_observations),
+            "main_client_wire_attempts": len(client.responses),
+            "retained_untimed_replays": sum(len(value["requests"]) for value in summary["untimed_replays"].values()),
+            "policy": "Existing server histories retained; memory() just completed its existing gc.collect/CUDA synchronization outside timing. No new collection or history release is introduced.",
+        }
         with unobserved(adapter):
-            for concurrency in (1, *CONCURRENCIES):
-                phase = f"performance-C{concurrency}"
-                evidence.emit("gpu_before_phase", phase=phase, telemetry=telemetry())
-                measured = await asyncio.to_thread(performance, url, concurrency, evidence, smoke=args.smoke)
-                summary["performance"][str(concurrency)] = measured
-                evidence.emit("performance", phase=phase, **measured)
-                atomic_json(evidence.directory / "trial.json", summary)
-                for row in measured["samples"]:
-                    require(row["result"]["usage"] == bases[0]["result"]["usage"], "timed SDK usage differs")
-                    if concurrency == 1:
-                        require(vector_delta(row["scores"], baseline) <= RESTORE_ATOL, "timed C1 base output differs")
-                    row["diagnostic_matching_oracle"] = matching_vector(row["scores"], summary["shape_oracles"])
-                measured["actual_timed_batch_shape"] = "unobserved"
-                evidence.emit(
-                    "timed_output_diagnostics",
-                    concurrency=concurrency,
-                    witnesses=[
-                        {"label": row["label"], "match": row["diagnostic_matching_oracle"]}
-                        for row in measured["samples"]
-                    ],
-                )
-                evidence.emit("gpu_after_phase", phase=phase, telemetry=telemetry())
+            async with IsolatedLoadgen(url, args.source, evidence, smoke=args.smoke) as loadgen:
+                for concurrency in (1, *CONCURRENCIES):
+                    phase = f"performance-C{concurrency}"
+                    evidence.emit("gpu_before_phase", phase=phase, telemetry=telemetry())
+                    await loadgen.phase(concurrency)
+                    evidence.emit("gpu_after_phase", phase=phase, telemetry=telemetry())
+            # Reaping and all raw-row materialization/validation happen after
+            # every measured phase, so their allocations never enter the
+            # serving heap during a subsequent timed phase.
+            summary["loadgen"] = loadgen.receipt
+            summary["performance"] = loadgen.results()
+        for concurrency in (1, *CONCURRENCIES):
+            measured = summary["performance"][str(concurrency)]
+            evidence.emit("performance", phase=f"performance-C{concurrency}", **measured)
+            atomic_json(evidence.directory / "trial.json", summary)
+            for row in measured["samples"]:
+                require(row["result"]["usage"] == bases[0]["result"]["usage"], "timed SDK usage differs")
+                if concurrency == 1:
+                    require(vector_delta(row["scores"], baseline) <= RESTORE_ATOL, "timed C1 base output differs")
+                row["diagnostic_matching_oracle"] = matching_vector(row["scores"], summary["shape_oracles"])
+            measured["actual_timed_batch_shape"] = "unobserved"
+            evidence.emit(
+                "timed_output_diagnostics",
+                concurrency=concurrency,
+                witnesses=[
+                    {"label": row["label"], "match": row["diagnostic_matching_oracle"]} for row in measured["samples"]
+                ],
+            )
         adapter.observation_phase = "lifecycle"
         if args.arm == "R":
             previous = set(registry.loaded_lora_names(MODEL))

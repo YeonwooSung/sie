@@ -18,11 +18,12 @@ from transformers import BertConfig, BertForSequenceClassification, BertTokenize
 
 from tools.benchmarks.cross_encoder_lora import prepare as source_preparer
 from tools.benchmarks.cross_encoder_lora.adapter import require_forward_coverage
+from tools.benchmarks.cross_encoder_lora.client import describe_response, validate_response
 from tools.benchmarks.cross_encoder_lora.evidence import Evidence, atomic_json, vector_delta
 from tools.benchmarks.cross_encoder_lora.fixtures import prepare
 from tools.benchmarks.cross_encoder_lora.protocol import BASE_REVISION, ORDERS, compare, paired_gate, percentile
 from tools.benchmarks.cross_encoder_lora.runner import ROOT, extract, source_environment
-from tools.benchmarks.cross_encoder_lora.worker import ORDER, describe_response, matching_vector, validate_response
+from tools.benchmarks.cross_encoder_lora.worker import ORDER, matching_vector
 
 
 def tiny_snapshot(directory: Path) -> Path:

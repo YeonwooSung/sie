@@ -170,8 +170,9 @@ close address that benchmark-owned retention. Normal HTTPX response-stream and
 SDK namespace cycles remain, with automatic GC enabled. This finding does not
 identify the cause of earlier GPU timing variation. Snapshot capture adds timed
 metadata work; its CPU cost must be recorded, without subtracting it from the
-measurements or claiming zero overhead. Client and server still share a process,
-so the result includes their normal GC and GIL interactions.
+measurements or claiming zero overhead. That version shared one client/server process and included their normal GC and
+GIL interactions; the subsequent isolation amendment below preserves its failed
+result rather than reclassifying it.
 
 Freeze the reviewed source and operator bounds before one complete amended
 18-process run. A separate baseline-readiness allocation is not required. Every
@@ -185,6 +186,68 @@ success and failure. It records the current observer mode and worker source
 hash. A new invocation uses this checkout's snapshot observer and is **not** a
 byte-identical replay of the earlier diagnostic. Exact historical replay uses
 commit `482b599224920a97bb2fce4a740317efb89351ab` and its original protocol.
+
+## SDK process isolation amendment
+
+The complete longer-window run at `a2932d81ef0894d3270a26350a2cd0703fa66a82`
+failed five of twelve upper-confidence gates. Its point estimates did not
+establish a serving slowdown, but they also did not satisfy the fixed precision
+requirement. No source defect or physical cause was established. The original
+records and criteria remain unchanged.
+
+Qualification now starts one fresh Python **exec** load generator per server
+trial and reuses it across C1/C4/C16. It imports only the selected archive's SDK
+and benchmark client/telemetry helpers, never Torch, PEFT or the serving model.
+The server retains its original process, CPU allocation, affinity and model
+state. The SDK, HTTP, serving work, normal GC and every fixed workload/gate
+remain included. Separation removes direct client/server interpreter and GIL
+coupling; it does not remove shared CPU competition or guarantee precise results.
+The historical `stability` command retains its in-process diagnostic method.
+
+Client startup, warmup, boundary handshakes, process shutdown and evidence serialization
+are outside the request timers. The same lane loop releases a barrier after
+recording its start and drains every admitted request before the end timestamp.
+The parent waits asynchronously so the server event loop continues. A single
+stdin reader monitors parent lifetime; unexpected EOF ends the owned child.
+Normal shutdown wakes and joins that reader, writes final terminal evidence,
+then reports completion; the parent reaps the child before closing stdin. No new process group or detached session is
+created. Cancellation, malformed protocol and child errors fail the trial and
+trigger bounded termination/reaping. SIGKILL or immediate parent-death exit can
+lose the interrupted phase; prior completed atomic phase files remain evidence.
+
+Each PID records preallocated numeric GC events and self-duration. The combined
+server-plus-client estimated callback cost must be at most **0.1%** of each
+measured interval, including a fixed 10-microsecond allowance per intersecting
+callback. A bounded local calibration must be retained before hardware use;
+it checks the allowance rather than changing it after outcomes. This estimate
+cannot prove zero scheduling or GC perturbation. Overflow, missing event pairs,
+clock contradictions, callback-list changes or the cost limit fail qualification.
+Run the public local calibration once from the frozen checkout and retain its
+full JSON, including failures and outliers:
+
+```console
+mise exec -- uv run --no-sync python -m tools.benchmarks.cross_encoder_lora.calibrate_gc --output /tmp/ce-gc-calibration.json
+```
+
+It estimates local mean cost, not worst-case event cost or another host's cost.
+Short CPU smoke applies integrity checks but does not qualify performance or
+apply a meaningful wall-time cost budget. No automatic collection is disabled,
+and no forced collection is added during timing.
+
+CPU/context-switch/cgroup snapshots bracket the actual shared monotonic interval;
+they include boundary work and are not exact request-level or GPU-only timers.
+Shared cgroup observations are labeled and must never be summed across PIDs.
+Missing optional counters remain unavailable. Existing server correctness
+histories are retained and counted; the pre-timing memory checkpoint keeps its
+existing explicit GC and CUDA synchronization. No speculative history cleanup
+or heap normalization is introduced. The child retains its request histories
+until all phases end. The server ingests them only after the child is reaped.
+
+Phase payloads, observed IPC clocks, PID/source identities, ordered terminal
+records, lengths and hashes must agree. Raw requests, wire attempts and all
+existing numerical checks remain available. Child observations and phase files
+live under each trial's `loadgen/` directory, with a separate process receipt and
+server boundary snapshots. Keep those files in the full durable archive.
 
 ## Evidence and CPU checks
 
@@ -214,7 +277,7 @@ Store the evidence directory on durable storage and verify the full archive
 hash after retrieval; stdout is unsuitable for transferring large artifacts.
 
 ```console
-mise run test -- tools/benchmarks/cross_encoder_lora/tests/test_probe.py
+mise run test -- tools/benchmarks/cross_encoder_lora/tests
 mise run typecheck -- tools/benchmarks/cross_encoder_lora
 ```
 

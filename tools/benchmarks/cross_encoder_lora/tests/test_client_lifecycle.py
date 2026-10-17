@@ -15,7 +15,7 @@ import pytest
 from sie_sdk._msgpack import packb, unpackb
 from sie_sdk.client.errors import ServerError, SIEConnectionError
 
-from tools.benchmarks.cross_encoder_lora import worker
+from tools.benchmarks.cross_encoder_lora import client as worker
 from tools.benchmarks.cross_encoder_lora.evidence import Evidence
 
 HTTP_CLIENT = httpx.Client
@@ -369,3 +369,47 @@ def test_performance_evidence_failure_still_closes_all_clients(monkeypatch: pyte
         worker.performance(URL, 4, evidence, smoke=True)
     assert closed == [True] * 4
     assert gc.isenabled() == gc_enabled
+
+
+def test_primary_sdk_error_survives_observer_failure_with_all_wire_attempts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 4:  # two warmups, one completed timed request, one failure
+            return httpx.Response(500, json={"error": {"code": "INTERNAL_ERROR", "message": "primary SDK failure"}})
+        return success(request)
+
+    def after(_clock: dict[str, float]) -> None:
+        raise BrokenPipeError("secondary observer failed")
+
+    install_transport(monkeypatch, handler)
+    evidence = Evidence(tmp_path / "out")
+    with pytest.raises(ServerError) as failure:
+        worker.performance(URL, 1, evidence, smoke=True, after_measure=after)
+    assert "secondary observer failed" in " ".join(failure.value.__notes__)
+    row = json.loads((evidence.directory / "events.jsonl").read_text())
+    assert len(row["completed_samples"]) == 1
+    assert [value["status"] for value in row["wire_responses"]] == [200, 200, 200, 500]
+    assert row["primary_error"]["type"] == "ServerError"
+    assert row["finalization_errors"] == [{"type": "BrokenPipeError", "message": "secondary observer failed"}]
+
+
+def test_before_measure_failure_aborts_waiting_threads_and_preserves_warmups(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    install_transport(monkeypatch, success)
+
+    def before() -> None:
+        raise OSError("boundary failed before timer")
+
+    evidence = Evidence(tmp_path / "out")
+    with pytest.raises(OSError, match="boundary failed"):
+        worker.performance(URL, 4, evidence, smoke=True, before_measure=before)
+    row = json.loads((evidence.directory / "events.jsonl").read_text())
+    assert len(row["warmups"]) == 2
+    assert row["completed_samples"] == []
+    assert len(row["wire_responses"]) == 2

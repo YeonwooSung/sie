@@ -16,8 +16,8 @@ from typing import Any
 import pytest
 
 from tools.benchmarks.cross_encoder_lora import prepare as source_preparer
+from tools.benchmarks.cross_encoder_lora import process_metrics, worker
 from tools.benchmarks.cross_encoder_lora import stability as probe
-from tools.benchmarks.cross_encoder_lora import worker
 from tools.benchmarks.cross_encoder_lora.evidence import digest, fingerprint
 from tools.benchmarks.cross_encoder_lora.fixtures import prepare
 from tools.benchmarks.cross_encoder_lora.protocol import BASE_REVISION
@@ -31,14 +31,14 @@ def observed(tick: int = 1) -> dict[str, Any]:
         "core": {
             "wall_ns": tick * 1000000000,
             "monotonic_ns": tick * 1000000000,
-            "rusage": dict.fromkeys(probe.RUSAGE_FIELDS, tick),
+            "rusage": dict.fromkeys(process_metrics.RUSAGE_FIELDS, tick),
             "gc_enabled": True,
             "gc_thresholds": [700, 10, 10],
             "gc_count": [tick, 0, 0],
-            "gc_stats": [dict.fromkeys(probe.GC_FIELDS, tick) for _ in range(3)],
+            "gc_stats": [dict.fromkeys(process_metrics.GC_FIELDS, tick) for _ in range(3)],
         },
         "cgroup": {"path": None, "error": "unavailable"},
-        "cgroup_files": dict.fromkeys(probe.OPTIONAL_FILES),
+        "cgroup_files": dict.fromkeys(process_metrics.OPTIONAL_FILES),
         "optional_errors": {"cgroup": "unavailable"},
         "affinity": None,
         "snapshot_read_ns": 1,
@@ -116,10 +116,10 @@ def test_all_fixed_process_units_and_positive_metrics_required(failure: str) -> 
 
 
 def test_optional_cgroup_unavailable_is_explicit_not_zero(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(probe, "unified_cgroup", lambda: {"path": None, "error": "not exposed"})
+    monkeypatch.setattr(process_metrics, "unified_cgroup", lambda: {"path": None, "error": "not exposed"})
     first, last = probe.snapshot(), probe.snapshot()
     delta = probe.telemetry_delta(first, last)
-    assert set(first["cgroup_files"]) == set(probe.OPTIONAL_FILES)
+    assert set(first["cgroup_files"]) == set(process_metrics.OPTIONAL_FILES)
     assert all(value is None for value in first["cgroup_files"].values())
     assert delta["optional_cgroup"]["cpu.stat"] is None
     assert not delta["resource_telemetry_complete"]
@@ -140,7 +140,7 @@ def test_required_telemetry_validation(failure: str) -> None:
     else:
         core["gc_enabled"] = False
     with pytest.raises(AssertionError):
-        probe.validate_core(core)
+        process_metrics.validate_core(core)
 
 
 def test_own_cgroup_resolution_and_no_namespace_fallback(tmp_path: Path) -> None:
@@ -152,20 +152,22 @@ def test_own_cgroup_resolution_and_no_namespace_fallback(tmp_path: Path) -> None
     (proc / "cgroup").write_text("0::/namespace/child\n")
     line = f"1 0 0:1 /namespace {mount} rw - cgroup2 cgroup rw\n"
     (proc / "mountinfo").write_text(line)
-    assert probe.unified_cgroup(proc)["path"] == str(owned)
+    assert process_metrics.unified_cgroup(proc)["path"] == str(owned)
     (proc / "mountinfo").write_text(line + line)
-    assert probe.unified_cgroup(proc)["path"] is None
+    assert process_metrics.unified_cgroup(proc)["path"] is None
     (proc / "cgroup").write_text("0::/other/child\n")
     (proc / "mountinfo").write_text(line)
-    assert probe.unified_cgroup(proc)["path"] is None
+    assert process_metrics.unified_cgroup(proc)["path"] is None
 
 
 def test_exposed_counters_and_gauges_have_distinct_semantics() -> None:
     first, last = observed(1), observed(2)
     for record, ticks, avg in ((first, 100, 90), (last, 120, 1)):
         record["cgroup"] = {"path": "/owned", "device": 1, "inode": 2, "error": None}
-        record["cgroup_files"]["cpu.stat"] = probe.flat_counters(f"usage_usec {ticks}\nnr_throttled 1\n")
-        record["cgroup_files"]["cpu.pressure"] = probe.pressure(f"some avg10={avg} avg60=0 avg300=0 total={ticks}\n")
+        record["cgroup_files"]["cpu.stat"] = process_metrics.flat_counters(f"usage_usec {ticks}\nnr_throttled 1\n")
+        record["cgroup_files"]["cpu.pressure"] = process_metrics.pressure(
+            f"some avg10={avg} avg60=0 avg300=0 total={ticks}\n"
+        )
     last["core"]["gc_count"] = [0, 0, 0]  # Automatic GC resets this gauge normally.
     delta = probe.telemetry_delta(first, last)
     assert delta["cpu_pressure_counters_available"]
@@ -177,9 +179,9 @@ def test_exposed_counters_and_gauges_have_distinct_semantics() -> None:
         probe.telemetry_delta(first, last)
     for text in ("usage_usec -1", "usage_usec 0\nusage_usec 1", ""):
         with pytest.raises((AssertionError, ValueError)):
-            probe.flat_counters(text)
+            process_metrics.flat_counters(text)
     with pytest.raises(AssertionError, match="PSI"):
-        probe.pressure("some avg10=nan avg60=0 avg300=0 total=1")
+        process_metrics.pressure("some avg10=nan avg60=0 avg300=0 total=1")
 
 
 @pytest.mark.parametrize(
@@ -347,59 +349,28 @@ def test_negative_raw_latency_cannot_hide_in_positive_aggregates() -> None:
         probe.metrics(phase)
 
 
-def test_serving_observer_timed_loop_and_gc_are_unmodified() -> None:
+def test_serving_observer_and_gc_are_unmodified() -> None:
     baseline = subprocess.run(
-        ["git", "show", "f06f414a:tools/benchmarks/cross_encoder_lora/worker.py"],  # noqa: S607
+        ["git", "show", "a2932d81:tools/benchmarks/cross_encoder_lora/worker.py"],  # noqa: S607
         cwd=ROOT,
         capture_output=True,
         text=True,
         check=False,
     )
     if baseline.returncode:
-        pytest.skip("timed-code invariant control requires its documented parent commit in git history")
-    # The Client capture lifecycle is intentionally amended. Preserve the
-    # production observation boundary and actual timed loop, allowing only
-    # the named wait limit that gained scheduling headroom for the longer run.
-    names = {"performance", "unobserved"}
-
-    class TimedCore(ast.NodeTransformer):
-        def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-            if node.name == "performance":
-                timed = next(value for value in node.body if isinstance(value, ast.Try))
-                end = next(
-                    index
-                    for index, value in enumerate(timed.body)
-                    if isinstance(value, ast.Assign)
-                    and any(isinstance(target, ast.Name) and target.id == "elapsed" for target in value.targets)
-                )
-                timed.body = timed.body[: end + 1]
-                timed.finalbody = []
-            self.generic_visit(node)
-            return node
-
-        def visit_Call(self, node: ast.Call) -> ast.Call:
-            if (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "result"
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "future"
-            ):
-                timeout = next(value for value in node.keywords if value.arg == "timeout")
-                assert (isinstance(timeout.value, ast.Constant) and timeout.value.value == 90) or (
-                    isinstance(timeout.value, ast.Name) and timeout.value.id == "PERFORMANCE_FUTURE_TIMEOUT_S"
-                )
-                timeout.value = ast.Constant(value=90)
-            self.generic_visit(node)
-            return node
+        pytest.skip("invariant control requires its documented parent commit in git history")
 
     def code(text: str) -> dict[str, str]:
         return {
-            node.name: ast.dump(TimedCore().visit(node))
+            node.name: ast.dump(node)
             for node in ast.parse(text).body
-            if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names
+            if isinstance(node, ast.FunctionDef) and node.name in {"unobserved", "memory"}
         }
 
     assert code(Path(worker.__file__).read_text()) == code(baseline.stdout)
+    # Historical diagnostic timing still uses the in-process wrapper and does
+    # not force GC. The new qualification load loop has its own extraction and
+    # clock-boundary tests; exact historical replay remains pinned to 482b.
     tree = ast.parse(Path(probe.__file__).read_text())
     assert not any(
         isinstance(node, ast.Call)

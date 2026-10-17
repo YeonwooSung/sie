@@ -15,11 +15,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import gc
 import json
 import math
 import os
-import resource
 import signal
 import socket
 import statistics
@@ -34,10 +32,13 @@ from typing import Any
 
 import torch
 import uvicorn
+from sie_sdk import SIEClient
 
 from tools.benchmarks.cross_encoder_lora import worker
 from tools.benchmarks.cross_encoder_lora.adapter import require_forward_selection
+from tools.benchmarks.cross_encoder_lora.client import validate_response
 from tools.benchmarks.cross_encoder_lora.evidence import Evidence, atomic_json, digest, fingerprint, vector_delta
+from tools.benchmarks.cross_encoder_lora.process_metrics import CONTROL_FILES, snapshot, telemetry_delta
 from tools.benchmarks.cross_encoder_lora.protocol import (
     BASE_REVISION,
     CPU_ORACLE,
@@ -73,16 +74,7 @@ HISTORICAL_SOURCE_REVISION = "482b599224920a97bb2fce4a740317efb89351ab"
 METRICS = ((1, "mean_ms"), (1, "p95_ms"), (4, "rps"), (4, "p95_ms"), (16, "rps"), (16, "p95_ms"))
 RUNNER_LIMIT = 1200
 WORKER_LIMIT = 180
-GC_FIELDS = ("collections", "collected", "uncollectable")
-RUSAGE_FIELDS = ("ru_utime", "ru_stime", "ru_minflt", "ru_majflt", "ru_nvcsw", "ru_nivcsw")
-OPTIONAL_FILES = ("cpu.stat", "cpu.stat.local", "cpu.pressure", "cpu.max", "cpu.weight", "cpuset.cpus.effective")
-COUNTER_FILES = ("cpu.stat", "cpu.stat.local")
-CONTROL_FILES = ("cpu.max", "cpu.weight", "cpuset.cpus.effective")
-GC_GENERATIONS = 3
 QUARTILES = 4
-PSI_FIELDS = ("avg10", "avg60", "avg300", "total")
-MAX_PERCENT = 100
-MAX_CPU_WEIGHT = 10000
 
 
 class DiagnosticEvidence(Evidence):
@@ -126,215 +118,6 @@ def diagnostic_settings(warmups: int) -> Iterator[None]:
                 delattr(worker, name)
             else:
                 setattr(worker, name, value)
-
-
-def unified_cgroup(proc: Path = Path("/proc/self")) -> dict[str, Any]:
-    """Resolve the process's own namespace; never fall back to another cgroup."""
-    try:
-        rows = (proc / "cgroup").read_text().splitlines()
-        membership = [row[3:] for row in rows if row.startswith("0::")]
-        require(len(membership) == 1, "unified cgroup membership is unavailable or ambiguous")
-        group = Path(membership[0])
-        require(group.is_absolute() and ".." not in group.parts, "invalid cgroup membership")
-        matches = []
-        for row in (proc / "mountinfo").read_text().splitlines():
-            left, right = row.split(" - ", 1)
-            if right.split()[0] != "cgroup2":
-                continue
-            fields = left.split()
-            root = Path(fields[3].replace("\\040", " ").replace("\\134", "\\"))
-            mount = Path(fields[4].replace("\\040", " ").replace("\\134", "\\"))
-            if group.is_relative_to(root):
-                matches.append(mount / group.relative_to(root))
-        require(len(matches) == 1, "cgroup mount cannot be resolved uniquely")
-        path = matches[0]
-        info = path.stat()
-        return {"path": str(path), "device": info.st_dev, "inode": info.st_ino, "error": None}
-    except (OSError, ValueError, IndexError, AssertionError) as error:
-        return {"path": None, "error": f"{type(error).__name__}: {error}"}
-
-
-def flat_counters(text: str) -> dict[str, int]:
-    result = {}
-    for row in text.splitlines():
-        key, value = row.split()
-        require(key not in result, "duplicate telemetry counter")
-        result[key] = int(value)
-        require(result[key] >= 0, "negative telemetry counter")
-    require(bool(result), "empty exposed telemetry counter file")
-    return result
-
-
-def pressure(text: str) -> dict[str, dict[str, float | int]]:
-    result = {}
-    for row in text.splitlines():
-        name, *parts = row.split()
-        require(name in {"some", "full"} and name not in result, "invalid PSI row")
-        values = dict(part.split("=", 1) for part in parts)
-        require(len(parts) == len(PSI_FIELDS) and set(values) == set(PSI_FIELDS), "invalid PSI fields")
-        parsed = {key: int(value) if key == "total" else float(value) for key, value in values.items()}
-        require(all(math.isfinite(value) and value >= 0 for value in parsed.values()), "invalid PSI value")
-        require(all(parsed[key] <= MAX_PERCENT for key in PSI_FIELDS[:-1]), "invalid PSI percentage")
-        result[name] = parsed
-    require("some" in result, "missing exposed PSI some row")
-    return result
-
-
-def validate_core(core: dict[str, Any]) -> None:
-    require(
-        all(isinstance(core[key], int) and core[key] > 0 for key in ("wall_ns", "monotonic_ns"))
-        and core["gc_enabled"] is True,
-        "invalid required clock/GC state",
-    )
-    require(
-        set(core["rusage"]) == set(RUSAGE_FIELDS)
-        and all(math.isfinite(value) and value >= 0 for value in core["rusage"].values()),
-        "invalid required rusage",
-    )
-    for key in ("gc_thresholds", "gc_count"):
-        require(
-            len(core[key]) == GC_GENERATIONS and all(type(value) is int and value >= 0 for value in core[key]),
-            "invalid required GC counts/thresholds",
-        )
-    require(core["gc_thresholds"][0] > 0, "automatic GC is disabled by its threshold")
-    require(len(core["gc_stats"]) == GC_GENERATIONS, "missing required GC generations")
-    require(
-        all(
-            set(row) == set(GC_FIELDS) and all(type(row[key]) is int and row[key] >= 0 for key in GC_FIELDS)
-            for row in core["gc_stats"]
-        ),
-        "invalid required GC statistics",
-    )
-
-
-def control_value(name: str, text: str) -> str:
-    if name == "cpu.max":
-        quota, period = text.split()
-        require((quota == "max" or int(quota) > 0) and int(period) > 0, "invalid exposed cpu.max")
-    elif name == "cpu.weight":
-        require(1 <= int(text) <= MAX_CPU_WEIGHT, "invalid exposed cpu.weight")
-    else:
-        for item in text.split(","):
-            bounds = [int(value) for value in item.split("-")]
-            require(len(bounds) in {1, 2} and bounds[0] >= 0 and bounds[-1] >= bounds[0], "invalid exposed cpuset")
-    return text
-
-
-def snapshot() -> dict[str, Any]:
-    """Only called outside performance(), including all filesystem reads."""
-    started = time.monotonic_ns()
-    usage = resource.getrusage(resource.RUSAGE_SELF)
-    core = {
-        "wall_ns": time.time_ns(),
-        "monotonic_ns": started,
-        "rusage": {key: getattr(usage, key) for key in RUSAGE_FIELDS},
-        "gc_enabled": gc.isenabled(),
-        "gc_thresholds": list(gc.get_threshold()),
-        "gc_count": list(gc.get_count()),
-        "gc_stats": gc.get_stats(),
-    }
-    validate_core(core)
-    group = unified_cgroup()
-    files: dict[str, Any] = {}
-    errors = {}
-    if group["path"] is not None:
-        for name in OPTIONAL_FILES:
-            try:
-                text = (Path(group["path"]) / name).read_text().strip()
-            except OSError as error:
-                files[name] = None
-                errors[name] = f"{type(error).__name__}: {error}"
-                continue
-            # Missing optional files are unavailability, but malformed exposed
-            # counters must not be mistaken for trustworthy zero deltas.
-            files[name] = (
-                flat_counters(text)
-                if name in COUNTER_FILES
-                else pressure(text)
-                if name == "cpu.pressure"
-                else control_value(name, text)
-            )
-    else:
-        files = dict.fromkeys(OPTIONAL_FILES)
-        errors["cgroup"] = group["error"]
-    affinity = None
-    try:
-        if hasattr(os, "sched_getaffinity"):
-            affinity = sorted(os.sched_getaffinity(0))
-            require(bool(affinity), "empty exposed affinity")
-        else:
-            errors["affinity"] = "sched_getaffinity unavailable on this platform"
-    except OSError as error:
-        errors["affinity"] = f"{type(error).__name__}: {error}"
-    return {
-        "qualification": False,
-        "core": core,
-        "cgroup": group,
-        "cgroup_files": files,
-        "optional_errors": errors,
-        "affinity": affinity,
-        "snapshot_read_ns": time.monotonic_ns() - started,
-    }
-
-
-def counter_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
-    require(set(before) == set(after), "counter fields changed within a window")
-    result = {key: after[key] - value for key, value in before.items()}
-    require(all(math.isfinite(value) and value >= 0 for value in result.values()), "telemetry counter reset")
-    return result
-
-
-def telemetry_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
-    first, last = before["core"], after["core"]
-    validate_core(first)
-    validate_core(last)
-    require(
-        last["wall_ns"] > first["wall_ns"] and last["monotonic_ns"] > first["monotonic_ns"],
-        "required clock did not advance",
-    )
-    require(
-        first["gc_enabled"] and last["gc_enabled"] and first["gc_thresholds"] == last["gc_thresholds"],
-        "GC configuration changed",
-    )
-    group_before, group_after = before["cgroup"], after["cgroup"]
-    require(
-        all(group_before.get(key) == group_after.get(key) for key in ("path", "device", "inode")),
-        "cgroup path or identity changed within a window",
-    )
-    require(before["affinity"] == after["affinity"], "process affinity changed within a window")
-    for name in CONTROL_FILES:
-        require(
-            before["cgroup_files"].get(name) == after["cgroup_files"].get(name),
-            "cgroup quota/weight/cpuset changed within a window",
-        )
-    optional = {}
-    for name in COUNTER_FILES:
-        a, b = before["cgroup_files"].get(name), after["cgroup_files"].get(name)
-        optional[name] = counter_delta(a, b) if a is not None and b is not None else None
-    a, b = before["cgroup_files"].get("cpu.pressure"), after["cgroup_files"].get("cpu.pressure")
-    optional["cpu.pressure"] = (
-        counter_delta({k: v["total"] for k, v in a.items()}, {k: v["total"] for k, v in b.items()})
-        if a is not None and b is not None
-        else None
-    )
-    return {
-        "qualification": False,
-        "scope": "Whole performance call, including sequential warmup, measurement, drain, validation and raw emission",
-        "wall_s": (last["wall_ns"] - first["wall_ns"]) / 1e9,
-        "monotonic_s": (last["monotonic_ns"] - first["monotonic_ns"]) / 1e9,
-        "rusage": counter_delta(first["rusage"], last["rusage"]),
-        "gc_stats": [counter_delta(a, b) for a, b in zip(first["gc_stats"], last["gc_stats"], strict=True)],
-        "optional_cgroup": optional,
-        "cpu_pressure_counters_available": all(optional.get(name) is not None for name in ("cpu.stat", "cpu.pressure")),
-        "resource_telemetry_complete": before["affinity"] is not None
-        and after["affinity"] is not None
-        and all(
-            before["cgroup_files"].get(name) is not None and after["cgroup_files"].get(name) is not None
-            for name in OPTIONAL_FILES
-        ),
-        "optional_errors_before": before["optional_errors"],
-        "optional_errors_after": after["optional_errors"],
-    }
 
 
 def metrics(phase: dict[str, Any]) -> dict[str, Any]:
@@ -418,7 +201,7 @@ def verify_attempt(path: Path, record: dict[str, Any]) -> None:
     )
     for row in rows:
         saved = row["scores"][:]
-        worker.validate_response(row)
+        validate_response(row)
         require(saved == row["scores"] and row["selection"] is None, "baseline scores/selection differ")
         require(row["end_ns"] >= row["start_ns"] > 0, "invalid request timestamps")
     if record["concurrency"] == 1:
@@ -635,7 +418,7 @@ async def child(args: argparse.Namespace) -> dict[str, Any]:
         environment["hardware_preflight_only"] = environment.pop("qualification")
         environment["qualification"] = False
         environment["source_imports"] = {}
-        for name, target in (("sdk", worker.SIEClient), ("server", worker.AppFactory)):
+        for name, target in (("sdk", SIEClient), ("server", worker.AppFactory)):
             module_file = sys.modules[target.__module__].__file__
             assert module_file is not None, "source module has no file"
             source_file = Path(module_file).resolve()  # noqa: ASYNC240 -- preflight before model/server starts
