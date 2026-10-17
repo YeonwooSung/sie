@@ -28,6 +28,9 @@ from tools.benchmarks.cross_encoder_lora.protocol import (
 )
 
 ROOT = Path(__file__).resolve().parents[3]
+WAIT_GRACE_SECONDS = 45
+TERMINATE_GRACE_SECONDS = 35
+KILL_GRACE_SECONDS = 10
 
 
 def harness_manifest() -> dict[str, Any]:
@@ -123,10 +126,10 @@ def stop(process: subprocess.Popen) -> None:
     if process.poll() is None:
         process.send_signal(signal.SIGTERM)
         try:
-            process.wait(timeout=35)
+            process.wait(timeout=TERMINATE_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
             process.kill()
-            process.wait(timeout=10)
+            process.wait(timeout=KILL_GRACE_SECONDS)
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -152,7 +155,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         schedule = [(0, "R")] if args.smoke else [(pair, arm) for pair, order in enumerate(ORDERS) for arm in order]
         for pair, arm in schedule:
             require(
-                time.monotonic() + args.trial_deadline_s + 45 < absolute_deadline,
+                time.monotonic()
+                + args.trial_deadline_s
+                + WAIT_GRACE_SECONDS
+                + TERMINATE_GRACE_SECONDS
+                + KILL_GRACE_SECONDS
+                < absolute_deadline,
                 "insufficient time for a complete bounded next trial and cleanup",
             )
             directory = args.output / f"trial-{pair}-{arm}"
@@ -187,7 +195,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     process = subprocess.Popen(
                         command, env=source_environment(source), cwd=source, stdout=log, stderr=subprocess.STDOUT
                     )
-                    returncode = process.wait(timeout=args.trial_deadline_s + 45)
+                    returncode = process.wait(timeout=args.trial_deadline_s + WAIT_GRACE_SECONDS)
                 except BaseException as error:  # noqa: BLE001 -- persist the trial, then re-raise after owned cleanup
                     pending_error = error
                 finally:
