@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import math
 import os
@@ -15,7 +16,12 @@ from typing import Any, Self
 
 from tools.benchmarks.cross_encoder_lora.evidence import Evidence, atomic_json, digest
 from tools.benchmarks.cross_encoder_lora.loadgen import CONTROL_LIMIT, CONTROL_TIMEOUT_S, PHASES
-from tools.benchmarks.cross_encoder_lora.process_metrics import MAX_CALLBACK_FRACTION, GCRecorder, bracket, snapshot
+from tools.benchmarks.cross_encoder_lora.process_metrics import (
+    boundary_gc_report,
+    bracket,
+    snapshot,
+    validate_boundary_gc,
+)
 from tools.benchmarks.cross_encoder_lora.protocol import PERFORMANCE_FUTURE_TIMEOUT_S, require
 
 
@@ -115,12 +121,11 @@ class IsolatedLoadgen:
             len(self.records) < len(PHASES) and concurrency == PHASES[len(self.records)],
             "duplicate or reordered measured phase",
         )
-        monitor = GCRecorder()
         observation: dict[str, Any] = {"server_pid": os.getpid(), "client_identity": self.receipt["identity"]}
         try:
             await self._send("phase", concurrency)
             await self._read("ready", concurrency)
-            monitor.start()
+            callbacks = tuple(gc.callbacks)
             observation["before"] = snapshot()
             await self._send("go", concurrency)
             measured = await self._read("measured", concurrency, wait_s=PERFORMANCE_FUTURE_TIMEOUT_S)
@@ -135,8 +140,7 @@ class IsolatedLoadgen:
             )
             observation["clock"] = clock
             observation["after"] = snapshot()
-            monitor.close()
-            observation["gc"] = monitor.report(clock["start"], clock["end"])
+            observation["gc"] = boundary_gc_report(observation["before"], observation["after"], callbacks)
             observation["resources"] = bracket(observation["before"], observation["after"], clock)
             await self._send("observed", concurrency)
             complete = await self._read("phase_complete", concurrency)
@@ -159,7 +163,6 @@ class IsolatedLoadgen:
             )
             return record
         finally:
-            monitor.close()
             primary_error = sys.exception()
             try:
                 atomic_json(self.evidence.directory / f"server-C{concurrency}-observations.json", observation)
@@ -279,24 +282,11 @@ class IsolatedLoadgen:
         require(client["gc"]["pid"] == identity["pid"], "client GC observation PID differs")
         require(server["gc"]["pid"] == os.getpid(), "server GC observation PID differs")
         for observation in (client, server):
-            gc_report = observation["gc"]
-            require(
-                gc_report["window_start_ns"] == round(server["clock"]["start"] * 1e9)
-                and gc_report["window_end_ns"] == round(server["clock"]["end"] * 1e9),
-                "GC observation window differs",
-            )
-            require(gc_report["integrity_passed"] is True, "GC observer integrity gate failed")
-            cost = gc_report["estimated_observer_fraction"]
-            require(type(cost) in (int, float) and math.isfinite(cost) and cost >= 0, "invalid observer cost")
-        combined = server["gc"]["estimated_observer_fraction"] + client["gc"]["estimated_observer_fraction"]
-        # Tiny CPU smoke has no performance qualification. It still must prove
-        # evidence integrity; the unchanged prospective cost gate is mandatory
-        # for every real measurement window on the qualifying allocation.
-        if not self.smoke:
-            require(combined <= MAX_CALLBACK_FRACTION, "combined observer cost gate failed")
+            validate_boundary_gc(observation)
         value["server_observation"] = server
-        value["combined_estimated_observer_fraction"] = combined
-        value["observer_cost_gate_applied"] = not self.smoke
+        value["combined_estimated_observer_fraction"] = None
+        value["observer_cost_gate_applied"] = False
+        value["observer_cost_gate_status"] = "not_applicable"
         return value
 
     def results(self) -> dict[str, dict[str, Any]]:

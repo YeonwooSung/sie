@@ -43,7 +43,7 @@ benchmark only inspects them and fails on a mismatch.
 ```console
 mise exec -- uv run --no-sync python -m tools.benchmarks.cross_encoder_lora.runner \
   --inputs /tmp/ce-sources --fixtures /tmp/ce-fixtures \
-  --output /tmp/ce-evidence --deadline-s 4200 --trial-deadline-s 270
+  --output /tmp/ce-evidence --deadline-s 3900 --trial-deadline-s 270
 ```
 
 Use a fresh output directory. Set the outer compute-session deadline before
@@ -55,8 +55,11 @@ more than its 270-second limit plus 90 seconds for wait, termination and kill
 grace (45/35/10). The proposed outer limits are 4,500 seconds for the operator
 and 4,800 seconds from provider start, with a 300-second startup cutoff and an
 additional absolute ceiling of application creation plus 5,100 seconds. The
-operator must reserve export time before starting the runner; these settings
-do not themselves authorize or allocate compute. Never change thresholds or
+operator reserves 300 seconds for export and requires strictly more than 4,255
+seconds remaining before starting the 3,900-second runner (plus 45 seconds wait
+and 10 seconds cleanup). The public runner's 4,200-second ceiling remains
+available, but is not this operator preset. These settings do not themselves
+authorize or allocate compute. Never change thresholds or
 drop failed trials to obtain a pass, or retry the same failed protocol unchanged.
 
 ## Frozen comparison
@@ -215,24 +218,42 @@ created. Cancellation, malformed protocol and child errors fail the trial and
 trigger bounded termination/reaping. SIGKILL or immediate parent-death exit can
 lose the interrupted phase; prior completed atomic phase files remain evidence.
 
-Each PID records preallocated numeric GC events and self-duration. The combined
-server-plus-client estimated callback cost must be at most **0.1%** of each
-measured interval, including a fixed 10-microsecond allowance per intersecting
-callback. A bounded local calibration must be retained before hardware use;
-it checks the allowance rather than changing it after outcomes. This estimate
-cannot prove zero scheduling or GC perturbation. Overflow, missing event pairs,
-clock contradictions, callback-list changes or the cost limit fail qualification.
-Run the public local calibration once from the frozen checkout and retain its
-full JSON, including failures and outliers:
+### Boundary-only observation amendment
+
+The first isolated run at `250bd9a91c8f465aafe69de94aee98aad6ac3298` completed
+the first baseline trial's three SDK phases, then failed its prospective
+combined GC-callback cost limit. Its C16 estimate was **0.183546%** against
+**0.1%**: measured inner callback self-time contributed **0.055258%** and the
+fixed 10-microsecond allowance contributed **0.128287%**. That failed run remains
+failed; no candidate trials or paired performance gates were qualified. The
+allowance was not reduced after observing the result.
+
+The qualification harness now adds **no per-event GC callbacks** in either
+PID; pre-existing callbacks are preserved. Outside-clock snapshots retain normal GC enable state, thresholds,
+collection counters and ordered callback identities. The original callback
+objects stay referenced through both boundaries, and changes to their identities
+or GC configuration fail the phase. These checks cannot detect an intervening
+change undone before the next snapshot. No automatic collection is disabled,
+and no forced collection is added during timing.
+
+Actual GC pause intervals and callback self-time/cost are explicitly **unavailable**
+(`null`), not measured zero; the absent observer's cost gate is `not_applicable`,
+not passed. Boundary snapshots still have overhead outside the request clocks;
+this is not a zero-overhead claim. The SDK process separation, workload,
+statistical gates, numerical and memory limits, wire checks and process cleanup
+remain unchanged. The historical recorder and calibration remain standalone
+diagnostics and are not prerequisites for a run that does not install callbacks.
+To run that optional diagnostic from a frozen checkout, retain its full JSON,
+including failures and outliers:
 
 ```console
 mise exec -- uv run --no-sync python -m tools.benchmarks.cross_encoder_lora.calibrate_gc --output /tmp/ce-gc-calibration.json
 ```
 
-It estimates local mean cost, not worst-case event cost or another host's cost.
-Short CPU smoke applies integrity checks but does not qualify performance or
-apply a meaningful wall-time cost budget. No automatic collection is disabled,
-and no forced collection is added during timing.
+It estimates local mean callback cost, not worst-case event cost or another
+host's cost. Exact replay of the instrumented method requires its recorded
+`250bd9a9` checkout. Short CPU smoke checks evidence integrity but does not
+qualify performance.
 
 CPU/context-switch/cgroup snapshots bracket the actual shared monotonic interval;
 they include boundary work and are not exact request-level or GPU-only timers.

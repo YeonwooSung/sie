@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import inspect
 import json
 import os
@@ -19,7 +20,12 @@ from sie_sdk import SIEClient
 
 from tools.benchmarks.cross_encoder_lora.client import performance
 from tools.benchmarks.cross_encoder_lora.evidence import Evidence, atomic_json, digest
-from tools.benchmarks.cross_encoder_lora.process_metrics import GCRecorder, bracket, snapshot
+from tools.benchmarks.cross_encoder_lora.process_metrics import (
+    boundary_gc_report,
+    bracket,
+    snapshot,
+    validate_boundary_gc,
+)
 from tools.benchmarks.cross_encoder_lora.protocol import require
 
 CONTROL_LIMIT = 65_536
@@ -133,11 +139,12 @@ def run(args: argparse.Namespace) -> None:
         for concurrency in PHASES:
             control.receive("phase", concurrency)
             require_sdk_only()
-            monitor = GCRecorder()
-            monitor.start()
+            callbacks: tuple[Any, ...] = ()
             observations: dict[str, Any] = {}
 
             def before_measure() -> None:
+                nonlocal callbacks
+                callbacks = tuple(gc.callbacks)
                 observations["before"] = snapshot()
                 control.send("ready", concurrency)
                 control.receive("go", concurrency)
@@ -145,7 +152,7 @@ def run(args: argparse.Namespace) -> None:
             def after_measure(clock: dict[str, float]) -> None:
                 observations["clock"] = clock
                 observations["after"] = snapshot()
-                monitor.close()
+                observations["gc"] = boundary_gc_report(observations["before"], observations["after"], callbacks)
                 control.send("measured", concurrency, clock=clock)
                 control.receive("observed", concurrency)
 
@@ -159,15 +166,16 @@ def run(args: argparse.Namespace) -> None:
                     after_measure=after_measure,
                 )
             finally:
-                monitor.close()
-                if "clock" in observations:
-                    observations["gc"] = monitor.report(observations["clock"]["start"], observations["clock"]["end"])
-                atomic_json(evidence.directory / f"phase-C{concurrency}-observations.json", observations)
-            require(observations["gc"]["integrity_passed"], "client GC observation integrity failed")
-            if not args.smoke:
-                require(
-                    observations["gc"]["cost_budget_passed"], "client GC observation exceeded its prospective cost gate"
-                )
+                primary_error = sys.exception()
+                try:
+                    atomic_json(evidence.directory / f"phase-C{concurrency}-observations.json", observations)
+                except BaseException as write_error:
+                    if primary_error is None:
+                        raise
+                    primary_error.add_note(
+                        f"Secondary client observation write failure: {type(write_error).__name__}: {write_error}"
+                    )
+            validate_boundary_gc(observations)
             observations["resources"] = bracket(
                 observations["before"], observations["after"], result["measurement_clock"]
             )

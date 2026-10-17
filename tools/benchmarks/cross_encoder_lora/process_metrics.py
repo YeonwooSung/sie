@@ -137,6 +137,7 @@ def snapshot() -> dict[str, Any]:
         "rusage": {key: getattr(usage, key) for key in RUSAGE_FIELDS},
         "gc_enabled": gc.isenabled(),
         "gc_thresholds": list(gc.get_threshold()),
+        "gc_callback_ids": [id(callback) for callback in gc.callbacks],
         "gc_count": list(gc.get_count()),
         "gc_stats": gc.get_stats(),
     }
@@ -244,7 +245,72 @@ def telemetry_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, 
     }
 
 
-# Prospective observation limits, independent of the performance gates.
+def _boundary_gc_projection(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    first, last = before["core"], after["core"]
+    errors = []
+    for core in (first, last):
+        require(
+            isinstance(core["gc_callback_ids"], list)
+            and all(type(value) is int and value > 0 for value in core["gc_callback_ids"]),
+            "invalid boundary GC callback identities",
+        )
+        require(
+            len(core["gc_thresholds"]) == GC_GENERATIONS
+            and all(type(value) is int and value >= 0 for value in core["gc_thresholds"]),
+            "invalid boundary GC thresholds",
+        )
+    if first["pid"] != last["pid"]:
+        errors.append("GC boundary process identity changed")
+    if first["gc_callback_ids"] != last["gc_callback_ids"]:
+        errors.append("pre-existing GC callback identities changed")
+    if first["gc_enabled"] is not True or last["gc_enabled"] is not True:
+        errors.append("ordinary automatic GC must remain enabled")
+    if first["gc_thresholds"] != last["gc_thresholds"] or first["gc_thresholds"][0] <= 0:
+        errors.append("GC thresholds changed or disabled automatic collection")
+    return {
+        "mode": "boundary-only",
+        "pid": first["pid"],
+        "scope": "Boundary state only; intervening changes and GC pauses are unobserved.",
+        "integrity_passed": not errors,
+        "errors": errors,
+        "records": None,
+        "intervals": None,
+        "callback_self_ns": None,
+        "estimated_observer_fraction": None,
+        "cost_budget_passed": None,
+        "unavailable_reason": "No per-event GC callbacks are installed by the qualification harness.",
+    }
+
+
+def boundary_gc_report(before: dict[str, Any], after: dict[str, Any], callbacks: tuple[Any, ...]) -> dict[str, Any]:
+    """Check outside-clock state without installing callbacks or changing GC.
+
+    Holding the original objects through both snapshots prevents identity reuse.
+    This cannot observe an intervening change that is undone before the boundary.
+    """
+    result = _boundary_gc_projection(before, after)
+    if (
+        before["core"]["gc_callback_ids"] != [id(callback) for callback in callbacks]
+        or len(gc.callbacks) != len(callbacks)
+        or any(current is not prior for current, prior in zip(gc.callbacks, callbacks, strict=False))
+    ):
+        result["errors"].append("retained GC callback identity differs at a boundary")
+        result["integrity_passed"] = False
+    return result
+
+
+def validate_boundary_gc(observation: dict[str, Any]) -> None:
+    """Reject measured-event claims or contradictory raw boundary evidence."""
+    expected = _boundary_gc_projection(observation["before"], observation["after"])
+    require(
+        expected["integrity_passed"] is True
+        and observation["gc"]["integrity_passed"] is True
+        and observation["gc"] == expected,
+        "boundary-only GC state or unavailable observation fields differ",
+    )
+
+
+# Historical per-event diagnostic limits; qualification does not install this recorder.
 MAX_CALLBACK_FRACTION = 0.001
 CALLBACK_TAIL_ALLOWANCE_NS = 10_000
 GC_RECORD_CAPACITY = 65_536
@@ -391,7 +457,7 @@ class GCRecorder:
 
 
 def bracket(before: dict[str, Any], after: dict[str, Any], clock: dict[str, float]) -> dict[str, Any]:
-    """Attribute exact GC intervals separately from enclosing CPU/cgroup deltas."""
+    """Keep enclosing GC/CPU/cgroup deltas distinct from request-level timing."""
     require(before["core"]["pid"] == after["core"]["pid"], "process identity changed")
     begin, end = clock["start"], clock["end"]
     require(

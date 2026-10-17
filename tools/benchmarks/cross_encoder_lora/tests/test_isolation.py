@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import copy
+import gc
 import json
 import os
 import subprocess
@@ -18,6 +19,7 @@ from typing import Any, cast
 import pytest
 from sie_sdk._msgpack import packb, unpackb
 
+from tools.benchmarks.cross_encoder_lora import isolation, loadgen, process_metrics
 from tools.benchmarks.cross_encoder_lora.evidence import Evidence, atomic_json, digest
 from tools.benchmarks.cross_encoder_lora.isolation import IsolatedLoadgen
 from tools.benchmarks.cross_encoder_lora.loadgen import PHASES
@@ -67,7 +69,32 @@ def sdk_server(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
 
 
 @pytest.mark.asyncio
-async def test_one_sdk_only_exec_pid_reused_across_all_phases_and_reaped(sdk_server: str, tmp_path: Path) -> None:
+async def test_one_sdk_only_exec_pid_reused_across_all_phases_and_reaped(
+    sdk_server: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("qualification must not construct a GCRecorder")
+
+    # Exercise both real qualification paths with the historical recorder
+    # constructor made fatal. The SDK-only exec still uses its ordinary CLI.
+    monkeypatch.setattr(isolation, "GCRecorder", forbidden, raising=False)
+    monkeypatch.setattr(process_metrics, "GCRecorder", forbidden)
+    original_exec = asyncio.create_subprocess_exec
+
+    async def guarded_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+        assert args[1:3] == ("-m", "tools.benchmarks.cross_encoder_lora.loadgen")
+        bootstrap = (
+            "from tools.benchmarks.cross_encoder_lora import process_metrics, loadgen\n"
+            "def forbidden(*args, **kwargs):\n"
+            "    raise AssertionError('qualification must not construct a GCRecorder')\n"
+            "process_metrics.GCRecorder = forbidden\n"
+            "loadgen.GCRecorder = forbidden\n"
+            "loadgen.main()\n"
+        )
+        return await original_exec(args[0], "-c", bootstrap, *args[3:], **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", guarded_exec)
+    callbacks, thresholds = tuple(gc.callbacks), gc.get_threshold()
     evidence = Evidence(tmp_path / "out")
     async with IsolatedLoadgen(sdk_server, ROOT, evidence, smoke=True) as owner:
         assert owner.process is not None
@@ -94,8 +121,21 @@ async def test_one_sdk_only_exec_pid_reused_across_all_phases_and_reaped(sdk_ser
         assert phase["client_observation"]["gc"]["integrity_passed"]
         assert phase["server_observation"]["gc"]["integrity_passed"]
         assert phase["measurement_clock"] == phase["server_observation"]["clock"]
-        assert phase["observer_cost_gate_applied"] is False  # CPU smoke never qualifies performance.
+        assert phase["combined_estimated_observer_fraction"] is None
+        assert phase["observer_cost_gate_applied"] is False
+        assert phase["observer_cost_gate_status"] == "not_applicable"
+        for observation in (phase["client_observation"], phase["server_observation"]):
+            assert observation["gc"]["mode"] == "boundary-only"
+            assert observation["gc"]["records"] is None
+            assert observation["gc"]["intervals"] is None
+            assert observation["gc"]["callback_self_ns"] is None
+            assert observation["gc"]["estimated_observer_fraction"] is None
+            assert observation["gc"]["cost_budget_passed"] is None
         assert all(len(row["responses"]) == 1 for row in phase["samples"])
+    assert len(gc.callbacks) == len(callbacks)
+    assert all(current is prior for current, prior in zip(gc.callbacks, callbacks, strict=True))
+    assert gc.isenabled()
+    assert gc.get_threshold() == thresholds
     terminal = json.loads((evidence.directory / "loadgen/terminal.json").read_text())
     assert terminal["phases"] == owner.records
     with pytest.raises(ProcessLookupError):
@@ -109,18 +149,13 @@ def synthetic_owner(tmp_path: Path) -> tuple[IsolatedLoadgen, dict[str, Any], di
     clock = {"start": 1.0, "deadline": 61.0, "end": 61.1}
 
     def observation(pid: int) -> dict[str, Any]:
-        return {
-            "before": {"core": {"pid": pid}},
-            "after": {"core": {"pid": pid}},
+        value = {
+            "before": {"core": {"pid": pid, "gc_enabled": True, "gc_thresholds": [700, 10, 10], "gc_callback_ids": []}},
+            "after": {"core": {"pid": pid, "gc_enabled": True, "gc_thresholds": [700, 10, 10], "gc_callback_ids": []}},
             "clock": clock,
-            "gc": {
-                "pid": pid,
-                "integrity_passed": True,
-                "window_start_ns": 1_000_000_000,
-                "window_end_ns": 61_100_000_000,
-                "estimated_observer_fraction": 0.0001,
-            },
         }
+        value["gc"] = process_metrics._boundary_gc_projection(value["before"], value["after"])
+        return value
 
     owner.observations[1] = observation(os.getpid())
     record = {"concurrency": 1}
@@ -142,16 +177,21 @@ def synthetic_owner(tmp_path: Path) -> tuple[IsolatedLoadgen, dict[str, Any], di
         "observation_clock",
         "identity",
         "pid",
-        "window",
+        "mode",
+        "callbacks",
+        "thresholds",
+        "disabled",
         "cost_nan",
-        "combined_budget",
+        "zero_cost",
+        "empty_events",
+        "false_gate",
         "integrity",
     ],
 )
-def test_phase_payload_must_match_observed_ipc_provenance_and_combined_budget(tmp_path: Path, mutation: str) -> None:
+def test_phase_payload_must_match_observed_ipc_provenance_and_boundary_state(tmp_path: Path, mutation: str) -> None:
     owner, record, original = synthetic_owner(tmp_path)
     value = copy.deepcopy(original)
-    assert owner._validate_phase(record, copy.deepcopy(original))["observer_cost_gate_applied"]
+    assert owner._validate_phase(record, copy.deepcopy(original))["observer_cost_gate_applied"] is False
     if mutation == "swapped_phase":
         value["concurrency"] = 4
     elif mutation == "clock":
@@ -162,17 +202,69 @@ def test_phase_payload_must_match_observed_ipc_provenance_and_combined_budget(tm
         value["identity"]["source"] = "/wrong"
     elif mutation == "pid":
         value["client_observation"]["after"]["core"]["pid"] += 1
-    elif mutation == "window":
-        value["client_observation"]["gc"]["window_start_ns"] += 1
+    elif mutation == "mode":
+        value["client_observation"]["gc"]["mode"] = "per-event"
+    elif mutation == "callbacks":
+        value["client_observation"]["after"]["core"]["gc_callback_ids"] = [123]
+    elif mutation == "thresholds":
+        value["client_observation"]["after"]["core"]["gc_thresholds"][0] += 1
+    elif mutation == "disabled":
+        value["client_observation"]["after"]["core"]["gc_enabled"] = False
     elif mutation == "cost_nan":
         value["client_observation"]["gc"]["estimated_observer_fraction"] = float("nan")
-    elif mutation == "combined_budget":
-        owner.observations[1]["gc"]["estimated_observer_fraction"] = 0.0006
-        value["client_observation"]["gc"]["estimated_observer_fraction"] = 0.0006
+    elif mutation == "zero_cost":
+        value["client_observation"]["gc"]["estimated_observer_fraction"] = 0
+    elif mutation == "empty_events":
+        value["client_observation"]["gc"]["records"] = []
+    elif mutation == "false_gate":
+        value["client_observation"]["gc"]["cost_budget_passed"] = False
     else:
         value["client_observation"]["gc"]["integrity_passed"] = False
     with pytest.raises(AssertionError):
         owner._validate_phase(record, value)
+
+
+def test_child_observation_write_failure_cannot_replace_primary_phase_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import argparse
+
+    class Control:
+        def __init__(self, _token: str) -> None:
+            pass
+
+        def send(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def receive(self, *_args: Any) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def failed_performance(*_args: Any, before_measure: Any, **_kwargs: Any) -> None:
+        before_measure()
+        raise ValueError("primary SDK failure")
+
+    original_write = loadgen.atomic_json
+
+    def failed_write(path: Path, value: Any) -> None:
+        if path.name.endswith("-observations.json"):
+            raise OSError("observation write failed")
+        original_write(path, value)
+
+    monkeypatch.setattr(loadgen, "Control", Control)
+    monkeypatch.setattr(loadgen, "identity", lambda _source: {"pid": os.getpid()})
+    monkeypatch.setattr(loadgen, "require_sdk_only", lambda: None)
+    monkeypatch.setattr(loadgen, "performance", failed_performance)
+    monkeypatch.setattr(loadgen, "atomic_json", failed_write)
+    args = argparse.Namespace(output=tmp_path / "child", source=ROOT, token=str(os.getpid()), smoke=True, url="unused")
+    with pytest.raises(ValueError, match="primary SDK failure") as caught:
+        loadgen.run(args)
+    assert any("observation write failed" in note for note in caught.value.__notes__)
+    terminal = json.loads((args.output / "terminal.json").read_text())
+    assert terminal["error"]["type"] == "ValueError"
+    assert terminal["passed"] is False
 
 
 @pytest.mark.asyncio

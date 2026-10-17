@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import gc
 import time
 from array import array
@@ -11,6 +12,79 @@ from typing import Any
 import pytest
 
 from tools.benchmarks.cross_encoder_lora import process_metrics as metrics
+
+
+def test_boundary_observation_preserves_gc_without_measuring_events() -> None:
+    callbacks, thresholds = tuple(gc.callbacks), gc.get_threshold()
+    before = metrics.snapshot()
+    after = metrics.snapshot()
+    value = metrics.boundary_gc_report(before, after, callbacks)
+    metrics.validate_boundary_gc({"before": before, "after": after, "gc": value})
+    assert value["mode"] == "boundary-only"
+    assert value["integrity_passed"]
+    assert all(
+        value[key] is None
+        for key in ("records", "intervals", "callback_self_ns", "estimated_observer_fraction", "cost_budget_passed")
+    )
+    assert "unobserved" in value["scope"]
+    assert before["core"]["gc_callback_ids"] == after["core"]["gc_callback_ids"] == [id(item) for item in callbacks]
+    assert len(gc.callbacks) == len(callbacks)
+    assert all(current is prior for current, prior in zip(gc.callbacks, callbacks, strict=True))
+    assert gc.isenabled()
+    assert gc.get_threshold() == thresholds
+
+
+def test_boundary_callback_identity_check_does_not_use_callable_equality() -> None:
+    class Permissive:
+        def __call__(self, _phase: str, _info: dict[str, Any]) -> None:
+            pass
+
+        def __eq__(self, _other: object) -> bool:
+            return True
+
+        def __hash__(self) -> int:
+            return 0
+
+    original, replacement = Permissive(), Permissive()
+    previous = tuple(gc.callbacks)
+    gc.callbacks.append(original)
+    callbacks = tuple(gc.callbacks)
+    try:
+        before = metrics.snapshot()
+        gc.callbacks[-1] = replacement
+        after = metrics.snapshot()
+        value = metrics.boundary_gc_report(before, after, callbacks)
+        assert not value["integrity_passed"]
+        with pytest.raises(AssertionError, match="boundary-only"):
+            metrics.validate_boundary_gc({"before": before, "after": after, "gc": value})
+        # Even forged matching snapshot IDs cannot hide a changed live object
+        # from the local retained-reference check.
+        after["core"]["gc_callback_ids"] = before["core"]["gc_callback_ids"]
+        assert not metrics.boundary_gc_report(before, after, callbacks)["integrity_passed"]
+    finally:
+        gc.callbacks[:] = previous
+
+
+def test_boundary_threshold_mutation_and_disabled_gc_fail_without_restoring_them_silently() -> None:
+    thresholds = gc.get_threshold()
+    callbacks = tuple(gc.callbacks)
+    before = metrics.snapshot()
+    try:
+        gc.set_threshold(thresholds[0] + 1, *thresholds[1:])
+        after = metrics.snapshot()
+        value = metrics.boundary_gc_report(before, after, callbacks)
+        assert not value["integrity_passed"]
+        assert gc.get_threshold()[0] == thresholds[0] + 1
+        gc.disable()
+        with pytest.raises(AssertionError, match="GC state"):
+            metrics.snapshot()
+        after = copy.deepcopy(before)
+        after["core"]["gc_enabled"] = False
+        assert not metrics.boundary_gc_report(before, after, callbacks)["integrity_passed"]
+        assert not gc.isenabled()
+    finally:
+        gc.set_threshold(*thresholds)
+        gc.enable()
 
 
 def report(rows: list[list[int]], start: float = 1.0, end: float = 2.0) -> dict[str, Any]:
