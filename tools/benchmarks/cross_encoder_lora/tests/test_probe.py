@@ -21,7 +21,7 @@ from tools.benchmarks.cross_encoder_lora.evidence import Evidence, atomic_json, 
 from tools.benchmarks.cross_encoder_lora.fixtures import prepare
 from tools.benchmarks.cross_encoder_lora.protocol import BASE_REVISION, ORDERS, compare, paired_gate, percentile
 from tools.benchmarks.cross_encoder_lora.runner import ROOT, extract, source_environment
-from tools.benchmarks.cross_encoder_lora.worker import ORDER, describe_response, matching_vectors, validate_response
+from tools.benchmarks.cross_encoder_lora.worker import ORDER, describe_response, matching_vector, validate_response
 
 
 def tiny_snapshot(directory: Path) -> Path:
@@ -280,8 +280,8 @@ def test_timed_diagnostics_require_one_complete_oracle_vector() -> None:
         "first": {"copies": 1, "scores": [first[index] for index in ORDER]},
         "second": {"copies": 2, "scores": [second[index] for index in ORDER for _ in range(2)]},
     }
-    assert matching_vectors(first, oracles) == [{"workload_sha256": "first", "copies": 1, "request_position": 0}]
-    assert matching_vectors([0.0, 11.0, 2.0, 13.0], oracles) == []
+    assert matching_vector(first, oracles) == {"workload_sha256": "first", "copies": 1, "request_position": 0}
+    assert matching_vector([0.0, 11.0, 2.0, 13.0], oracles) is None
 
 
 def test_hidden_retry_rejected_and_malformed_error_retained() -> None:

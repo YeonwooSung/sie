@@ -106,7 +106,10 @@ list-append overhead; this is an SDK workload measurement.
 
 Actual timed C4/C16 batch shapes are **unknown**. Their raw four-score vectors
 are compared diagnostically against complete preselection oracle vectors at
-`1e-6`, with matching shapes and ambiguity recorded. A diagnostic cannot combine
+`1e-6`. Each response records one deterministic matching oracle reference, or
+null if none matches. This witness does not identify the actual shape or imply
+a unique match: the retained raw vector and complete oracle corpus allow every
+match and its ambiguity to be recomputed. A diagnostic cannot combine
 different oracle shapes per element or substitute for the separately observed
 shape-qualified replays. Timed C1 has one outstanding four-document request and
 must still match its preselection result at `1e-6`. This measurement is scoped to
@@ -130,7 +133,11 @@ the observed untimed replays supply that evidence instead.
 
 ## Evidence and CPU checks
 
-`summary.json` retains trial outcomes, statistical gates and source hashes.
+`summary.json` schema 2 retains trial outcomes, aggregate metrics, statistical
+gates and source hashes. Each entry links its complete `trial.json` by relative
+path and SHA-256; raw request arrays and oracle corpora stay in those per-trial
+files instead of being copied into the growing summary. Final cross-process
+checks reopen the complete records and verify their hashes and identities.
 The summary also hashes the complete benchmark file manifest. Each trial
 captures the full installed-distribution manifest; its digest must remain
 identical across arms. An optional `--environment-receipt` attaches a separate
@@ -141,6 +148,13 @@ scores, ranks, IDs, usage, latencies, errors, batch membership, logits, tensor
 hashes, library versions and shutdown status. Failure paths retain completed
 phases and partial request samples. Hash evidence files when archiving them;
 the runner records each terminal trial file hash.
+
+The compact representation follows an incomplete run whose stdout archive was
+truncated. Its old evidence stays separate and is not acceptance evidence. This
+change affects only post-measurement diagnostics and storage, not the timed
+path, workload, numerical tolerances, statistical gates, or raw observations.
+Store the evidence directory on durable storage and verify the full archive
+hash after retrieval; stdout is unsuitable for transferring large artifacts.
 
 ```console
 mise run test -- tools/benchmarks/cross_encoder_lora/tests/test_probe.py

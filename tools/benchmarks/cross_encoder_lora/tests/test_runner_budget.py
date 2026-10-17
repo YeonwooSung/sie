@@ -116,7 +116,7 @@ def test_full_timeout_cleanup_finishes_before_budget_and_retains_partial_trial(
                     "arm": "R",
                     "passed": False,
                     "shutdown_complete": False,
-                    "performance": {"1": {"completed_samples": 7}},
+                    "performance": {"1": {"count": 7}},
                 }
             )
         )
@@ -132,6 +132,6 @@ def test_full_timeout_cleanup_finishes_before_budget_and_retains_partial_trial(
     terminal = json.loads((args.output / "summary.json").read_text())
     assert not terminal["passed"]
     trial = terminal["trials"][0]
-    assert trial["performance"]["1"]["completed_samples"] == 7
+    assert trial["performance"]["1"]["count"] == 7
     assert trial["process_returncode"] == -9
     assert trial["runner_error"]["type"] == "TimeoutExpired"

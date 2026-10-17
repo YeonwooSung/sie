@@ -328,15 +328,21 @@ def unobserved(adapter: Any) -> Iterator[None]:
         )
 
 
-def matching_vectors(scores: list[float], oracles: dict[str, Any]) -> list[dict[str, Any]]:
-    matches = []
-    for key, oracle_row in oracles.items():
+def matching_vector(scores: list[float], oracles: dict[str, Any]) -> dict[str, Any] | None:
+    """Return one deterministic diagnostic witness, never actual batch attribution.
+
+    The full oracle corpus and raw score vector are retained separately, so all
+    matches (including ambiguity) can be recomputed without repeating up to 136
+    equivalent descriptions on every response.
+    """
+    for key in sorted(oracles):
+        oracle_row = oracles[key]
         copies = oracle_row["copies"]
         for position in range(copies):
             vector = [oracle_row["scores"][ORDER.index(index) * copies + position] for index in range(REQUEST_ITEMS)]
             if vector_delta(scores, vector) <= RESTORE_ATOL:
-                matches.append({"workload_sha256": key, "copies": copies, "request_position": position})
-    return matches
+                return {"workload_sha256": key, "copies": copies, "request_position": position}
+    return None
 
 
 def performance(url: str, concurrency: int, evidence: Evidence, *, smoke: bool) -> dict[str, Any]:
@@ -727,13 +733,13 @@ async def experiment(args: argparse.Namespace, evidence: Evidence, summary: dict
                     require(row["result"]["usage"] == bases[0]["result"]["usage"], "timed SDK usage differs")
                     if concurrency == 1:
                         require(vector_delta(row["scores"], baseline) <= RESTORE_ATOL, "timed C1 base output differs")
-                    row["diagnostic_matching_oracles"] = matching_vectors(row["scores"], summary["shape_oracles"])
+                    row["diagnostic_matching_oracle"] = matching_vector(row["scores"], summary["shape_oracles"])
                 measured["actual_timed_batch_shape"] = "unobserved"
                 evidence.emit(
                     "timed_output_diagnostics",
                     concurrency=concurrency,
-                    matches=[
-                        {"label": row["label"], "matches": row["diagnostic_matching_oracles"]}
+                    witnesses=[
+                        {"label": row["label"], "match": row["diagnostic_matching_oracle"]}
                         for row in measured["samples"]
                     ],
                 )

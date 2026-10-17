@@ -132,11 +132,61 @@ def stop(process: subprocess.Popen) -> None:
             process.wait(timeout=KILL_GRACE_SECONDS)
 
 
+def trial_summary(trial: dict[str, Any]) -> dict[str, Any]:
+    """Keep the cumulative index independent of the number of raw requests."""
+    fields = (
+        "pair",
+        "arm",
+        "passed",
+        "shutdown_complete",
+        "smoke",
+        "pid",
+        "process_returncode",
+        "source_commit",
+        "terminal_record",
+        "terminal_record_sha256",
+        "error",
+        "runner_error",
+    )
+    result = {field: trial[field] for field in fields if field in trial}
+    if "performance" in trial:
+        metrics = ("concurrency", "count", "elapsed_s", "mean_ms", "p95_ms", "rps", "actual_timed_batch_shape")
+        result["performance"] = {
+            concurrency: {field: phase[field] for field in metrics if field in phase}
+            for concurrency, phase in trial["performance"].items()
+        }
+    return result
+
+
+def load_trial(output: Path, record: dict[str, Any]) -> dict[str, Any]:
+    """Reopen the complete evidence only after checking its recorded identity."""
+    relative = f"trial-{record['pair']}-{record['arm']}/trial.json"
+    require(record["terminal_record"] == relative, "unexpected terminal record path")
+    path = output / relative
+    require(path.resolve().is_relative_to(output.resolve()), "terminal record path escapes output")
+    require(digest(path) == record["terminal_record_sha256"], "terminal record hash differs")
+    trial = json.loads(path.read_text())
+    require((trial["pair"], trial["arm"]) == (record["pair"], record["arm"]), "terminal record identity differs")
+    for field, value in trial_summary(trial).items():
+        if field == "passed" and "runner_error" in record:
+            # A process timeout can invalidate an otherwise successful worker
+            # record. The runner's failed verdict must survive that override.
+            require(record[field] is False, "runner error lost its failed verdict")
+        else:
+            require(record.get(field) == value, "terminal record summary differs")
+    if "runner_error" in record:
+        trial["passed"] = False
+        trial["runner_error"] = record["runner_error"]
+    if "process_returncode" in record:
+        trial["process_returncode"] = record["process_returncode"]
+    return trial
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     args.output.mkdir(parents=True, exist_ok=False)
     manifest = extract(args.inputs.resolve(), args.output / "sources")
     summary: dict[str, Any] = {
-        "schema": 1,
+        "schema": 2,
         "passed": False,
         "source_manifest": manifest,
         "harness_manifest": harness_manifest(),
@@ -218,10 +268,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             trial["terminal_record_sha256"] = (
                 digest(directory / "trial.json") if (directory / "trial.json").exists() else None
             )
+            trial["terminal_record"] = (
+                str((directory / "trial.json").relative_to(args.output))
+                if trial["terminal_record_sha256"] is not None
+                else None
+            )
             if pending_error is not None:
                 trial["passed"] = False
                 trial["runner_error"] = {"type": type(pending_error).__name__, "message": str(pending_error)}
-            summary["trials"].append(trial)
+            summary["trials"].append(trial_summary(trial))
             atomic_json(summary_path, summary)
             if pending_error is not None:
                 raise pending_error
@@ -234,8 +289,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             summary["passed"] = True
             summary["qualification"] = False
         else:
-            summary["correctness_memory"] = cross_checks(summary["trials"])
-            summary["statistics"] = compare(summary["trials"])
+            complete_trials = [load_trial(args.output, row) for row in summary["trials"]]
+            summary["correctness_memory"] = cross_checks(complete_trials)
+            summary["statistics"] = compare(complete_trials)
             summary["passed"] = summary["statistics"]["passed"]
             require(summary["passed"], "fixed non-inferiority gates did not pass")
     except BaseException as error:
