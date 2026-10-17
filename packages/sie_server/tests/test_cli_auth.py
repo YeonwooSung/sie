@@ -6,6 +6,7 @@ import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 from sie_server import cli
@@ -14,6 +15,7 @@ from sie_server.core.server_auth import token_path
 from typer.testing import CliRunner
 
 TOKEN = "s3cret-token-value"  # noqa: S105 - test credential
+EXPOSED_HOST = "0.0.0.0"  # noqa: S104 - no server is started
 
 
 @pytest.fixture(autouse=True)
@@ -249,4 +251,142 @@ def test_auth_modes_are_case_sensitive_as_on_the_gateway(
 
     assert result.exit_code == 1
     assert "lowercase" in result.output
+    assert not started
+
+
+@pytest.mark.parametrize(
+    ("mode", "token", "host", "required", "generated"),
+    [
+        (None, None, EXPOSED_HOST, "none", False),
+        ("none", None, EXPOSED_HOST, "none", False),
+        (None, TOKEN, EXPOSED_HOST, "token", False),
+        ("token", TOKEN, EXPOSED_HOST, "token", False),
+        ("static", TOKEN, EXPOSED_HOST, "token", False),
+        ("auto", TOKEN, "127.0.0.1", "token", False),
+        ("auto", None, "127.0.0.1", "none", False),
+        ("auto", None, EXPOSED_HOST, "token", True),
+        ("token", None, "127.0.0.1", "token", True),
+        ("static", None, "127.0.0.1", "token", True),
+    ],
+)
+def test_required_auth_mode_matches_existing_resolution(
+    started: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mode: str | None,
+    token: str | None,
+    host: str,
+    required: str,
+    generated: bool,
+) -> None:
+    if mode is not None:
+        monkeypatch.setenv("SIE_AUTH_MODE", mode)
+    if token is not None:
+        monkeypatch.setenv("SIE_AUTH_TOKEN", token)
+    monkeypatch.setattr(cli, "_stderr_is_terminal", lambda: False)
+
+    result = serve("--host", host, "--require-auth-mode", required)
+
+    assert result.exit_code == 0, result.output
+    assert resolved_mode(started) == required
+    assert token_path(tmp_path / "data").exists() is generated
+    assert os.environ.get("SIE_AUTH_MODE") == mode
+    assert os.environ.get("SIE_AUTH_TOKEN") == token
+    assert TOKEN not in result.output
+
+
+@pytest.fixture
+def no_token_provisioning(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    directory = Mock(side_effect=AssertionError("unexpected token directory resolution"))
+    token = Mock(side_effect=AssertionError("unexpected token provisioning"))
+    monkeypatch.setattr(cli, "resolve_data_dir", directory)
+    monkeypatch.setattr(cli, "load_or_create_token", token)
+    yield
+    directory.assert_not_called()
+    token.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("mode", "token", "host", "required"),
+    [
+        (None, None, EXPOSED_HOST, "token"),
+        ("none", None, EXPOSED_HOST, "token"),
+        ("token", None, "127.0.0.1", "none"),
+        ("static", None, "127.0.0.1", "none"),
+        (None, TOKEN, "127.0.0.1", "none"),
+        ("auto", None, EXPOSED_HOST, "none"),
+        ("auto", None, "127.0.0.1", "token"),
+    ],
+)
+@pytest.mark.usefixtures("no_token_provisioning")
+def test_required_auth_mode_mismatch_stops_before_provisioning_or_serving(
+    started: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mode: str | None,
+    token: str | None,
+    host: str,
+    required: str,
+) -> None:
+    if mode is not None:
+        monkeypatch.setenv("SIE_AUTH_MODE", mode)
+    if token is not None:
+        monkeypatch.setenv("SIE_AUTH_TOKEN", token)
+
+    result = serve("--host", host, "--require-auth-mode", required)
+
+    assert result.exit_code == 1
+    assert "resolved authentication mode does not match --require-auth-mode" in result.output
+    assert not started
+    assert not (tmp_path / "data").exists()
+    assert os.environ.get("SIE_AUTH_MODE") == mode
+    assert os.environ.get("SIE_AUTH_TOKEN") == token
+    assert TOKEN not in result.output
+
+
+@pytest.mark.parametrize("required", ["", "auto", "static", "TOKEN", "None", " token", "unknown"])
+@pytest.mark.usefixtures("no_token_provisioning")
+def test_required_auth_mode_rejects_invalid_option_before_auth_resolution(
+    started: dict[str, Any], monkeypatch: pytest.MonkeyPatch, required: str
+) -> None:
+    prepare = Mock(side_effect=AssertionError("unexpected auth resolution"))
+    monkeypatch.setattr(cli, "_prepare_auth", prepare)
+
+    result = serve("--require-auth-mode", required)
+
+    assert result.exit_code == 2
+    assert "Invalid value" in result.output
+    prepare.assert_not_called()
+    assert not started
+
+
+@pytest.mark.parametrize("name", ["SIE_AUTH_TOKEN", "SIE_AUTH_TOKENS"])
+@pytest.mark.parametrize("value", ["", " ", ","])
+@pytest.mark.parametrize("required", ["token", "none"])
+@pytest.mark.usefixtures("no_token_provisioning")
+def test_required_auth_mode_does_not_bypass_blank_token_refusal(
+    started: dict[str, Any], monkeypatch: pytest.MonkeyPatch, name: str, value: str, required: str
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    result = serve("--require-auth-mode", required)
+
+    assert result.exit_code == 1
+    assert "holds no token" in result.output
+    assert not started
+
+
+@pytest.mark.parametrize("required", ["token", "none"])
+@pytest.mark.usefixtures("no_token_provisioning")
+def test_required_auth_mode_does_not_override_auth_off_with_token_refusal(
+    started: dict[str, Any], monkeypatch: pytest.MonkeyPatch, required: str
+) -> None:
+    monkeypatch.setenv("SIE_AUTH_MODE", "none")
+    monkeypatch.setenv("SIE_AUTH_TOKEN", TOKEN)
+
+    result = serve("--require-auth-mode", required)
+
+    assert result.exit_code == 1
+    assert "SIE_AUTH_MODE=none turns authentication off" in result.output
+    assert TOKEN not in result.output
     assert not started

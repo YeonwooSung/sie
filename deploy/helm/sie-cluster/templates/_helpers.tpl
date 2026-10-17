@@ -1060,10 +1060,6 @@ two-step upgrade and needs workers.auth.enabled.
 {{- if and $allowUnauthenticated (not (include "sie-cluster.workers.authEnabled" .)) -}}
 {{- fail "workers.auth.allowUnauthenticated=true needs workers.auth.enabled=true: it is the first step of the two-step upgrade, in which the gateway presents the worker token and the workers do not require it yet. Set workers.auth.enabled=true with it, or remove it." -}}
 {{- end -}}
-{{- $tag := toString (dig "common" "image" "tag" "" (.Values.workers | default dict)) -}}
-{{- if and (include "sie-cluster.workers.authEnabled" .) .Chart.AppVersion (regexMatch "^v?[0-9]+\\.[0-9]+\\.[0-9]+$" $tag) (semverCompare (printf "<%s" .Chart.AppVersion) $tag) -}}
-{{- fail (printf "workers.auth.enabled needs sie-server images from this chart's release (%s) or later, which enforce the worker token; workers.common.image.tag=%s is older, so its workers would serve without a token. Remove the tag override or set a tag of this release or later." .Chart.AppVersion $tag) -}}
-{{- end -}}
 {{- end }}
 
 {{/*

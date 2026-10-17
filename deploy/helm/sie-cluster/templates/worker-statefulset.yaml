@@ -332,6 +332,9 @@ spec:
           imagePullPolicy: {{ $root.Values.workers.common.image.pullPolicy }}
           args:
             - serve
+            {{- if include "sie-cluster.workers.authEnabled" $root }}
+            - --require-auth-mode={{ ternary "token" "none" (not (empty $workerAuthEnforced)) }}
+            {{- end }}
             - --host=0.0.0.0
             - --port={{ $workerPort }}
             - --bundle={{ $bundle }}

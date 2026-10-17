@@ -27,6 +27,7 @@ import hashlib
 import logging
 import shlex
 from collections.abc import Iterable
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
 
@@ -151,6 +152,11 @@ _SECURE_DEFAULTS_RELEASE = "0.13.0"
 SERVER_HOST_ENV = "SIE_SERVER_HOST"
 
 
+class RequiredAuthMode(StrEnum):
+    NONE = "none"
+    TOKEN = "token"  # noqa: S105 - an authentication mode, not a credential
+
+
 def _stderr_is_terminal() -> bool:
     return sys.stderr.isatty()
 
@@ -179,7 +185,9 @@ def _echo_generated_token(stored: StoredToken, port: int) -> None:
     typer.echo("\n".join([rule, *lines, rule]), err=True)
 
 
-def _prepare_auth(*, host: str, port: int, host_is_default: bool) -> AuthMode:
+def _prepare_auth(
+    *, host: str, port: int, host_is_default: bool, require_auth_mode: RequiredAuthMode | None = None
+) -> AuthMode:
     """Resolve the server's auth mode, provision its token, and warn about exposure."""
     exposed = not is_loopback_host(host)
     requested = requested_mode(os.environ)
@@ -191,6 +199,10 @@ def _prepare_auth(*, host: str, port: int, host_is_default: bool) -> AuthMode:
     except AuthConfigError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1) from None
+
+    if require_auth_mode is not None and mode != require_auth_mode.value:
+        typer.echo("Error: resolved authentication mode does not match --require-auth-mode", err=True)
+        raise typer.Exit(1)
 
     if mode == "token" and tokens:
         typer.echo(f"Auth: every route except /healthz, /livez and /readyz requires one of {len(tokens)} token(s)")
@@ -503,6 +515,13 @@ def serve(
             ),
         ),
     ] = None,
+    require_auth_mode: Annotated[
+        RequiredAuthMode | None,
+        typer.Option(
+            "--require-auth-mode",
+            help="Require the resolved authentication mode without changing its configuration.",
+        ),
+    ] = None,
 ) -> None:
     """Start the SIE inference server."""
     from sie_sdk.storage import is_cloud_path
@@ -744,6 +763,7 @@ def serve(
         host=host,
         port=port,
         host_is_default=_parameter_source("host") in (None, ParameterSource.DEFAULT),
+        require_auth_mode=require_auth_mode,
     )
 
     typer.echo(f"Starting SIE server on {host}:{port}")
