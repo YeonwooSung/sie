@@ -68,6 +68,7 @@ MAX_LOADING_RETRIES = 10
 MAX_LOADING_DELAY = 5
 RESIDENT_CAPACITY = 2
 REQUEST_ITEMS = len(DOCUMENTS)
+RESPONSE_CAPTURE_MODE = "success-status-header-snapshots"
 
 
 def error_record(error: BaseException) -> dict[str, Any]:
@@ -204,13 +205,15 @@ def adapter_storage(adapter: Any) -> dict[str, int]:
 
 class Client:
     def __init__(self, url: str) -> None:
-        self.responses: list[httpx.Response] = []
+        self.responses: list[dict[str, Any] | httpx.Response] = []
         http = httpx.Client(base_url=url, timeout=30, event_hooks={"response": [self.observe]})
+        self._http = http
         self.sdk = SIEClient(url, timeout_s=30, http_client=http)
 
     def observe(self, response: httpx.Response) -> None:
-        # The only extra HTTP-hook work in timed phases. Decode after clocks stop.
-        self.responses.append(response)
+        # Keep successful wire evidence without retaining its Response/Request/
+        # stream graph for the whole phase. Failure bodies are decoded later.
+        self.responses.append(describe_response(response) if response.status_code == HTTPStatus.OK else response)
 
     def score(self, selection: str | None, label: str, *, cold: bool = False, timed: bool = False) -> dict[str, Any]:
         started = time.perf_counter_ns()
@@ -256,10 +259,25 @@ class Client:
         return row
 
     def close(self) -> None:
-        self.sdk.close()
+        try:
+            self.sdk.close()
+        finally:
+            # Callers serialize their evidence before closing. Preserve unrelated
+            # hooks, and break only the observer/history this benchmark owns.
+            hooks = self._http.event_hooks["response"]
+            hooks[:] = [
+                hook
+                for hook in hooks
+                if not (
+                    getattr(hook, "__self__", None) is self and getattr(hook, "__func__", None) is type(self).observe
+                )
+            ]
+            self.responses.clear()
 
 
-def describe_response(response: httpx.Response) -> dict[str, Any]:
+def describe_response(response: httpx.Response | dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(response, httpx.Response):
+        return response
     row: dict[str, Any] = {
         "status": response.status_code,
         "timing_headers": {
@@ -275,7 +293,17 @@ def describe_response(response: httpx.Response) -> dict[str, Any]:
         },
     }
     if response.status_code >= HTTPStatus.BAD_REQUEST:
-        response.read()
+        row["content_type"] = response.headers.get("content-type")
+        row["retry_after"] = response.headers.get("retry-after")
+        try:
+            response.read()
+        except (httpx.StreamError, httpx.HTTPError) as error:
+            # A partially read error stream can already have failed in the SDK.
+            # Preserve that original failure and its wire metadata; diagnostic
+            # re-reading must not replace it or discard earlier attempts.
+            row.update(body_unavailable=True, body_read_error=type(error).__name__, code=None)
+            return row
+        row["body_hex"] = response.content.hex()
         try:
             body = (
                 unpackb(response.content, numeric_arrays=False)
@@ -286,9 +314,7 @@ def describe_response(response: httpx.Response) -> dict[str, Any]:
             row["body_decode_error"] = type(error).__name__
             body = None
         error = body.get("error", body.get("detail", body)) if isinstance(body, dict) else None
-        row.update(
-            code=error.get("code") if isinstance(error, dict) else None, retry_after=response.headers.get("retry-after")
-        )
+        row["code"] = error.get("code") if isinstance(error, dict) else None
     return row
 
 
