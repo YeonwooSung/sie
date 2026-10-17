@@ -38,6 +38,7 @@ from sie_server.app.app_factory import AppFactory
 from sie_server.app.app_state_config import AppStateConfig
 from sie_server.types.inputs import Item
 
+from tools.benchmarks.cross_encoder_lora.adapter import require_forward_selection
 from tools.benchmarks.cross_encoder_lora.evidence import Evidence, atomic_json, digest, fingerprint, vector_delta
 from tools.benchmarks.cross_encoder_lora.protocol import (
     CONCURRENCIES,
@@ -302,11 +303,10 @@ def validate_response(row: dict[str, Any], *, allow_loading: bool = False) -> No
 
 @contextmanager
 def unobserved(adapter: Any) -> Iterator[None]:
-    """Time production methods directly; no model hook, copying or observer lock."""
+    """Time production methods with the original forward attribute lookup restored."""
     score_pairs, select = adapter.score_pairs, adapter.set_active_lora
     before = (len(adapter.batch_observations), len(adapter.forward_observations), len(adapter.selection_observations))
-    adapter._observer_handle.remove()
-    adapter._observer_handle = None
+    adapter.remove_forward_observer()
     adapter.score_pairs = CrossEncoderAdapter.score_pairs.__get__(adapter)
     adapter.set_active_lora = CrossEncoderAdapter.set_active_lora.__get__(adapter)
     try:
@@ -314,7 +314,9 @@ def unobserved(adapter: Any) -> Iterator[None]:
         require(
             adapter.set_active_lora.__func__ is CrossEncoderAdapter.set_active_lora, "timed selection is instrumented"
         )
+        adapter.assert_original_forward()
         yield
+        adapter.assert_original_forward()
         after = (
             len(adapter.batch_observations),
             len(adapter.forward_observations),
@@ -323,9 +325,7 @@ def unobserved(adapter: Any) -> Iterator[None]:
         require(before == after, "observer activity occurred during production timing")
     finally:
         adapter.score_pairs, adapter.set_active_lora = score_pairs, select
-        adapter._observer_handle = adapter._model.model.register_forward_hook(
-            adapter._observe_forward, with_kwargs=True
-        )
+        adapter.install_forward_observer()
 
 
 def matching_vector(scores: list[float], oracles: dict[str, Any]) -> dict[str, Any] | None:
@@ -677,12 +677,7 @@ async def experiment(args: argparse.Namespace, evidence: Evidence, summary: dict
                     "concurrent selected scores differ from shape-matched oracle",
                 )
                 expected_peft = PEFTLoRAMixin._peft_adapter_name(source) if source else None
-                for forward in batch["forwards"]:
-                    enabled = forward["enabled_adapters"]
-                    require(bool(enabled) == bool(alias), "actual adapter enable state differs at model forward")
-                    require(
-                        all(item["adapters"] == [expected_peft] for item in enabled), "wrong PEFT adapter at forward"
-                    )
+                require_forward_selection(batch, expected_peft)
                 if len({item.split(":")[0] for item in batch["item_ids"]}) > 1:
                     combined.add(alias)
             require(combined == {None, "a", "b"}, "did not observe cross-request batches for base, A and B")
@@ -710,10 +705,7 @@ async def experiment(args: argparse.Namespace, evidence: Evidence, summary: dict
                     "untimed SDK replay differs from preselection shape oracle",
                 )
                 require(batch["selection"] is None, "untimed base replay selected a LoRA")
-                require(
-                    all(not forward["enabled_adapters"] for forward in batch["forwards"]),
-                    "untimed base replay left a PEFT adapter enabled",
-                )
+                require_forward_selection(batch, None)
             if concurrency > 1:
                 require(
                     any(len({item.split(":")[0] for item in batch["item_ids"]}) > 1 for batch in batches),

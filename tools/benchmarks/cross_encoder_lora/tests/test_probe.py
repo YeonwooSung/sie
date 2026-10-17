@@ -17,6 +17,7 @@ import torch
 from transformers import BertConfig, BertForSequenceClassification, BertTokenizerFast
 
 from tools.benchmarks.cross_encoder_lora import prepare as source_preparer
+from tools.benchmarks.cross_encoder_lora.adapter import require_forward_coverage
 from tools.benchmarks.cross_encoder_lora.evidence import Evidence, atomic_json, vector_delta
 from tools.benchmarks.cross_encoder_lora.fixtures import prepare
 from tools.benchmarks.cross_encoder_lora.protocol import BASE_REVISION, ORDERS, compare, paired_gate, percentile
@@ -179,6 +180,10 @@ def test_real_loader_sdk_lifecycle(tmp_path: Path, arm: str) -> None:
     assert Path(summary["environment"]["adapter_source"]).is_relative_to(source)
     events = [json.loads(line) for line in (output / "events.jsonl").read_text().splitlines()]
     assert {"shape_oracles", "performance", "finished"} <= {event["event"] for event in events}
+    batches = next(event["batches"] for event in events if event["event"] == "all_batches")
+    assert batches
+    for batch in batches:
+        require_forward_coverage(batch)
     if arm == "R":
         assert {"effects", "concurrent_batches", "resident_set", "restored_state"} <= {
             event["event"] for event in events

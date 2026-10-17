@@ -95,10 +95,17 @@ Production fault-injection tests separately cover malformed artifacts and
 partial-attachment rollback; this probe does not pretend to reproduce them on
 every GPU trial.
 
-The hook records deep selection/logit details during correctness checks and
-two observed SDK replay rounds at C1/C4/C16. During timed phases the forward
-hook is removed and production `score_pairs` and `set_active_lora` are bound
-directly. The harness asserts that no observer activity occurred. Response
+The untimed observer wraps the model's bound `forward` method, because Sentence
+Transformers calls that method directly and bypasses root module forward hooks.
+Every observed outer score batch must have nonempty forward records, finite
+logits and exact input-row coverage; selected/base tuner checks cannot pass on
+an empty list. It records selection/logit details during correctness checks and
+two observed SDK replay rounds at C1/C4/C16. During timed phases the original
+forward attribute lookup is restored: an original instance override is restored
+exactly, or the temporary instance attribute is deleted to restore descriptor
+lookup. Production `score_pairs` and `set_active_lora` are bound directly.
+The harness checks the original forward target and that no observer activity
+occurred, including restoration after an exceptional exit. Response
 validation and header decoding happen after the phase clock stops; exactly one
 successful HTTP response is required per warmup/measured SDK call, excluding
 hidden retries. The timed client retains timer, result-list and raw-response
