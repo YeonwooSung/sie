@@ -911,10 +911,12 @@ workers:
   # -- Worker API authentication. When enabled, the gateway presents the
   # worker token (SIE_WORKER_AUTH_TOKEN) and each worker container that serves
   # the worker API requires it (SIE_AUTH_MODE=token, SIE_AUTH_TOKEN) on every
-  # route except the probes /healthz, /livez, and /readyz. It needs sie-server
-  # and sie-gateway images from this chart's release (appVersion) or later:
-  # images of 0.10.1 and earlier ignore these variables and serve without a
-  # token. A post-install and post-upgrade hook Job fails the release when a
+  # route except the probes /healthz, /livez, and /readyz. The sie-server
+  # image must support serve --require-auth-mode=token|none; the gateway must
+  # present SIE_WORKER_AUTH_TOKEN. Image version tags do not prove support.
+  # Published v0.10.1 images predate these capabilities. Unsupported worker
+  # CLIs reject the required option before serving, including after scale-up
+  # from zero. A post-install and post-upgrade hook Job fails the release when a
   # ready worker of the current revision answers GET /v1/models without a
   # token or does not answer; the worker NetworkPolicies admit that Job's pod.
   # With worker auth off, the chart sets SIE_AUTH_MODE=none on those
@@ -925,7 +927,8 @@ workers:
     enabled: false
     # -- With enabled, the gateway presents the token but the workers do not
     # require it yet (a boolean). A temporary aid for the two-step upgrade:
-    # once every gateway pod has restarted, upgrade again with
+    # this step rolls the gateway and Python workers. Once both rollouts
+    # complete successfully, upgrade again with
     # `--set workers.auth.allowUnauthenticated=false`; `--reuse-values` and
     # `--reset-then-reuse-values` keep it on. It fails the render without
     # enabled.

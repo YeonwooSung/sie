@@ -146,7 +146,7 @@ spec:
                           unreached=$((unreached + 1)) ;;
                         *)
                           echo "FAILED: $lane $address answered GET /v1/models without a token (HTTP $code)."
-                          echo "Its sie-server image does not enforce workers.auth. Use worker images from the same release as the chart."
+                          echo "Its sie-server image does not enforce workers.auth. Use worker images that support serve --require-auth-mode=token."
                           exit 1 ;;
                       esac
                     done
