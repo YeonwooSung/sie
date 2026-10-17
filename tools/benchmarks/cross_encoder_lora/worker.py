@@ -168,12 +168,34 @@ def base_unchanged(before: dict[str, Any], after: dict[str, Any], *, restored: b
 
 
 def adapter_storage(adapter: Any) -> dict[str, int]:
+    """Inspect actual resident tensors outside timing, including detached layers."""
+    parameters = {id(tensor): tensor for name, tensor in adapter._model.model.named_parameters() if ".lora_" in name}
+    manager = getattr(adapter, "_lora", None)
+    resident_count = 0
+    if manager is not None:
+        require(set(manager._parameters) == set(manager._loaded), "resident parameter sources differ from admission")
+        declared = {}
+        for source, values in manager._parameters.items():
+            require(bool(values), "resident adapter has no parameter evidence")
+            require(
+                sum(value.numel() * value.element_size() for value in values) == manager._loaded[source],
+                "resident parameter bytes differ from admission",
+            )
+            declared.update({id(value): value for value in values})
+        for layer in getattr(manager, "_resident_layers", {}).values():
+            parameters.update(
+                {id(value): value for name, value in layer.named_parameters() if name.startswith("lora_")}
+            )
+        require(set(parameters) == set(declared), "actual resident tensors differ from declared parameter ownership")
+        resident_count = len(manager._loaded)
+    else:
+        require(not parameters, "a model without a manager contains LoRA tensors")
     storages = {}
-    for name, tensor in adapter._model.model.named_parameters():
-        if ".lora_" in name:
-            storage = tensor.untyped_storage()
-            storages[(str(tensor.device), storage.data_ptr())] = storage.nbytes()
+    for tensor in parameters.values():
+        storage = tensor.untyped_storage()
+        storages[(str(tensor.device), storage.data_ptr())] = storage.nbytes()
     return {
+        "resident_adapters": resident_count,
         "storage_count": len(storages),
         "tensor_storage_bytes": sum(storages.values()),
         "rounded_storage_bytes": sum(math.ceil(size / 512) * 512 for size in storages.values()),
@@ -687,6 +709,10 @@ async def experiment(args: argparse.Namespace, evidence: Evidence, summary: dict
             await call(None, "before-performance-base")
             require(set(registry.loaded_lora_names(MODEL)) == {"a", "b"}, "resident set before R measurement differs")
             summary["adapter_storage"] = adapter_storage(adapter)
+            require(
+                summary["adapter_storage"]["resident_adapters"] == RESIDENT_CAPACITY,
+                "storage evidence does not cover every resident adapter",
+            )
             base_unchanged(original, await asyncio.to_thread(tensor_state, adapter))
 
         summary["untimed_replays"] = {}
