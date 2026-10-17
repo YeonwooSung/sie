@@ -51,6 +51,7 @@ from tools.benchmarks.cross_encoder_lora.protocol import (
     MAX_TRIAL_SECONDS,
     MODEL,
     ORACLE_ATOL,
+    PERFORMANCE_FUTURE_TIMEOUT_S,
     QUERY,
     RESTORE_ATOL,
     SEQUENTIAL,
@@ -421,7 +422,7 @@ def performance(url: str, concurrency: int, evidence: Evidence, *, smoke: bool) 
             clock["deadline"] = clock["start"] + (0.15 if smoke else STEADY_SECONDS)
             barrier.wait(timeout=30)
             for future in futures:
-                future.result(timeout=90)
+                future.result(timeout=PERFORMANCE_FUTURE_TIMEOUT_S)
         elapsed = time.perf_counter() - clock["start"]
         for row in [*warmups, *samples]:
             validate_response(row)
@@ -906,10 +907,13 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--arm", choices=("B", "N", "R"), required=True)
     parser.add_argument("--pair", type=int, default=0)
-    parser.add_argument("--deadline-s", type=float, default=180)
+    parser.add_argument("--deadline-s", type=float, default=MAX_TRIAL_SECONDS)
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
-    require(0 < args.deadline_s <= MAX_TRIAL_SECONDS, "worker deadline must be in (0, 300]")
+    require(
+        0 < args.deadline_s <= MAX_TRIAL_SECONDS,
+        f"worker deadline must be in (0, {MAX_TRIAL_SECONDS}]",
+    )
     asyncio.run(run(args))
 
 
