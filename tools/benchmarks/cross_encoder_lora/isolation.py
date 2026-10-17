@@ -28,14 +28,19 @@ from tools.benchmarks.cross_encoder_lora.protocol import PERFORMANCE_FUTURE_TIME
 class IsolatedLoadgen:
     """Leave uvicorn running while awaiting a bounded, same-group SDK child."""
 
-    def __init__(self, url: str, source: Path, evidence: Evidence, *, smoke: bool) -> None:
+    def __init__(
+        self, url: str, source: Path, evidence: Evidence, *, smoke: bool, idle_deadline: float | None = None
+    ) -> None:
         self.url, self.source, self.evidence, self.smoke = url, source.resolve(), evidence, smoke
+        self.idle_deadline = idle_deadline
         self.token = uuid.uuid4().hex
         self.process: asyncio.subprocess.Process | None = None
         self.log: Any = None
         self.records: list[dict[str, Any]] = []
         self.observations: dict[int, dict[str, Any]] = {}
         self.receipt: dict[str, Any] = {"passed": False, "reaped": False, "phases": self.records}
+        self.exit_watcher: asyncio.Task | None = None
+        self.expected_exit = False
 
     async def _send(self, command: str, concurrency: int | None = None) -> None:
         assert self.process is not None
@@ -75,6 +80,11 @@ class IsolatedLoadgen:
         ]
         if self.smoke:
             command.append("--smoke")
+        if self.idle_deadline is not None:
+            require(
+                math.isfinite(self.idle_deadline) and self.idle_deadline > time.monotonic(), "invalid idle deadline"
+            )
+            command.extend(["--idle-deadline", str(self.idle_deadline)])
         self.log = (self.evidence.directory / "loadgen.log").open("wb")
         try:
             self.process = await asyncio.create_subprocess_exec(
@@ -96,6 +106,7 @@ class IsolatedLoadgen:
                 identity["source"] == str(self.source) and identity["forbidden_imports_present"] is False,
                 "loadgen source/import preflight failed",
             )
+            require(hello.get("idle_deadline") == self.idle_deadline, "loadgen idle deadline differs")
             sdk_path = Path(identity["sdk_path"])
             require(
                 sdk_path.is_relative_to(self.source / "packages/sie_sdk/src"), "loadgen SDK source escaped its archive"
@@ -108,6 +119,10 @@ class IsolatedLoadgen:
             )
             self.receipt["identity"] = identity
             self.evidence.emit("loadgen_started", **identity)
+            if self.idle_deadline is not None:
+                owner = asyncio.current_task()
+                assert owner is not None
+                self.exit_watcher = asyncio.create_task(self._watch_group_exit(owner))
             return self
         except BaseException as error:
             try:
@@ -115,6 +130,12 @@ class IsolatedLoadgen:
             except BaseException as cleanup_error:  # noqa: BLE001 -- retain primary startup failure
                 error.add_note(f"Loadgen startup cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}")
             raise
+
+    async def _watch_group_exit(self, owner: asyncio.Task) -> None:
+        assert self.process is not None
+        await self.process.wait()
+        if not self.expected_exit:
+            owner.cancel("group SDK child exited before finalization")
 
     async def phase(self, concurrency: int) -> dict[str, Any]:
         require(
@@ -174,6 +195,7 @@ class IsolatedLoadgen:
                 )
 
     async def _cleanup(self, successful: bool) -> None:
+        self.expected_exit = True
         try:
             if self.process is not None:
                 try:
@@ -209,6 +231,9 @@ class IsolatedLoadgen:
             else:
                 self.receipt["reaped"] = True
         finally:
+            if self.exit_watcher is not None:
+                self.exit_watcher.cancel()
+                await asyncio.gather(self.exit_watcher, return_exceptions=True)
             if self.log is not None:
                 self.log.close()
             atomic_json(self.evidence.directory / "loadgen-process.json", self.receipt)
@@ -254,6 +279,7 @@ class IsolatedLoadgen:
         require(terminal.get("passed") is True and "error" not in terminal, "loadgen terminal did not pass")
         require(terminal.get("identity") == self.receipt["identity"], "loadgen terminal identity differs")
         require(terminal.get("smoke") is self.smoke, "loadgen terminal mode differs")
+        require(terminal.get("idle_deadline") == self.idle_deadline, "loadgen terminal idle deadline differs")
         require(terminal.get("phases") == self.records, "loadgen terminal phase records differ")
         require(tuple(record["concurrency"] for record in self.records) == PHASES, "loadgen terminal schedule differs")
         require(

@@ -42,6 +42,7 @@ from tools.benchmarks.cross_encoder_lora.client import (
     describe_response,
 )
 from tools.benchmarks.cross_encoder_lora.evidence import Evidence, atomic_json, digest, fingerprint, vector_delta
+from tools.benchmarks.cross_encoder_lora.group_control import Member, validate_source
 from tools.benchmarks.cross_encoder_lora.isolation import IsolatedLoadgen
 from tools.benchmarks.cross_encoder_lora.protocol import (
     CONCURRENCIES,
@@ -354,7 +355,8 @@ def preflight(args: argparse.Namespace, evidence: Evidence) -> dict[str, Any]:
         "threads": torch.get_num_threads(),
         "device": str(torch.cuda.get_device_name(0)) if torch.cuda.is_available() else "cpu",
         "torch_cuda": torch.version.cuda,
-        "qualification": not args.smoke,
+        "qualification": not args.smoke
+        and (getattr(args, "group", None) is None or args.group.binding["mode"] == "qualification"),
         "installed_distributions": sorted(
             (dist.metadata["Name"], dist.version) for dist in importlib.metadata.distributions()
         ),
@@ -369,6 +371,7 @@ def preflight(args: argparse.Namespace, evidence: Evidence) -> dict[str, Any]:
 
 
 async def experiment(args: argparse.Namespace, evidence: Evidence, summary: dict[str, Any]) -> None:
+    group: Member | None = getattr(args, "group", None)
     fixtures = args.fixtures.resolve()
     manifest = json.loads((fixtures / "manifest.json").read_text())
     snapshot = args.snapshot.resolve() if args.snapshot else Path(manifest["snapshot"])
@@ -585,12 +588,34 @@ async def experiment(args: argparse.Namespace, evidence: Evidence, summary: dict
             "policy": "Existing server histories retained; memory() just completed its existing gc.collect/CUDA synchronization outside timing. No new collection or history release is introduced.",
         }
         with unobserved(adapter):
-            async with IsolatedLoadgen(url, args.source, evidence, smoke=args.smoke) as loadgen:
+            async with IsolatedLoadgen(
+                url,
+                args.source,
+                evidence,
+                smoke=args.smoke,
+                idle_deadline=group.binding["work_deadline"] if group is not None else None,
+            ) as loadgen:
+                if group is not None:
+                    group.acknowledge(
+                        actual_arm=args.arm,
+                        manager_present=summary["manager_present"],
+                        config_sha256=digest(evidence.directory / "models/model.yaml"),
+                        sdk_identity=loadgen.receipt["identity"],
+                        quiet=group_quiet(worker),
+                    )
                 for concurrency in (1, *CONCURRENCIES):
+                    if group is not None:
+                        await group.grant(f"C{concurrency}")
                     phase = f"performance-C{concurrency}"
                     evidence.emit("gpu_before_phase", phase=phase, telemetry=telemetry())
-                    await loadgen.phase(concurrency)
+                    record = await loadgen.phase(concurrency)
                     evidence.emit("gpu_after_phase", phase=phase, telemetry=telemetry())
+                    if group is not None:
+                        group.acknowledge(record=record, quiet=group_quiet(worker))
+                if group is not None:
+                    # No SDK shutdown, raw payload loading, churn, unload or
+                    # finalization until all nine group phase ACKs exist.
+                    await group.grant("finish")
             # Reaping and all raw-row materialization/validation happen after
             # every measured phase, so their allocations never enter the
             # serving heap during a subsequent timed phase.
@@ -687,16 +712,33 @@ async def experiment(args: argparse.Namespace, evidence: Evidence, summary: dict
                     sock.close()
 
 
+def group_quiet(worker: Any) -> dict[str, Any]:
+    """A lease ends only after drained requests and an outside-timer CUDA fence."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    state = {
+        "pending": worker.pending_count,
+        "in_flight": len(worker._in_flight),
+        "cuda_synchronized": torch.cuda.is_available(),
+    }
+    require(state["pending"] == 0 and state["in_flight"] == 0, "worker was not quiet at lease boundary")
+    return state
+
+
 async def run(args: argparse.Namespace) -> dict[str, Any]:
+    group: Member | None = getattr(args, "group", None)
     evidence = Evidence(args.output.resolve())
     summary: dict[str, Any] = {
-        "arm": args.arm,
+        "arm": group.binding["logical_role"] if group is not None else args.arm,
         "pair": args.pair,
         "passed": False,
         "shutdown_complete": False,
         "smoke": args.smoke,
         "pid": os.getpid(),
     }
+    if group is not None:
+        summary["group"] = group.binding
+        summary["actual_arm"] = args.arm
     os.environ.update(
         {
             "SIE_TELEMETRY_DISABLED": "1",
@@ -709,8 +751,12 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     torch.set_num_threads(THREADS)
     torch.set_num_interop_threads(1)
     try:
+        if group is not None:
+            await group.grant("prepare")
+            validate_source(group.binding, args.source, args.arm, args.pair)
         summary["environment"] = preflight(args, evidence)
-        async with asyncio.timeout(args.deadline_s):
+        timeout = max(0, group.binding["work_deadline"] - time.monotonic()) if group is not None else args.deadline_s
+        async with asyncio.timeout(timeout):
             await experiment(args, evidence, summary)
     except BaseException as error:
         summary["passed"] = False
@@ -720,10 +766,12 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     finally:
         atomic_json(evidence.directory / "trial.json", summary)
         evidence.emit("finished", passed=summary["passed"], shutdown_complete=summary["shutdown_complete"])
+        if group is not None and summary["passed"] and summary["shutdown_complete"]:
+            group.acknowledge(terminal_sha256=digest(evidence.directory / "trial.json"))
     return summary
 
 
-def main() -> None:
+def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--fixtures", type=Path, required=True)
@@ -733,12 +781,16 @@ def main() -> None:
     parser.add_argument("--pair", type=int, default=0)
     parser.add_argument("--deadline-s", type=float, default=MAX_TRIAL_SECONDS)
     parser.add_argument("--smoke", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     require(
         0 < args.deadline_s <= MAX_TRIAL_SECONDS,
         f"worker deadline must be in (0, {MAX_TRIAL_SECONDS}]",
     )
-    asyncio.run(run(args))
+    return args
+
+
+def main() -> None:
+    asyncio.run(run(arguments()))
 
 
 if __name__ == "__main__":

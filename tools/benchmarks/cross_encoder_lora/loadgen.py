@@ -6,6 +6,7 @@ import argparse
 import gc
 import inspect
 import json
+import math
 import os
 import queue
 import select
@@ -95,8 +96,16 @@ class Control:
         os.close(self.stop_read)
         os.close(self.stop_write)
 
-    def receive(self, command: str, concurrency: int | None = None) -> dict[str, Any]:
-        value = self.messages.get(timeout=CONTROL_TIMEOUT_S)
+    def receive(
+        self, command: str, concurrency: int | None = None, *, idle_deadline: float | None = None
+    ) -> dict[str, Any]:
+        wait_s = CONTROL_TIMEOUT_S
+        if idle_deadline is not None:
+            require(command in {"phase", "finish"}, "group idle deadline used for active handshake")
+            require(math.isfinite(idle_deadline), "invalid group idle deadline")
+            wait_s = idle_deadline - time.monotonic()
+            require(wait_s > 0, "group idle deadline expired")
+        value = self.messages.get(timeout=wait_s)
         require("reader_error" not in value, "control reader failed")
         require(value.get("token") == self.token and value.get("command") == command, "unexpected parent command")
         require(value.get("concurrency") == concurrency, "parent phase identity differs")
@@ -134,10 +143,15 @@ def run(args: argparse.Namespace) -> None:
     control = Control(args.token)
     terminal: dict[str, Any] = {"passed": False, "phases": [], "identity": identity(args.source), "smoke": args.smoke}
     retained_results = []
-    control.send("hello", identity=terminal["identity"])
+    idle_deadline = getattr(args, "idle_deadline", None)
+    terminal["idle_deadline"] = idle_deadline
+    control.send("hello", identity=terminal["identity"], idle_deadline=idle_deadline)
     try:
         for concurrency in PHASES:
-            control.receive("phase", concurrency)
+            if idle_deadline is None:
+                control.receive("phase", concurrency)
+            else:
+                control.receive("phase", concurrency, idle_deadline=idle_deadline)
             require_sdk_only()
             callbacks: tuple[Any, ...] = ()
             observations: dict[str, Any] = {}
@@ -198,7 +212,10 @@ def run(args: argparse.Namespace) -> None:
             # rows until every timed phase is complete.
             retained_results.append(result)
             control.send("phase_complete", concurrency, record=record)
-        control.receive("finish")
+        if idle_deadline is None:
+            control.receive("finish")
+        else:
+            control.receive("finish", idle_deadline=idle_deadline)
         terminal["passed"] = True
     except BaseException as error:
         terminal["error"] = {"type": type(error).__name__, "message": str(error)}
@@ -218,6 +235,7 @@ def main() -> None:
     parser.add_argument("--url", required=True)
     parser.add_argument("--token", required=True)
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--idle-deadline", type=float)
     run(parser.parse_args())
 
 

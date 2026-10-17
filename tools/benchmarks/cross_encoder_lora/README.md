@@ -272,6 +272,69 @@ server boundary snapshots. Keep those files in the full durable archive.
 
 ## Evidence and CPU checks
 
+### Whole-phase triplet feasibility mode
+
+The separate `interleaved` entry point holds three fresh server/SDK pairs resident
+for one triplet. It prepares every pair before timing, then runs C1 for all three
+roles, C4 for all three, and C16 for all three, using the six existing balanced
+role orders. Each arm keeps its contiguous 2,000-request C1 phase, 60-second
+C4/C16 admission windows, 30 warmups, drain, and original numerical, memory and
+12 statistical limits. The sequential `runner` entry point remains available.
+
+The `baseline-pilot` mode maps **every** logical B/N/R role to the same archived
+baseline source and actual B configuration, with no adapter declarations. It
+retains the peer numerical and memory checks. Its schema-3 summary reports
+`completed_valid` separately from `qualification_passed`, which is always false
+for this descriptive mode. A successful diagnostic exit does not qualify a
+candidate or authorize a subsequent run. The separately selected `qualification`
+mode requires the original B/N/R configurations and source mapping; it cannot
+silently substitute baseline-only R. Pilot and candidate observations must not
+be pooled or appended until a gate passes.
+
+From a clean frozen checkout, after the ordinary immutable source and fixture
+preparation above, the prospective baseline-only invocation is:
+
+```console
+mise exec -- uv run --no-sync python -m tools.benchmarks.cross_encoder_lora.interleaved \
+  --inputs /tmp/ce-inputs --fixtures /tmp/ce-fixtures --output /tmp/ce-baseline-pilot \
+  --mode baseline-pilot --deadline-s 3900 --group-work-s 600
+```
+
+These are bounds, not a promise that six groups fit. Strict group admission
+reserves 600 seconds of work plus one shared 90-second cleanup interval. Each
+worker also has a cumulative 270-second grant-to-ACK active budget, with a
+120-second cap for each phase; explicit idle waits consume the group budget.
+The smaller group cap can stop work before three full active budgets are spent.
+The enclosing prospective operator keeps its 300-second archive reserve within
+4,500 seconds, provider lifetime at most 4,800 seconds, and outer bound 5,100
+seconds. This entry point does not allocate resources or extend those bounds.
+
+A dedicated socket carries immutable mode, role, actual configuration, source,
+group deadline and lease identities; stdout/stderr remain ordinary logs. One
+lease covers warmup, measurement, complete drain, atomic phase persistence and
+an outside-timer CUDA synchronization with no pending/in-flight model requests.
+Inactive workers wait on events, without a benchmark polling loop. All nine
+phase ACKs precede any finish grant, coordinator/server result materialization, lifecycle
+churn, unload or archive work. Pre-existing server housekeeping and three idle
+CUDA contexts remain part of this changed resource condition; single-active
+inference does not establish their neutrality.
+
+The coordinator owns each server process group; its SDK child inherits that
+group. The dedicated EOF monitor starts before heavy server imports, explicitly
+cancels the experiment even under uvicorn's signal handler, and has a bounded
+group-kill fallback. Group mode also watches unexpected idle SDK exit. Shared
+cleanup signals every owned group before waiting and joins teardown through
+repeated cancellation. A hard kill may prevent the interrupted phase from
+being finalized; prior atomic files remain evidence, not a reconstructed pass.
+
+This prospective method follows the failed complete `4eb6a0da` sequential
+experiment. A separately retained CPU mechanics experiment verified scheduling,
+cleanup and sensitivity to an injected arm delay, but only 6/12 baseline gates
+passed under either schedule and 0/12 passed with the planted common drift.
+Those controls do not demonstrate improved precision, explain the earlier
+hardware result, or qualify L4 performance. Six triplets remain the statistical
+units; shared-device observations are not independent hardware replications.
+
 `summary.json` schema 2 retains trial outcomes, aggregate metrics, statistical
 gates and source hashes. Each entry links its complete `trial.json` by relative
 path and SHA-256; raw request arrays and oracle corpora stay in those per-trial
