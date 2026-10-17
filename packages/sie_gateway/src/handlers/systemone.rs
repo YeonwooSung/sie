@@ -36,7 +36,7 @@ use crate::server::AppState;
 use super::proxy::{
     check_sdk_version, compatibility_model_uri, is_openai_compat_forwarded_header,
     is_openai_compat_inner_request_header, is_valid_compat_model_id, proxy_request,
-    request_body_error, CompatibilityRoute,
+    request_body_error, resolve_model_and_bundle, CompatibilityRoute,
 };
 
 /// Request body cap. A System One request is one text state and its
@@ -542,7 +542,12 @@ pub async fn proxy_systemone(State(state): State<Arc<AppState>>, req: Request) -
     if !is_valid_compat_model_id(&request.model) {
         return validation_error(&invalid(&["model"], "invalid model id"), None);
     }
-    match is_decision_model(&state, &request.model) {
+    let (resolved_model, _) =
+        match resolve_model_and_bundle(&state, &request.model, &parts.extensions) {
+            Ok(resolved) => resolved,
+            Err(response) => return translate_error(response).await,
+        };
+    match is_decision_model(&state, &resolved_model) {
         None => {
             return api_error(
                 StatusCode::NOT_FOUND,
@@ -942,6 +947,73 @@ mod tests {
         assert_eq!(dispatched.len(), 1);
         assert_eq!(dispatched[0].endpoint, "extract");
         assert_eq!(dispatched[0].model, "acme/decide");
+    }
+
+    #[tokio::test]
+    async fn configured_aliases_reach_the_native_extract_queue() {
+        for model in ["decision", "DECISION", "profiled", "bundled"] {
+            let model_yaml = format!(
+                "{LOCAL_DECISION_MODEL}  alternate:\n    adapter_path: sie_server.adapters.gliner2.decide:GLiNER2DecideAdapter\n    max_batch_tokens: 8192\n"
+            );
+            let mut gateway = TestGateway::new(&[&model_yaml]).await;
+            gateway.add_model_alias("decision", "acme/decide");
+            gateway.add_model_alias("profiled", "acme/decide:alternate");
+            gateway.add_model_alias("bundled", "default:/acme/decide");
+            gateway
+                .add_verified_worker(
+                    "local-1",
+                    LOCAL_LANE,
+                    &["acme/decide", "acme/decide:alternate"],
+                )
+                .await;
+            gateway.dispatcher.return_extract_data(json!({
+                "q": {"type":"noul", "noul":0.9, "answer":true}
+            }));
+            let response = proxy_systemone(
+                State(Arc::clone(&gateway.state)),
+                systemone_request(json!({
+                    "model":model, "state":"Continue?", "questions":{"q":{"type":"noul"}}
+                })),
+            )
+            .await;
+            let status = response.status();
+            let body = body_json(response).await;
+            assert_eq!(status, StatusCode::OK, "{model}: {body}");
+            assert_eq!(body["model"], model);
+            assert_eq!(body["answers"]["q"]["answer"], true);
+            let dispatched = gateway.dispatcher.dispatched();
+            assert_eq!(dispatched.len(), 1);
+            assert_eq!(
+                dispatched[0].model,
+                if model == "profiled" {
+                    "acme/decide:alternate"
+                } else {
+                    "acme/decide"
+                }
+            );
+            assert_eq!(dispatched[0].endpoint, "extract");
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_aliases_preserve_decision_capability_checks() {
+        let mut gateway = TestGateway::new(&[LOCAL_DECISION_MODEL, LOCAL_ENCODE_MODEL]).await;
+        gateway.add_model_alias("encode", "acme/local");
+        gateway.add_model_alias("missing", "acme/missing");
+        for (model, status) in [
+            ("encode", StatusCode::UNPROCESSABLE_ENTITY),
+            ("missing", StatusCode::NOT_FOUND),
+        ] {
+            let response = proxy_systemone(
+                State(Arc::clone(&gateway.state)),
+                systemone_request(json!({
+                    "model":model, "state":"Continue?", "questions":{"q":{"type":"noul"}}
+                })),
+            )
+            .await;
+            assert_eq!(response.status(), status, "{model}");
+        }
+        assert!(gateway.dispatcher.dispatched().is_empty());
     }
 
     #[tokio::test]
