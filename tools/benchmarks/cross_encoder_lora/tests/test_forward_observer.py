@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 from sie_server.adapters.cross_encoder import CrossEncoderAdapter
+from sie_server.adapters.cross_encoder.runtime_lora import CrossEncoderLoraAdapter
+from sie_server.adapters.lora import LoraStateUncertainError
 from sie_server.types.inputs import Item
 
 from tools.benchmarks.cross_encoder_lora.adapter import (
@@ -16,6 +18,8 @@ from tools.benchmarks.cross_encoder_lora.adapter import (
     require_forward_coverage,
     require_forward_selection,
 )
+from tools.benchmarks.cross_encoder_lora.fixtures import prepare
+from tools.benchmarks.cross_encoder_lora.runtime_adapter import ObservedRuntimeCrossEncoder
 from tools.benchmarks.cross_encoder_lora.tests.test_probe import tiny_snapshot
 from tools.benchmarks.cross_encoder_lora.worker import unobserved
 
@@ -135,6 +139,33 @@ def observed_batch() -> dict:
         "item_ids": ["0", "1"],
         "forwards": [{"input_shape": [2, 8], "logits": [[0.1], [0.2]], "enabled_adapters": []}],
     }
+
+
+def test_runtime_timing_uses_actual_opt_in_selection_and_preserves_poison_refusal(tmp_path: Path) -> None:
+    snapshot = tiny_snapshot(tmp_path / "model")
+    fixtures = tmp_path / "fixtures"
+    prepare(fixtures, snapshot, smoke=True)
+    adapter = ObservedRuntimeCrossEncoder(snapshot, lora_paths={"a": str(fixtures / "a")})
+    adapter.load("cpu")
+    try:
+        adapter.load_lora("a")
+        before = len(adapter.selection_observations)
+        with unobserved(adapter):
+            assert adapter.production_adapter_class is CrossEncoderLoraAdapter
+            assert adapter.score_pairs.__func__ is CrossEncoderAdapter.score_pairs
+            assert adapter.set_active_lora.__func__ is CrossEncoderLoraAdapter.set_active_lora
+            adapter.set_active_lora("a")
+            assert adapter._lora._active == str(fixtures / "a")
+            adapter.set_active_lora(None)
+            assert adapter._lora._active is None
+            adapter.score_pairs(*pairs())
+        assert len(adapter.selection_observations) == before
+        adapter._lora._uncertain = True
+        with pytest.raises(LoraStateUncertainError), unobserved(adapter):
+            adapter.set_active_lora(None)
+        assert adapter._observer_wrapper is not None
+    finally:
+        adapter.unload()
 
 
 @pytest.mark.parametrize("failure", ["empty", "rows", "logits", "nonfinite", "wrong_adapter", "enabled_base"])

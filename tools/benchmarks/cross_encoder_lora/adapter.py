@@ -14,6 +14,16 @@ from tools.benchmarks.cross_encoder_lora.protocol import require
 INPUT_DIMENSIONS = 2
 
 
+def production_class(arm: str) -> type[CrossEncoderAdapter]:
+    require(arm in {"B", "N", "R"}, "unknown benchmark arm")
+    if arm == "R":
+        # Optional production adapter does not exist in the archived B source.
+        from sie_server.adapters.cross_encoder.runtime_lora import CrossEncoderLoraAdapter  # noqa: PLC0415
+
+        return CrossEncoderLoraAdapter
+    return CrossEncoderAdapter
+
+
 def require_forward_coverage(batch: dict[str, Any]) -> None:
     """An outer score batch alone does not prove the model forward was observed."""
     forwards = batch["forwards"]
@@ -47,6 +57,8 @@ def require_forward_selection(batch: dict[str, Any], expected_adapter: str | Non
 
 
 class ObservedCrossEncoder(CrossEncoderAdapter):
+    production_adapter_class = CrossEncoderAdapter
+
     def load(self, device: str) -> None:
         self.batch_observations = []
         self.selection_observations = []

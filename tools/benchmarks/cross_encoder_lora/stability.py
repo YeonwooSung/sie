@@ -414,7 +414,7 @@ async def child(args: argparse.Namespace) -> dict[str, Any]:
     torch.set_num_interop_threads(1)
     try:
         summary["required_telemetry_preflight"] = snapshot()
-        environment = worker.preflight(args, evidence)
+        environment = worker.preflight(args, evidence, actual_arm="B")
         environment["hardware_preflight_only"] = environment.pop("qualification")
         environment["qualification"] = False
         environment["source_imports"] = {}

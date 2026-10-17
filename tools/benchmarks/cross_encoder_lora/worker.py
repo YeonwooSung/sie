@@ -28,14 +28,13 @@ import torch
 import uvicorn
 import yaml
 from sie_sdk.client.errors import RequestError
-from sie_server.adapters.cross_encoder import CrossEncoderAdapter
 from sie_server.adapters.peft_lora_mixin import PEFTLoRAMixin
 from sie_server.app.app_factory import AppFactory
 from sie_server.app.app_state_config import AppStateConfig
 from sie_server.types.inputs import Item
 
 from tools.benchmarks.cross_encoder_lora import client as client_workload
-from tools.benchmarks.cross_encoder_lora.adapter import require_forward_selection
+from tools.benchmarks.cross_encoder_lora.adapter import production_class, require_forward_selection
 from tools.benchmarks.cross_encoder_lora.client import (
     REQUEST_ITEMS,
     Client,
@@ -208,15 +207,14 @@ def adapter_storage(adapter: Any) -> dict[str, int]:
 def unobserved(adapter: Any) -> Iterator[None]:
     """Time production methods with the original forward attribute lookup restored."""
     score_pairs, select = adapter.score_pairs, adapter.set_active_lora
+    production = adapter.production_adapter_class
     before = (len(adapter.batch_observations), len(adapter.forward_observations), len(adapter.selection_observations))
     adapter.remove_forward_observer()
-    adapter.score_pairs = CrossEncoderAdapter.score_pairs.__get__(adapter)
-    adapter.set_active_lora = CrossEncoderAdapter.set_active_lora.__get__(adapter)
+    adapter.score_pairs = production.score_pairs.__get__(adapter)
+    adapter.set_active_lora = production.set_active_lora.__get__(adapter)
     try:
-        require(adapter.score_pairs.__func__ is CrossEncoderAdapter.score_pairs, "timed scoring is instrumented")
-        require(
-            adapter.set_active_lora.__func__ is CrossEncoderAdapter.set_active_lora, "timed selection is instrumented"
-        )
+        require(adapter.score_pairs.__func__ is production.score_pairs, "timed scoring is instrumented")
+        require(adapter.set_active_lora.__func__ is production.set_active_lora, "timed selection is instrumented")
         adapter.assert_original_forward()
         yield
         adapter.assert_original_forward()
@@ -330,19 +328,21 @@ def configs(directory: Path, source: Path, fixtures: Path, arm: str, snapshot: P
     profile = config["profiles"]["default"]
     profile["adapter_path"] = f"{HERE / 'adapter.py'}:ObservedCrossEncoder"
     if arm == "R":
+        profile["adapter_path"] = f"{HERE / 'runtime_adapter.py'}:ObservedRuntimeCrossEncoder"
         profile["adapter_options"]["loadtime"] = {
             "lora_paths": {name: str(fixtures / name) for name in ("a", "b", "c")}
         }
     (directory / "model.yaml").write_text(yaml.safe_dump(config))
 
 
-def preflight(args: argparse.Namespace, evidence: Evidence) -> dict[str, Any]:
+def preflight(args: argparse.Namespace, evidence: Evidence, *, actual_arm: str) -> dict[str, Any]:
     versions = {name: importlib.metadata.version(name) for name in EXPECTED_VERSIONS}
     try:
         torchao = importlib.metadata.version("torchao")
     except importlib.metadata.PackageNotFoundError:
         torchao = None
-    module_path = sys.modules[CrossEncoderAdapter.__module__].__file__
+    production = production_class(actual_arm)
+    module_path = sys.modules[production.__module__].__file__
     assert module_path is not None
     actual_source = Path(module_path).resolve()
     require(actual_source.is_relative_to(args.source.resolve()), "adapter was imported from a different source tree")
@@ -351,6 +351,7 @@ def preflight(args: argparse.Namespace, evidence: Evidence) -> dict[str, Any]:
         "torchao": torchao,
         "adapter_source": str(actual_source),
         "adapter_sha256": digest(actual_source),
+        "adapter_class": f"{production.__module__}:{production.__name__}",
         "python": sys.version,
         "threads": torch.get_num_threads(),
         "device": str(torch.cuda.get_device_name(0)) if torch.cuda.is_available() else "cpu",
@@ -424,6 +425,7 @@ async def experiment(args: argparse.Namespace, evidence: Evidence, summary: dict
         summary["loaded_before_forward_memory"] = memory()
         summary["manager_present"] = getattr(adapter, "_lora", None) is not None
         require(summary["manager_present"] == (args.arm == "R"), "unexpected manager activation")
+        require(adapter.production_adapter_class is production_class(args.arm), "wrong production adapter class")
 
         async def call(selection: str | None, label: str, *, cold: bool = False) -> dict[str, Any]:
             row = await asyncio.to_thread(client.score, selection, label, cold=cold)
@@ -754,7 +756,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         if group is not None:
             await group.grant("prepare")
             validate_source(group.binding, args.source, args.arm, args.pair)
-        summary["environment"] = preflight(args, evidence)
+        summary["environment"] = preflight(args, evidence, actual_arm=args.arm)
         timeout = max(0, group.binding["work_deadline"] - time.monotonic()) if group is not None else args.deadline_s
         async with asyncio.timeout(timeout):
             await experiment(args, evidence, summary)

@@ -349,7 +349,7 @@ def test_negative_raw_latency_cannot_hide_in_positive_aggregates() -> None:
         probe.metrics(phase)
 
 
-def test_serving_observer_and_gc_are_unmodified() -> None:
+def test_memory_and_observer_flow_preserved_with_explicit_production_class() -> None:
     baseline = subprocess.run(
         ["git", "show", "a2932d81:tools/benchmarks/cross_encoder_lora/worker.py"],  # noqa: S607
         cwd=ROOT,
@@ -361,13 +361,28 @@ def test_serving_observer_and_gc_are_unmodified() -> None:
         pytest.skip("invariant control requires its documented parent commit in git history")
 
     def code(text: str) -> dict[str, str]:
+        class ClassBinding(ast.NodeTransformer):
+            def visit_Name(self, node):
+                if node.id == "production":
+                    node.id = "CrossEncoderAdapter"
+                return node
+
+        tree = ast.parse(text)
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == "unobserved":
+                binding = ast.parse("production = adapter.production_adapter_class").body[0]
+                node.body = [entry for entry in node.body if ast.dump(entry) != ast.dump(binding)]
+                ClassBinding().visit(node)
         return {
             node.name: ast.dump(node)
-            for node in ast.parse(text).body
+            for node in tree.body
             if isinstance(node, ast.FunctionDef) and node.name in {"unobserved", "memory"}
         }
 
     assert code(Path(worker.__file__).read_text()) == code(baseline.stdout)
+    # The explicit opt-in subclass now supplies selection; all timing/restore
+    # control flow and memory semantics stay the same. Real R forwarding is
+    # checked separately, including refusal of a poisoned resident manager.
     # Historical diagnostic timing still uses the in-process wrapper and does
     # not force GC. The new qualification load loop has its own extraction and
     # clock-boundary tests; exact historical replay remains pinned to 482b.

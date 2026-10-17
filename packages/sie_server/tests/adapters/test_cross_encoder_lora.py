@@ -5,6 +5,8 @@ from __future__ import annotations
 import builtins
 import gc
 import json
+import subprocess
+import sys
 import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -18,10 +20,14 @@ import yaml
 from peft import LoraConfig
 from peft.tuners.tuners_utils import BaseTunerLayer
 from safetensors.torch import load_file, save_file
+from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters.cross_encoder import CrossEncoderAdapter
+from sie_server.adapters.cross_encoder.runtime_lora import CrossEncoderLoraAdapter
 from sie_server.adapters.lora import LoraStateUncertainError, LoraUnavailableError
 from sie_server.app.app_factory import AppFactory
 from sie_server.app.app_state_config import AppStateConfig
+from sie_server.config.model import ModelConfig
+from sie_server.core.loader import load_adapter
 from sie_server.core.registry import ModelRegistry
 from transformers import BertConfig, BertForSequenceClassification, BertTokenizerFast
 
@@ -92,7 +98,7 @@ def save_adapter(path, seed=1, *, targets=("query", "value"), **overrides):
 @pytest.fixture
 def adapter(checkpoint, tmp_path):
     paths = {name: save_adapter(tmp_path / name, seed) for seed, name in enumerate(("a", "b", "c"), 1)}
-    adapter = CrossEncoderAdapter(checkpoint, lora_paths=paths, max_loaded_loras=2)
+    adapter = CrossEncoderLoraAdapter(checkpoint, lora_paths=paths, max_loaded_loras=2)
     adapter.load("cpu")
     yield adapter
     adapter.unload()
@@ -149,12 +155,12 @@ def test_never_lora_has_no_manager_or_optional_imports(checkpoint, monkeypatch):
     original = builtins.__import__
 
     def guarded_import(name, *args, **kwargs):
-        assert name != "sie_server.adapters.cross_encoder._lora"
+        assert name not in {"sie_server.adapters.cross_encoder._lora", "sie_server.adapters.cross_encoder.runtime_lora"}
         return original(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", guarded_import)
     adapter = CrossEncoderAdapter(checkpoint)
-    assert adapter._lora is None
+    assert not hasattr(adapter, "_lora")
     assert not adapter.supports_lora()
     assert adapter.lora_capability() is None
     assert not adapter.supports_hot_lora_reload()
@@ -165,9 +171,92 @@ def test_never_lora_has_no_manager_or_optional_imports(checkpoint, monkeypatch):
     adapter.set_active_lora(None)
     np.testing.assert_array_equal(scores(adapter), baseline)
     assert_base_preserved(adapter, before)
-    with pytest.raises(ValueError, match="No LoRA sources"):
-        adapter.set_active_lora("a")
+    # Preserve the original base hook contract; registry capability checks
+    # reject adapter requests before any model mutation.
+    adapter.set_active_lora("a")
+    np.testing.assert_array_equal(scores(adapter), baseline)
     adapter.unload()
+
+
+def test_ordinary_module_import_and_hooks_stay_independent_of_runtime_lora(tmp_path):
+    script = """
+import builtins, sys
+original = builtins.__import__
+def guarded(name, *args, **kwargs):
+    assert name not in {
+        'sie_server.adapters.cross_encoder.runtime_lora',
+        'sie_server.adapters.cross_encoder._lora',
+    }, name
+    return original(name, *args, **kwargs)
+builtins.__import__ = guarded
+from sie_server.adapters._base_adapter import BaseAdapter
+from sie_server.adapters.cross_encoder import CrossEncoderAdapter
+adapter = CrossEncoderAdapter('unused-local-construction-only', lora_paths={'a': 'unused'})
+assert not hasattr(adapter, '_lora')
+for name in ('unload', 'supports_lora', 'supports_hot_lora_reload', 'lora_runtime_config',
+             'fetch_lora', 'discard_lora_source', 'load_lora', 'unload_lora', 'set_active_lora'):
+    assert getattr(CrossEncoderAdapter, name) is getattr(BaseAdapter, name), name
+assert not adapter.supports_lora()
+assert 'sie_server.adapters.cross_encoder.runtime_lora' not in sys.modules
+assert 'sie_server.adapters.cross_encoder._lora' not in sys.modules
+"""
+    result = subprocess.run(  # noqa: S603 -- fixed local import-only check, no model or network
+        [sys.executable, "-c", script], cwd=tmp_path, capture_output=True, text=True, timeout=45, check=False
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("declarations", [None, {}, []])
+def test_explicit_runtime_class_requires_declarations(checkpoint, declarations):
+    with pytest.raises(ValueError, match="requires nonempty lora_paths"):
+        CrossEncoderLoraAdapter(checkpoint, lora_paths=declarations, lora_revisions={"org/other": "a" * 40})
+
+
+@pytest.mark.parametrize("runtime", [False, True])
+def test_real_loader_routes_only_the_explicit_profile_and_preserves_base_options(checkpoint, runtime):
+    adapter_type = CrossEncoderLoraAdapter if runtime else CrossEncoderAdapter
+    loadtime = {"max_length": 24, "trust_remote_code": True}
+    if runtime:
+        loadtime["lora_paths"] = {"a": {"id": "org/declared", "revision": "b" * 40}}
+    config = ModelConfig.model_validate(
+        {
+            "sie_id": "test/explicit-cross-encoder",
+            "weights_path": str(checkpoint),
+            "hf_revision": "a" * 40,
+            "inputs": {"text": True},
+            "tasks": {"score": {}},
+            "profiles": {
+                "default": {
+                    "adapter_path": f"{adapter_type.__module__}:{adapter_type.__name__}",
+                    "max_batch_tokens": 8192,
+                    "adapter_options": {"loadtime": loadtime},
+                }
+            },
+        }
+    )
+    adapter = load_adapter(config, checkpoint, device="cpu", attention_backend="eager", max_loras_per_model=2)
+    assert type(adapter) is adapter_type
+    assert adapter._model_name_or_path == str(checkpoint)
+    assert adapter._max_length == 24
+    assert adapter._trust_remote_code
+    assert adapter._compute_precision == "float32"
+    assert adapter._attn_implementation == "eager"
+    assert adapter._revision == "a" * 40
+    assert adapter_type.score is CrossEncoderAdapter.score
+    assert adapter_type.score_pairs is CrossEncoderAdapter.score_pairs
+    if runtime:
+        assert adapter._lora._revisions == {"org/declared": "b" * 40}
+        assert adapter.lora_runtime_config().max_loaded == 2
+        assert adapter.lora_runtime_config().aliases == {"a": "org/declared"}
+    else:
+        assert not hasattr(adapter, "_lora")
+        assert adapter.set_active_lora.__func__ is BaseAdapter.set_active_lora
+        # Profile resolution is cached. Construct a distinct invalid config,
+        # rather than mutating the already-resolved instance behind its cache.
+        invalid = config.model_dump()
+        invalid["profiles"]["default"]["adapter_options"]["loadtime"]["lora_paths"] = {"a": "org/declared"}
+        with pytest.raises(ValueError, match=r"does not accept.*lora_paths"):
+            load_adapter(ModelConfig.model_validate(invalid), checkpoint, device="cpu")
 
 
 def test_actual_effect_restoration_head_and_final_module_identity(adapter):
@@ -216,6 +305,7 @@ def test_resident_adapters_leave_the_exact_base_tree_and_preserve_layer_hooks(ad
     snapshot = base_snapshot(adapter)
     baseline = scores(adapter)
     original_query = snapshot[1].bert.encoder.layer[0].attention.self.query
+    original_storage = [(parameter, parameter.data_ptr()) for parameter in snapshot[1].parameters()]
     original_calls, wrapper_calls = [], []
     base_hook = original_query.register_forward_hook(lambda *_: original_calls.append(True))
     adapter.load_lora("a")
@@ -246,10 +336,45 @@ def test_resident_adapters_leave_the_exact_base_tree_and_preserve_layer_hooks(ad
             np.testing.assert_array_equal(actual, expected[selection])
         expected[selection] = actual
         assert_base_preserved(adapter, snapshot)
+        assert all(parameter.data_ptr() == pointer for parameter, pointer in original_storage)
         assert {name: id(layer) for name, layer in manager._resident_layers.items()} == identities
     assert np.max(np.abs(expected["a"] - expected["b"])) > 1e-6
     base_hook.remove()
     wrapper_hook.remove()
+
+
+def test_repeated_disabled_selection_checks_readiness_without_tree_or_peft_work(adapter, monkeypatch):
+    adapter.load_lora("a")
+    adapter.load_lora("b")
+    adapter.set_active_lora(None)
+    baseline = scores(adapter)
+    snapshot = base_snapshot(adapter)
+    manager = adapter._lora
+    original_ready = manager._ready
+    checks = []
+
+    def ready():
+        checks.append(True)
+        original_ready()
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("disabled selection traversed or changed adapter layers")
+
+    with monkeypatch.context() as context:
+        context.setattr(manager, "_ready", ready)
+        for name in ("_attach_layers", "_detach_layers", "_restore_grad_flags"):
+            context.setattr(manager, name, unexpected)
+        for name in ("set_adapter", "enable_adapters", "disable_adapters"):
+            context.setattr(adapter._model, name, unexpected)
+        for _ in range(100):
+            adapter.set_active_lora(None)
+        assert len(checks) == 100
+        np.testing.assert_array_equal(scores(adapter), baseline)
+        assert dict(snapshot[1].named_modules()) == snapshot[5]
+        manager._uncertain = True
+        with pytest.raises(LoraStateUncertainError):
+            adapter.set_active_lora(None)
+        manager._uncertain = False
 
 
 def test_disjoint_targets_evict_only_their_wrappers_and_final_unload_releases_weights(checkpoint, tmp_path):
@@ -257,7 +382,7 @@ def test_disjoint_targets_evict_only_their_wrappers_and_final_unload_releases_we
         "a": save_adapter(tmp_path / "a", 1, targets=("query",)),
         "b": save_adapter(tmp_path / "b", 2, targets=("value",)),
     }
-    adapter = CrossEncoderAdapter(checkpoint, lora_paths=paths, max_loaded_loras=2)
+    adapter = CrossEncoderLoraAdapter(checkpoint, lora_paths=paths, max_loaded_loras=2)
     adapter.load("cpu")
     try:
         snapshot, baseline = base_snapshot(adapter), scores(adapter)
@@ -522,8 +647,8 @@ def test_discard_and_model_unload_release_owned_sources(adapter):
 def test_revision_and_capacity_validation(checkpoint, tmp_path):
     path = save_adapter(tmp_path / "a")
     with pytest.raises(ValueError, match="positive integer"):
-        CrossEncoderAdapter(checkpoint, lora_paths={"a": path}, max_loaded_loras=0)
-    adapter = CrossEncoderAdapter(checkpoint, lora_paths={"a": path}, lora_revisions={path: "a" * 40})
+        CrossEncoderLoraAdapter(checkpoint, lora_paths={"a": path}, max_loaded_loras=0)
+    adapter = CrossEncoderLoraAdapter(checkpoint, lora_paths={"a": path}, lora_revisions={path: "a" * 40})
     adapter.load("cpu")
     try:
         with pytest.raises(ValueError, match="differs"):
@@ -536,14 +661,14 @@ def test_revision_and_capacity_validation(checkpoint, tmp_path):
 
 def test_revisions_alone_do_not_enable_or_authorize_lora(checkpoint):
     adapter = CrossEncoderAdapter(checkpoint, lora_revisions={"other-profile/source": "a" * 40})
-    assert adapter._lora is None
+    assert not hasattr(adapter, "_lora")
     assert adapter.lora_capability() is None
 
 
 @pytest.mark.parametrize("paths", [["org/source"], {"/private/source": "org/source"}, {"a": "b", "b": "c"}])
 def test_aliases_are_public_names_and_cannot_shadow_sources(checkpoint, paths):
     with pytest.raises(ValueError, match=r"aliases|shadows"):
-        CrossEncoderAdapter(checkpoint, lora_paths=paths)
+        CrossEncoderLoraAdapter(checkpoint, lora_paths=paths)
 
 
 def test_fetch_rechecks_model_generation_before_publishing_source(adapter, monkeypatch):
@@ -669,7 +794,7 @@ def test_real_score_routes_authorize_aliases_isolate_batches_and_evict(
         "max_sequence_length": 64,
         "profiles": {
             "default": {
-                "adapter_path": "sie_server.adapters.cross_encoder:CrossEncoderAdapter",
+                "adapter_path": "sie_server.adapters.cross_encoder.runtime_lora:CrossEncoderLoraAdapter",
                 "max_batch_tokens": 8192,
                 "adapter_options": {"loadtime": {"lora_paths": {name: paths[name] for name in ("a", "b", "c")}}},
             },

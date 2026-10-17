@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from sie_server.adapters.cross_encoder import CrossEncoderAdapter
+from sie_server.adapters.cross_encoder.runtime_lora import CrossEncoderLoraAdapter
 
 from tools.benchmarks.cross_encoder_lora.fixtures import prepare
 from tools.benchmarks.cross_encoder_lora.tests.test_probe import tiny_snapshot
@@ -16,7 +16,7 @@ def resident(tmp_path):
     snapshot = tiny_snapshot(tmp_path / "model")
     fixtures = tmp_path / "fixtures"
     prepare(fixtures, snapshot, smoke=True)
-    adapter = CrossEncoderAdapter(snapshot, lora_paths={name: str(fixtures / name) for name in ("a", "b")})
+    adapter = CrossEncoderLoraAdapter(snapshot, lora_paths={name: str(fixtures / name) for name in ("a", "b")})
     adapter.load("cpu")
     adapter.load_lora("a")
     adapter.load_lora("b")

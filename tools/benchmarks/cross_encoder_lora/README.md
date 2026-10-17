@@ -1,7 +1,8 @@
 # CrossEncoder runtime LoRA qualification
 
-This probe measures the ordinary `CrossEncoderAdapter` using the real SIE loader,
-worker, loopback HTTP API and `sie_sdk.SIEClient`. It does not provision compute,
+This probe measures the ordinary `CrossEncoderAdapter` and the explicit opt-in
+`CrossEncoderLoraAdapter` using the real SIE loader, worker, loopback HTTP API
+and `sie_sdk.SIEClient`. It does not provision compute,
 install dependencies, change precision, or change the production catalog. The
 catalog model is overridden locally to use the ordinary adapter rather than the
 catalog's BertFlash implementation.
@@ -13,6 +14,46 @@ Fixtures A/B/C are deterministic, untrained rank-4, alpha-8, bias-free LoRAs on
 every BERT encoder query/value projection. They establish reversible numerical
 effects and lifecycle behavior, **not retrieval quality**. Source seeds, model
 files and adapter files are hashed in the fixture manifest.
+
+## Explicit opt-in adapter
+
+Ordinary profiles keep `sie_server.adapters.cross_encoder:CrossEncoderAdapter`.
+That module is restored exactly to the pinned baseline source, including its
+constructor, load/unload and inherited LoRA hooks. It does not import the
+runtime-LoRA module or construct a manager. The public catalog and fallback
+paths are unchanged.
+
+Experimental runtime profiles must select the separate class explicitly:
+
+```yaml
+profiles:
+  default:
+    adapter_path: sie_server.adapters.cross_encoder.runtime_lora:CrossEncoderLoraAdapter
+    max_batch_tokens: 8192
+    adapter_options:
+      loadtime:
+        lora_paths:
+          task_adapter:
+            id: example/bert-encoder-lora
+            revision: 0123456789abcdef0123456789abcdef01234567
+```
+
+The repository and revision above are placeholders. Use declared, compatible
+adapter weights. The explicit class requires nonempty declarations; revisions
+alone do not enable it. Older experimental PR775 configurations that added
+`lora_paths` to the ordinary class must change their `adapter_path`; the existing
+loader rejects those options on the ordinary class. Dependent architecture
+extensions must likewise opt into the separate class and retain their own
+qualification requirements; this change does not add XLM-R support.
+
+The opt-in class inherits the ordinary scoring methods. With base selected, its
+manager restores the original module objects and retains LoRA layers in a plain
+off-tree dictionary, without copying the base weights. Repeated base selection
+still checks manager readiness and active state; declared profiles retain their
+existing admission, reservation and mutation controls. These structural facts
+do not prove equal end-to-end latency or throughput for enabled profiles. All
+previous failed measurements and performance gates remain in force; the
+baseline-only pilot is not candidate qualification.
 
 ## Prepare immutable sources and fixtures
 
@@ -66,7 +107,8 @@ drop failed trials to obtain a pass, or retry the same failed protocol unchanged
 
 There are six fresh-process blocks, in order `BNR`, `NRB`, `RBN`, `BRN`, `RNB`,
 `NBR` (18 fresh servers). B uses the pinned baseline with no declared LoRA.
-N uses the candidate with no declared LoRA. R uses the candidate after A/B
+N uses the candidate's ordinary class with no declared LoRA. R uses its explicit
+runtime-LoRA class after A/B
 activity, with base selected and two adapters resident but disabled.
 
 Every arm uses the same password-reset query and four documents in `protocol.py`.
