@@ -825,6 +825,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_aliases_preserve_caller_spelling_and_dispatch_identity() {
+        for model in ["decision", "DECISION", "profiled", "bundled"] {
+            let model_yaml = format!(
+                "{LOCAL_DECISION_MODEL}  alternate:\n    adapter_path: sie_server.adapters.gliner2.decide:GLiNER2DecideAdapter\n    max_batch_tokens: 8192\n"
+            );
+            let mut gateway = TestGateway::new(&[&model_yaml]).await;
+            gateway.add_model_alias("decision", "acme/decide");
+            gateway.add_model_alias("profiled", "acme/decide:alternate");
+            gateway.add_model_alias("bundled", "default:/acme/decide");
+            gateway
+                .add_verified_worker(
+                    "local-1",
+                    LOCAL_LANE,
+                    &["acme/decide", "acme/decide:alternate"],
+                )
+                .await;
+            gateway.dispatcher.return_extract_data(json!({
+                "question_0":{"type":"noul", "noul":0.9}
+            }));
+            let mut body = predicate_request();
+            body["model"] = json!(model);
+            let response = proxy_decisions(State(Arc::clone(&gateway.state)), request(body)).await;
+            let status = response.status();
+            let body = body_json(response).await;
+            assert_eq!(status, StatusCode::OK, "{model}: {body}");
+            assert_eq!(body["model"], model);
+            assert_eq!(body["answers"][0]["probability"], 0.9);
+            let dispatched = gateway.dispatcher.dispatched();
+            assert_eq!(dispatched.len(), 1);
+            assert_eq!(
+                dispatched[0].model,
+                if model == "profiled" {
+                    "acme/decide:alternate"
+                } else {
+                    "acme/decide"
+                }
+            );
+            assert_eq!(dispatched[0].endpoint, "extract");
+        }
+    }
+
+    #[tokio::test]
+    async fn hidden_and_absent_aliases_have_identical_not_found_responses() {
+        for populated in [false, true] {
+            let hidden_models = if populated {
+                vec![LOCAL_DECISION_MODEL]
+            } else {
+                vec![]
+            };
+            let absent_models = if populated {
+                vec![LOCAL_ENCODE_MODEL]
+            } else {
+                vec![]
+            };
+            let mut hidden = TestGateway::new(&hidden_models).await;
+            let mut absent = TestGateway::new(&absent_models).await;
+            hidden.add_model_alias("decision", "acme/decide");
+            absent.add_model_alias("decision", "acme/decide");
+            hidden.install_policy(Arc::new(RequireCaller));
+            for model in ["decision", "DECISION"] {
+                let mut payload = predicate_request();
+                payload["model"] = json!(model);
+                let denied =
+                    proxy_decisions(State(Arc::clone(&hidden.state)), request(payload.clone()))
+                        .await;
+                let missing =
+                    proxy_decisions(State(Arc::clone(&absent.state)), request(payload)).await;
+                assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+                assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+                let denied = body_json(denied).await;
+                assert_eq!(denied["error"]["code"], "MODEL_NOT_FOUND");
+                assert_eq!(denied, body_json(missing).await);
+                assert!(!denied.to_string().contains("acme/"));
+            }
+            assert!(hidden.dispatcher.dispatched().is_empty());
+            assert!(absent.dispatcher.dispatched().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn alias_visibility_precedes_decision_capability_checks() {
+        let mut gateway = TestGateway::new(&[LOCAL_DECISION_MODEL, LOCAL_ENCODE_MODEL]).await;
+        gateway.add_model_alias("decision", "acme/decide");
+        gateway.add_model_alias("encode", "acme/local");
+        gateway.install_policy(Arc::new(RequireCaller));
+        for model in ["decision", "encode"] {
+            let mut body = predicate_request();
+            body["model"] = json!(model);
+            let response = proxy_decisions(State(Arc::clone(&gateway.state)), request(body)).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body = body_json(response).await;
+            assert!(body.get("error").is_some());
+            assert!(!body.to_string().contains("acme/"));
+        }
+        assert!(gateway.dispatcher.dispatched().is_empty());
+    }
+
+    #[tokio::test]
     async fn authenticated_extensions_reach_the_native_model_policy() {
         let mut gateway = TestGateway::new(&[LOCAL_DECISION_MODEL]).await;
         gateway.install_policy(Arc::new(RequireCaller));
