@@ -25,8 +25,24 @@ then the oldest flagged item, and so on. A batchable item never waits inside
 a long item's batch, and waits for at most one flagged item between two
 batches of its lane. A flagged item with k flagged items ahead of it waits
 for at most k + 1 batches of batchable items, however many keep arriving.
-When nothing pending is flagged, batch formation is exactly the cost-sorted
-greedy packing above.
+When nothing pending is flagged and every pending item fits the configured
+``max_batch_cost``, batch formation is exactly the cost-sorted greedy
+packing above.
+
+An item whose cost is above that configured limit cannot share a batch
+formed at the limit. Sorted packing never selects it while a cheaper item
+is pending, so cheaper arrivals hold it until they stop (#390). Those
+items take turns with the cheaper lane: one cost-sorted batch of items
+that fit, then the oldest over-budget item by itself. The first batch
+comes from the lane of the oldest pending item. An over-budget item with
+k over-budget items ahead of it waits for at most k + 1 cheaper batches,
+however many cheaper items keep arriving. The adaptive controller may
+later change the live ``max_batch_cost``; lane membership stays on the
+budget ``BatchConfig`` was built with, so a raised live limit does not
+pull the item back into a cheaper pack. Items at or under the configured
+limit stay on cost order, including when cheaper items fill the live
+budget ahead of them. While a ``runs_alone`` item is pending, only that
+lane runs.
 
 Cost semantics vary by modality (modality-native units):
 - Text: cost = token count
@@ -177,6 +193,9 @@ class BatchConfig:
             self.max_batch_cost = max_batch_tokens
         else:
             self.max_batch_cost = max_batch_cost
+        # The adaptive controller writes max_batch_cost. Over-budget lane
+        # membership stays on the budget this config was built with (#390).
+        self.configured_max_batch_cost = self.max_batch_cost
         self.max_batch_requests = max_batch_requests
         self.max_batch_wait_ms = max_batch_wait_ms
         self.coalesce_ms = coalesce_ms
@@ -229,6 +248,7 @@ class BatchFormer[I: HasCost, T]:
         self._first_request_time: float | None = None
         self._last_submit_time: float | None = None
         self._last_batch_alone: bool | None = None
+        self._last_over_budget_batch: bool | None = None
 
     @property
     def config(self) -> BatchConfig:
@@ -437,6 +457,51 @@ class BatchFormer[I: HasCost, T]:
         if alone_turn:
             self._pending.insert(0, self._pending.pop(head_index))
 
+    def _order_over_budget_lane(self) -> bool:
+        """Order items that exceed the configured batch cost. Return True when this batch is one of them.
+
+        Packable items stay cost-sorted. Over-budget items stay in arrival
+        order and are not taken during a packable turn, so a raised live
+        ``max_batch_cost`` cannot fold one into the cheaper batch. On an
+        over-budget turn the oldest one moves to the front; the caller takes
+        that item alone.
+        """
+        budget = self._config.configured_max_batch_cost
+        has_over = False
+        has_pack = False
+        for request in self._pending:
+            if request.item.cost > budget:
+                has_over = True
+            else:
+                has_pack = True
+        if not has_over:
+            self._pending.sort(key=lambda request: request.item.cost)
+            return False
+
+        self._pending.sort(
+            key=lambda request: (
+                request.item.cost > budget,
+                request.arrival_time if request.item.cost > budget else request.item.cost,
+            )
+        )
+        if has_pack and not self._over_budget_turn(budget):
+            return False
+        head_index = next(index for index, request in enumerate(self._pending) if request.item.cost > budget)
+        if head_index != 0:
+            self._pending.insert(0, self._pending.pop(head_index))
+        return True
+
+    def _over_budget_turn(self, budget: int) -> bool:
+        """Whether the next batch belongs to the over-budget lane.
+
+        Both lanes are pending. The first batch follows the oldest item.
+        After that the lanes alternate.
+        """
+        if self._last_over_budget_batch is None:
+            oldest = min(self._pending, key=lambda request: request.arrival_time)
+            return oldest.item.cost > budget
+        return not self._last_over_budget_batch
+
     def _extract_batch(
         self,
         max_items: int | None = None,
@@ -472,11 +537,12 @@ class BatchFormer[I: HasCost, T]:
         pending_before = len(self._pending)
         cost_before = self._total_cost
 
-        if any(request.runs_alone for request in self._pending):
+        alone_lane = any(request.runs_alone for request in self._pending)
+        over_budget_turn = False
+        if alone_lane:
             self._order_runs_alone_lane()
         else:
-            # Sort pending by cost (ascending) for optimal batching
-            self._pending.sort(key=lambda r: r.item.cost)
+            over_budget_turn = self._order_over_budget_lane()
 
         # Greedily take items until we exceed max_batch_cost
         batch_items: list[I] = []
@@ -495,6 +561,10 @@ class BatchFormer[I: HasCost, T]:
             # unless it is the first item taken.
             if request.runs_alone and take_count > 0:
                 break
+            # A packable turn stops at the over-budget lane. A raised live
+            # budget must not fold that item into the cheaper batch.
+            if not over_budget_turn and take_count > 0 and request.item.cost > self._config.configured_max_batch_cost:
+                break
             # Would this item push us over the cost limit?
             # Always take at least one item (handles single large requests)
             if batch_cost + request.item.cost > self._config.max_batch_cost:
@@ -508,7 +578,7 @@ class BatchFormer[I: HasCost, T]:
             batch_cost += request.item.cost
             take_count += 1
 
-            if request.runs_alone:
+            if request.runs_alone or over_budget_turn:
                 break
 
             # Also respect max_batch_requests
@@ -516,10 +586,17 @@ class BatchFormer[I: HasCost, T]:
                 hit_request_limit = True
                 break
 
-        lane = "alone" if take_count > 0 and self._pending[0].runs_alone else "batched"
+        if take_count > 0 and self._pending[0].runs_alone:
+            lane = "alone"
+        elif over_budget_turn:
+            lane = "over_budget"
+        else:
+            lane = "batched"
         if take_count > 0:
             # Whose turn is next when both lanes are pending.
             self._last_batch_alone = lane == "alone"
+            if not alone_lane:
+                self._last_over_budget_batch = over_budget_turn
 
         # Remove taken items from pending
         self._pending = self._pending[take_count:]
