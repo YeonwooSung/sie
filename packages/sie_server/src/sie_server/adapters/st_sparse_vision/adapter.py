@@ -4,9 +4,9 @@ Serves sentence-transformers ``SparseEncoder`` models that accept image
 documents in addition to text (visual-SPLADE family, e.g.
 naver/v-splade-quality): text or page-image in, sparse vocab-sized vector out.
 
-Requires the ``transformers5`` bundle (sentence-transformers >=5.6 /
-transformers >=5.14); the multimodal ``SparseEncoder`` routing does not exist
-on the sentence-transformers 5.0 line the default bundle pins.
+Requires the ``transformers5`` bundle for the checkpoint's Transformers >=5.14
+modeling support. Both this bundle and the default bundle pin
+sentence-transformers 5.7.0, which includes multimodal ``SparseEncoder`` routing.
 """
 
 from __future__ import annotations
