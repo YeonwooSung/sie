@@ -23,7 +23,7 @@ dependencies = [
     # the base venv can't silently jump to a transformers 6 major.
     "transformers>=4.57,<6",
     "tokenizers>=0.20,<1",
-    "sentence-transformers>=5.0,<6",
+    "sentence-transformers==5.7.0",
     "safetensors>=0.4,<1",
     # Artifact resolution (snapshot_download / hf_hub_download / scan_cache_dir)
     # is imported directly by the adapters and the disk cache, and `requests` by

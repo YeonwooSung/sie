@@ -7,6 +7,7 @@ import importlib
 import json
 import sys
 import threading
+import tomllib
 import types
 import uuid
 import weakref
@@ -19,6 +20,8 @@ import numpy as np
 import pytest
 import sentence_transformers
 import torch
+import yaml
+from packaging.requirements import Requirement
 from sentence_transformers import CrossEncoder, SentenceTransformer, SparseEncoder
 from sentence_transformers.base.modules import Dense, Module, Router
 from sentence_transformers.sentence_transformer.modules import Pooling, WordEmbeddings
@@ -41,6 +44,27 @@ from transformers import (
 
 class _ControlledAutoImportMarker(BaseException):
     """Survive AutoProcessor's broad Exception fallback to prove code execution."""
+
+
+def test_dependency_pins_match_supported_loading_boundary() -> None:
+    root = Path(__file__).resolve().parents[4]
+    server = root / "packages" / "sie_server"
+    project = tomllib.loads((server / "pyproject.toml").read_text())
+    requirement = next(
+        Requirement(value)
+        for value in project["project"]["dependencies"]
+        if Requirement(value).name == "sentence-transformers"
+    )
+    (specifier,) = requirement.specifier
+    assert specifier.operator == "=="
+    assert specifier.version in trust._SUPPORTED_VERSIONS
+    for bundle in ("default", "transformers5"):
+        config = yaml.safe_load((server / "bundles" / f"{bundle}.yaml").read_text())
+        assert config["deps"]["sentence-transformers"] == str(requirement.specifier)
+    lock = tomllib.loads((root / "uv.lock").read_text())
+    assert [package["version"] for package in lock["package"] if package["name"] == "sentence-transformers"] == [
+        specifier.version
+    ]
 
 
 @pytest.fixture(autouse=True)
