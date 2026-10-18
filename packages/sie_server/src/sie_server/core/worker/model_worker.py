@@ -123,6 +123,27 @@ def _dispatch_width(adapter: object) -> int:
     return max(1, width)
 
 
+async def _yield_ready_callbacks() -> None:
+    """Let ready producer callbacks schedule submissions before the idle recheck.
+
+    Completing a Future queues this task behind work those callbacks create.
+    This is one scheduling checkpoint, not a drain of all incoming work: later
+    network arrivals or unfinished preparation may still miss the batch.
+    """
+    loop = asyncio.get_running_loop()
+    ready: asyncio.Future[None] = loop.create_future()
+
+    def wake() -> None:
+        if not ready.done():
+            ready.set_result(None)
+
+    handle = loop.call_soon(wake)
+    try:
+        await ready
+    finally:
+        handle.cancel()
+
+
 class ModelWorker:
     """Worker that batches and processes inference requests for a single model.
 
@@ -1093,8 +1114,9 @@ class ModelWorker:
 
         When the worker was idle, one pending request is dispatched immediately
         (#373), however many items it carries. It is not held for
-        ``idle_coalesce_ms``. A lone head yields one event-loop turn so already
-        runnable submissions can join it, without waiting for a timer. A
+        ``idle_coalesce_ms``. A lone head yields one callback generation so
+        ready producers and the submissions they schedule can join it, without
+        waiting for a timer. Later arrivals may still miss this batch. A
         follow-up is a tail only while another request
         on that same batcher is still pending (arrived and not yet dispatched);
         the idle window can then catch a straggler. A finished request is no
@@ -1136,10 +1158,9 @@ class ModelWorker:
                 selected = self._batchers[selected_lora]
                 idle_window_ms = self._config.idle_coalesce_ms
                 if was_idle and idle_window_ms > 0 and selected.pending_request_count == 1:
-                    # Let submissions already runnable on this loop join the
-                    # head before deciding whether it is a lone request. This
-                    # yields once without waiting for a timer or later arrival.
-                    await asyncio.sleep(0)
+                    # A ready transport callback may create the submission task.
+                    # Give that task one opportunity before the lone-head check.
+                    await _yield_ready_callbacks()
                     if not self._running:
                         return None, FormattedBatch(items=[], metadata=[], total_cost=0), was_idle
                 # Alone is one request, not one item: ``submit_many`` queues

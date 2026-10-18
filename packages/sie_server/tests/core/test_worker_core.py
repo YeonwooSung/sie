@@ -16,6 +16,54 @@ from sie_server.core.worker import model_worker as model_worker_module
 from sie_server.types.inputs import Item
 
 
+@pytest.fixture(params=["asyncio", "uvloop"])
+def ready_loop_factory(request: pytest.FixtureRequest):
+    if request.param == "uvloop":
+        return pytest.importorskip("uvloop").new_event_loop
+    return asyncio.new_event_loop
+
+
+@pytest.mark.parametrize("stage", ["before_start", "before_resolve", "after_resolve_before_resume"])
+def test_ready_callback_checkpoint_cancellation(
+    stage: str, monkeypatch: pytest.MonkeyPatch, ready_loop_factory
+) -> None:
+    async def check() -> None:
+        """Cancellation cannot leave an owned callback or resolve a cancelled Future."""
+        loop = asyncio.get_running_loop()
+        call_soon = loop.call_soon
+        handles: list[asyncio.Handle] = []
+        errors: list[dict] = []
+        old_handler = loop.get_exception_handler()
+
+        def record_callback(callback, *args, context=None):
+            handle = call_soon(callback, *args, context=context)
+            if getattr(callback, "__module__", None) == model_worker_module.__name__:
+                handles.append(handle)
+            return handle
+
+        monkeypatch.setattr(loop, "call_soon", record_callback)
+        loop.set_exception_handler(lambda _loop, context: errors.append(context))
+        try:
+            task = asyncio.create_task(model_worker_module._yield_ready_callbacks())
+            if stage == "before_start":
+                task.cancel()
+            elif stage == "before_resolve":
+                loop.call_soon(task.cancel)
+            else:
+                loop.call_soon(lambda: loop.call_soon(task.cancel))
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0)
+            assert len(handles) == (0 if stage == "before_start" else 1)
+            assert all(handle.cancelled() for handle in handles)
+            assert errors == []
+        finally:
+            loop.set_exception_handler(old_handler)
+
+    with asyncio.Runner(loop_factory=ready_loop_factory) as runner:
+        runner.run(check())
+
+
 class TestRequestMetadata:
     """Tests for RequestMetadata dataclass."""
 
@@ -713,6 +761,68 @@ class TestModelWorker:
             assert call_sizes == [2]
         finally:
             await worker.stop()
+
+    @pytest.mark.parametrize("warmup", [False, True])
+    def test_ready_producer_callbacks_join_the_idle_head(
+        self, mock_adapter: MagicMock, warmup: bool, ready_loop_factory
+    ) -> None:
+        async def check() -> None:
+            """Ready transport-like callbacks create request tasks behind the worker.
+
+            A bare sleep(0) resumes the worker before those tasks. The checkpoint
+            lets their synchronous preparation and submit run without a timed wait.
+            """
+            call_sizes: list[int] = []
+            producer_callbacks: list[int] = []
+            producers_seen_at_dispatch: list[int] = []
+
+            def counting_encode(items, output_types, **kwargs):
+                call_sizes.append(len(items))
+                producers_seen_at_dispatch.append(len(producer_callbacks))
+                return EncodeOutput(dense=np.array([[0.1, 0.2, 0.3]] * len(items)), batch_size=len(items))
+
+            mock_adapter.encode.side_effect = counting_encode
+            worker = ModelWorker(
+                mock_adapter,
+                WorkerConfig(max_batch_tokens=1000, max_batch_requests=64, idle_coalesce_ms=3),
+            )
+            await worker.start()
+            tasks: list[asyncio.Task[None]] = []
+            submitted: list[asyncio.Future[WorkerResult]] = []
+            all_submitted = asyncio.Event()
+
+            async def submit_tail(index: int) -> None:
+                submitted.append(
+                    await worker.submit([make_text_item([1, 2], 0)], [Item(text=f"tail {index}")], ["dense"])
+                )
+                if len(submitted) == 7:
+                    all_submitted.set()
+
+            def produce(index: int) -> None:
+                producer_callbacks.append(index)
+                tasks.append(asyncio.create_task(submit_tail(index)))
+
+            try:
+                if warmup:
+                    warmed = await worker.submit([make_text_item([1, 2], 0)], [Item(text="warmup")], ["dense"])
+                    await asyncio.wait_for(warmed, timeout=2)
+                    call_sizes.clear()
+                    producers_seen_at_dispatch.clear()
+                first = await worker.submit([make_text_item([1, 2], 0)], [Item(text="head")], ["dense"])
+                loop = asyncio.get_running_loop()
+                for index in range(7):
+                    loop.call_soon(produce, index)
+                await asyncio.wait_for(all_submitted.wait(), timeout=2)
+                await asyncio.wait_for(asyncio.gather(first, *submitted), timeout=2)
+                assert producer_callbacks == list(range(7))
+                assert producers_seen_at_dispatch == [7]
+                assert call_sizes == [8]
+            finally:
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await worker.stop()
+
+        with asyncio.Runner(loop_factory=ready_loop_factory) as runner:
+            runner.run(check())
 
     @pytest.mark.asyncio
     async def test_already_queued_burst_fuses(self, mock_adapter: MagicMock) -> None:
