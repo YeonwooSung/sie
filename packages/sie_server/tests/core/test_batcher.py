@@ -1333,6 +1333,33 @@ class TestOverBudgetLane:
         assert batcher._extract_batch().metadata == ["long"]
         assert batcher._extract_batch().metadata == ["cheap"]
 
+    def test_an_empty_queue_restarts_the_over_budget_lane(self) -> None:
+        """The next queue follows its oldest item after an extract empties the queue."""
+        batcher: BatchFormer[ExtractPreparedItem, str] = BatchFormer(BatchConfig(max_batch_cost=100))
+        _queue(batcher, 250, "lone", at=0.0)
+        assert batcher._extract_batch().metadata == ["lone"]
+        assert batcher.pending_count == 0
+
+        _queue(batcher, 250, "over-budget", at=0.0)
+        _queue(batcher, 40, "cheap", at=1.0)
+
+        assert batcher._extract_batch().metadata == ["over-budget"]
+        assert batcher._extract_batch().metadata == ["cheap"]
+
+    def test_drain_pending_restarts_the_over_budget_lane(self) -> None:
+        """Draining the remainder of a queue clears the over-budget lane flag."""
+        batcher: BatchFormer[ExtractPreparedItem, str] = BatchFormer(BatchConfig(max_batch_cost=100))
+        _queue(batcher, 250, "over-budget", at=0.0)
+        _queue(batcher, 40, "cheap", at=1.0)
+        assert batcher._extract_batch().metadata == ["over-budget"]
+
+        assert batcher.drain_pending() == ["cheap"]
+        assert batcher.pending_count == 0
+
+        _queue(batcher, 250, "next-over-budget", at=0.0)
+        _queue(batcher, 40, "next-cheap", at=1.0)
+        assert batcher._extract_batch().metadata == ["next-over-budget"]
+
     def test_over_budget_items_run_in_arrival_order(self) -> None:
         """A newer, cheaper over-budget row does not pass an older one."""
         batcher: BatchFormer[ExtractPreparedItem, str] = BatchFormer(BatchConfig(max_batch_cost=100))
@@ -1414,6 +1441,8 @@ class TestOverBudgetLane:
                 oldest_over = min(pending, key=lambda request: request.arrival_time).item.cost > budget
                 assert over is (oldest_over if last_over is None else not last_over)
             last_over = over
+            if batcher.pending_count == 0:
+                last_over = None
             if over:
                 ahead, cheap_batches = waits.pop(batch.metadata[0])
                 assert cheap_batches <= ahead + 1

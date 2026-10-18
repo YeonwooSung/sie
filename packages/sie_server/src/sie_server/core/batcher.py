@@ -619,10 +619,12 @@ class BatchFormer[I: HasCost, T]:
             len(self._pending),
         )
 
-        # Reset timers if we've emptied the queue
+        # Reset timers if we've emptied the queue. The next queue follows its
+        # oldest item. The runs_alone lane keeps its turn across an empty queue.
         if not self._pending:
             self._first_request_time = None
             self._last_submit_time = None
+            self._last_over_budget_batch = None
 
         return FormattedBatch(
             items=batch_items,
@@ -660,6 +662,8 @@ class BatchFormer[I: HasCost, T]:
         self._total_cost = 0
         self._first_request_time = None
         self._last_submit_time = None
+        # Same restart as an empty extract. runs_alone still keeps its turn.
+        self._last_over_budget_batch = None
         return metadata
 
     async def try_drain(self, max_items: int | None = None) -> FormattedBatch[I, T] | None:
