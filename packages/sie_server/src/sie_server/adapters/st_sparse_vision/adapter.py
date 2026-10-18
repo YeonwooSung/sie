@@ -21,6 +21,7 @@ from huggingface_hub import snapshot_download
 from sentence_transformers import SparseEncoder
 
 from sie_server.adapters._base_adapter import BaseAdapter
+from sie_server.adapters._sentence_transformer_trust import load_sentence_transformer
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
 from sie_server.adapters._utils import validate_output_types
@@ -106,7 +107,7 @@ class SparseEncoderVisionAdapter(BaseAdapter):
             load_kwargs["revision"] = self._revision
         if self._trust_remote_code:
             self._register_remote_code_dir()
-        self._model = SparseEncoder(self._model_name_or_path, **load_kwargs)
+        self._model = load_sentence_transformer(SparseEncoder, self._model_name_or_path, **load_kwargs)
 
         if self._max_seq_length is not None:
             self._model.max_seq_length = self._max_seq_length
