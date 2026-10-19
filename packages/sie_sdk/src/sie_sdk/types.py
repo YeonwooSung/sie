@@ -9,6 +9,7 @@ These types support flexible Python inputs
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal, Never, NotRequired, Required, TypedDict
 
@@ -142,6 +143,27 @@ class TimingInfo(TypedDict, total=False):
     inference_ms: float
 
 
+class GatewayTimingInfo(TypedDict, total=False):
+    """Terminal response-header durations, in milliseconds.
+
+    Queue gateways report independent worker maxima, not additive request
+    phases. Their worker queue timing can include execution because it is
+    measured from publication to result. Queue/inference zero can be a gateway
+    missing-value fallback; any zero can also reflect header rounding. Direct
+    servers can report their own stage timings under the same worker headers.
+    Missing fields stay absent. These durations do not measure the complete
+    gateway request or client round trip.
+    """
+
+    publish_ms: float
+    result_wait_ms: float
+    worker_queue_ms_max: float
+    worker_inference_ms_max: float
+    worker_tokenization_ms_max: float
+    worker_postprocessing_ms_max: float
+    worker_payload_fetch_ms_max: float
+
+
 class RequestUsage(TypedDict, total=False):
     """Authoritative metered units for one completed inference request.
 
@@ -161,6 +183,10 @@ class RequestUsage(TypedDict, total=False):
     :attr:`RequestMetadata.credits_debited` for the authoritative answer: the
     SDK fills it from this block when present and from that header otherwise,
     so it is absent only when nothing was charged.
+
+    ``credits_charged_decimal`` is the same charge with up to six decimals, as
+    a string such as ``"0.140000"``. It is optional: a response may carry
+    ``credits_charged`` without it.
     """
 
     input_tokens: int
@@ -172,6 +198,7 @@ class RequestUsage(TypedDict, total=False):
     audio_ms: int
     credits_charged: int
     rate_book_version: str
+    credits_charged_decimal: str
 
 
 #: The metered dimensions of :class:`RequestUsage` — the units a consumer
@@ -184,7 +211,23 @@ TERMINAL_UNIT_FIELDS: frozenset[str] = frozenset(
 #: their only writer; it adds them to the `usage` block of every settled
 #: response it can rewrite. They are NOT metered dimensions and must never be
 #: summed as one.
-SETTLED_CHARGE_FIELDS: frozenset[str] = frozenset({"credits_charged", "rate_book_version"})
+SETTLED_CHARGE_FIELDS: frozenset[str] = frozenset({"credits_charged", "rate_book_version", "credits_charged_decimal"})
+
+#: The settled-charge annotations a settled response may omit.
+OPTIONAL_SETTLED_CHARGE_FIELDS: frozenset[str] = frozenset({"credits_charged_decimal"})
+
+_CREDITS_DECIMAL = re.compile(r"(0|[1-9][0-9]*)\.[0-9]{6}")
+
+
+def parse_credits_decimal(value: Any) -> str | None:
+    """Return ``value`` when it is a six-decimal credit string such as ``"0.140000"``.
+
+    Anything else, including a number, is treated as absent.
+    """
+    if isinstance(value, str) and value.isascii() and _CREDITS_DECIMAL.fullmatch(value):
+        return value
+    return None
+
 
 #: Every key the `usage` block is allowed to carry, as a single set.
 #:
@@ -220,6 +263,10 @@ class RequestMetadata(TypedDict, total=False):
     #: ``usage`` — does mean nothing was charged. Streamed responses carry no
     #: headers at all: their charge rides the terminal usage chunk.
     credits_debited: int
+    #: ``credits_debited`` with up to six decimals, such as ``"0.140000"``, when
+    #: the response reported it (``usage.credits_charged_decimal`` or the
+    #: ``x-sie-credits-debited-decimal`` header).
+    credits_debited_decimal: str
     #: Immutable rate-book version that rated ``credits_debited``, when the
     #: response reported one.
     rate_book_version: str
@@ -256,6 +303,8 @@ class EncodeResult(TypedDict, total=False):
             the default dtype; an explicit output_dtype request overrides it.
         request: Request-scoped id, metered usage, and settled debit when
             supplied by the gateway.
+        gateway_timing: Optional terminal response-header durations,
+            distinct from the response body's timing breakdown.
     """
 
     model: str
@@ -264,6 +313,7 @@ class EncodeResult(TypedDict, total=False):
     sparse: SparseResult
     multivector: NDArray[np.float16] | NDArray[np.float32]
     timing: TimingInfo
+    gateway_timing: GatewayTimingInfo
     request: RequestMetadata
 
 
@@ -404,8 +454,15 @@ class ModelInfo(TypedDict, total=False):
     dims: ModelDims
     max_sequence_length: int | None
     revision: str | None
+    description: str
+    """One line about the model; ``""`` when the catalog sets none."""
+    release_date: str
+    """Release date of the served weights, ``YYYY-MM-DD``; ``""`` when the catalog sets none."""
     profiles: dict[str, ProfileInfo]
     """Servable profiles keyed by name; address one as ``"model@profile"``."""
+
+    lora_adapters: list[str]
+    """Single-server ready LoRA names; absent on gateways (not fleet residency)."""
 
     capabilities: ModelCapabilities | None
     """``None`` for models that declare no ``generate`` task."""
@@ -574,6 +631,35 @@ class ExtractResult(TypedDict, total=False):
     request: RequestMetadata
 
 
+class SystemOneUsage(TypedDict):
+    """Tokens a System One call read. Decision models generate none.
+
+    ``input_tokens`` is the metered count the response reported (SIE
+    Serverless meters every request); ``0`` when the deployment reports no
+    metering. ``POST /v1/systemone`` itself always returns the worker's count.
+    """
+
+    input_tokens: int
+    output_tokens: int
+
+
+class SystemOneResult(TypedDict):
+    """Answers to typed questions, in the System One response shape.
+
+    Attributes:
+        model: The decision model that answered.
+        answers: One answer per question id. ``noul``: ``noul``, the
+            probability of yes. ``choice``: ``choice``, ``confidence`` and
+            ``probabilities`` by option. ``score``: ``score``, ``confidence``,
+            and ``legend`` and ``probabilities`` by level index (``"0"``...).
+        usage: Tokens the model read.
+    """
+
+    model: str
+    answers: dict[str, dict[str, Any]]
+    usage: SystemOneUsage
+
+
 # Streaming generation result. Streaming happens inside the gateway/worker;
 # the SDK surfaces the aggregated outcome plus SIE-native timing metadata
 # (TTFT, TPOT, attempt_id). Future SDK additions may surface chunks as an
@@ -656,6 +742,7 @@ class GenerationUsage(TypedDict):
     prompt_tokens_details: NotRequired[PromptTokensDetails]
     credits_charged: NotRequired[int]
     rate_book_version: NotRequired[str]
+    credits_charged_decimal: NotRequired[str]
 
 
 class GenerateResult(TypedDict, total=False):
@@ -788,6 +875,8 @@ class ChatMessage(TypedDict, total=False):
     for vision-capable generation models, base64 ``data:`` image parts);
     ``tool_calls`` / ``tool_call_id`` are honoured on the multi-turn tool-replay
     path. See the gateway schema for the canonical accepted subset.
+    ``reasoning_content`` is the model's reasoning on a response message,
+    present only when the request set ``include_reasoning``.
     """
 
     role: ChatRole
@@ -795,6 +884,7 @@ class ChatMessage(TypedDict, total=False):
     name: str
     tool_call_id: str
     tool_calls: list[dict[str, Any]]
+    reasoning_content: str
 
 
 class ChatUsage(TypedDict):
@@ -830,11 +920,16 @@ class ChatCompletion(TypedDict, total=False):
 
 
 class ChatDelta(TypedDict, total=False):
-    """Incremental delta emitted on each streaming chunk."""
+    """Incremental delta emitted on each streaming chunk.
+
+    ``reasoning_content`` carries the model's reasoning, present only when
+    the request set ``include_reasoning``.
+    """
 
     role: str
     content: str
     tool_calls: list[dict[str, Any]]
+    reasoning_content: str
 
 
 class ChatChunkChoice(TypedDict, total=False):
@@ -1247,7 +1342,12 @@ ClusterModelInfo = ModelSummary
 
 
 class ServerInfo(TypedDict):
-    """Server metadata included in worker status."""
+    """Server metadata included in worker status.
+
+    ``user``, ``working_dir`` and ``pid`` are deprecated: the server sends
+    ``""``, ``""`` and ``0``, and the fields will be removed no earlier than
+    0.13.0.
+    """
 
     version: str
     uptime_seconds: int
@@ -1444,6 +1544,7 @@ class JobPreflight(TypedDict, total=False):
     """The preflight reservation echoed on submit / status."""
 
     estimated_credits: int
+    estimated_credits_decimal: str
     estimate_basis: str
 
 
@@ -1538,6 +1639,8 @@ class CostEstimate(TypedDict):
     endpoint: str
     identity: RateIdentity
     estimated_credits: int
+    #: ``estimated_credits`` with up to six decimals, such as ``"0.140000"``.
+    estimated_credits_decimal: NotRequired[str]
     unit_ceilings: dict[str, int]
     applied_rates: list[AppliedRate]
     rate_book_version: str
@@ -1716,6 +1819,9 @@ class JobChunk(TypedDict, total=False):
     #: settlement is acknowledged. A job settles per chunk, so these sum to the
     #: job's ``settled_credits`` exactly.
     credits_charged: int | None
+    #: ``credits_charged`` with up to six decimals, such as ``"0.140000"``, or
+    #: ``None`` when the chunk did not report it.
+    credits_charged_decimal: str | None
     #: Immutable rate-book version that rated ``credits_charged``. Present
     #: exactly when ``credits_charged`` is.
     rate_book_version: str | None
@@ -1772,6 +1878,7 @@ class JobStatus(TypedDict, total=False):
     completed_items: int
     preflight: JobPreflight
     settled_credits: int
+    settled_credits_decimal: str
     created_at: float
     finished_at: float | None
     output: dict[str, Any]
@@ -1823,6 +1930,7 @@ class JobResults(TypedDict, total=False):
     state: JobState | None
     total_items: int | None
     settled_credits: int | None
+    settled_credits_decimal: str | None
     chunks: list[JobChunk]
     retrieved: int
     dims: int | None

@@ -17,6 +17,9 @@ executable.
   key — a silently renamed meter — without also rejecting the settled charge
   that legitimately rides alongside it. See issue #3063 for the failure this
   exists to prevent.
+  `optional_settled_charge_fields` lists the settled fields a settled response
+  may omit; `credits_charged_decimal` is the charge with up to six decimals as
+  a string such as `"0.140000"`, next to the integer `credits_charged`.
 - `model_info.json` — the field set of one `/v1/models` entry, split into
   `typed` (an SDK `ModelInfo` MUST declare it) and `excluded` (an SDK MUST NOT
   declare it, with the reason recorded per key).
@@ -47,6 +50,10 @@ executable.
   response headers that say which side served (`X-SIE-Served-By`,
   `X-SIE-Upstream`, `X-SIE-Fallback-Reason`, `X-SIE-Fallback-Error`), each with
   its allowed values or pattern. An SDK drops a value outside them.
+- `upstream_failure_reasons.json` — the `reason` that names the class of a
+  remote upstream's failure on a generation error, the fixed message an
+  `inference_error` of each class carries in place of the worker's own text,
+  and the terminal error object a worker publishes for one of them.
 - `worker_status.json` — the worker heartbeat the sidecar publishes on
   `sie.health.<worker_id>`: the exact `fields` it sends, the
   `omitted_when_empty` fields it leaves out when empty, and a fully populated
@@ -101,14 +108,21 @@ fixture set. Current consumers:
   (asserts that the `X-SIE-Served-By` and `X-SIE-Upstream` names and the
   served-by values it emits are the ones `serving_disclosure.json` declares,
   and checks every gateway vector of `remote_routing.json` through its
-  handlers and its fallback refusal).
+  handlers and its fallback refusal), and
+  `packages/sie_gateway/src/queue/streaming.rs` (the reasons it admits and
+  their messages are `upstream_failure_reasons.json`, and it reads the reason
+  of its worker terminal error).
 - Server — `packages/sie_server/tests/adapters/test_remote_fallback.py` (each
   disclosure header the single server sends on a response served locally,
   remotely or through a bridge, and on the local refusal that answers a failed
   remote attempt, has a value or pattern `serving_disclosure.json` declares),
-  and `packages/sie_server/tests/api/test_remote_routing.py` (checks every
+  `packages/sie_server/tests/api/test_remote_routing.py` (checks every
   single-server vector of `remote_routing.json` through the routing decision
-  and the refusal that answers a failed remote attempt).
+  and the refusal that answers a failed remote attempt), and
+  `packages/sie_server/tests/api/test_remote_chat.py` (the reasons and messages
+  the server sends are `upstream_failure_reasons.json`), and
+  `packages/sie_server/tests/processors/test_remote_chat.py` (a worker whose
+  upstream answered 402 publishes its worker terminal error).
 - Worker sidecar — `packages/sie_server_sidecar/src/health_publisher.rs`
   (the published key set equals `fields`, minus `omitted_when_empty` when those
   are empty) and gateway — `packages/sie_gateway/src/types/worker.rs` (the

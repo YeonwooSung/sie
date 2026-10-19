@@ -12,6 +12,7 @@ import torch
 
 from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
+from sie_server.adapters._transformers_compat import install_transformers_security_fixes
 from sie_server.adapters._types import ComputePrecision
 from sie_server.core.inference_output import EncodeOutput, ExtractOutput
 from sie_server.core.prepared import AudioPayload
@@ -79,6 +80,7 @@ class WhisperAdapter(BaseAdapter):
             dtype,
             self._attn_implementation,
         )
+        install_transformers_security_fixes()
         self._processor = AutoProcessor.from_pretrained(
             self._model_name_or_path,
             **shared_kwargs,
@@ -192,15 +194,22 @@ class WhisperAdapter(BaseAdapter):
                 timestamp_mode = "word"
             else:
                 timestamp_mode = long_form or "segment" in granularities
-            group_outputs = self._pipeline(
-                [pipeline_inputs[index] for index in indices],
-                # Long-form features keep each recording's full frame count, and
-                # the pipeline cannot pad different lengths into one batch.
-                batch_size=1 if long_form else self._pipeline_batch_size,
-                return_timestamps=timestamp_mode,
-                return_language=True,
-                generate_kwargs=generation_kwargs,
-            )
+            attn_implementation = self._model.config._attn_implementation
+            try:
+                group_outputs = self._pipeline(
+                    [pipeline_inputs[index] for index in indices],
+                    # Long-form features keep each recording's full frame count, and
+                    # the pipeline cannot pad different lengths into one batch.
+                    batch_size=1 if long_form else self._pipeline_batch_size,
+                    return_timestamps=timestamp_mode,
+                    return_language=True,
+                    generate_kwargs=generation_kwargs,
+                )
+            finally:
+                # Word timestamps make Whisper's generate() switch the shared
+                # model config to eager attention, and it never switches back,
+                # so every later batch in this process would run eager too.
+                self._model.config._attn_implementation = attn_implementation
             if isinstance(group_outputs, dict):
                 group_outputs = [group_outputs]
             if len(group_outputs) != len(indices):

@@ -57,6 +57,7 @@ from sie_sdk.jobs import (
     require_connection_schema_policy,
     require_connector_idempotency_key,
 )
+from sie_sdk.systemone import SYSTEM_ONE_OPTIONS, system_one_request, system_one_result
 from sie_sdk.types import (
     Batch,
     BatchList,
@@ -92,7 +93,9 @@ from sie_sdk.types import (
     ResponseResult,
     ScoreResult,
     StatusMessage,
+    SystemOneResult,
     WorkerInfo,
+    parse_credits_decimal,
 )
 
 from ._shared import (
@@ -123,6 +126,7 @@ from ._shared import (
     SERVER_VERSION_HEADER,
     _coerce_token_count,
     admission_retry_delay,
+    attach_gateway_timing,
     attach_request_metadata,
     attempt_timeout_cap,
     base_url_accepts_origin_credentials,
@@ -144,6 +148,7 @@ from ._shared import (
     is_transient_connect_error,
     modal_continuation_path,
     next_stream_retry_delay,
+    parse_cost_estimate,
     parse_encode_results,
     parse_extract_results,
     parse_gpu_param,
@@ -167,11 +172,12 @@ from ._shared import (
     valid_stream_request_id,
     validate_base_url,
     validate_batch_result_count,
+    validate_encode_traceparent,
     validate_generate_grammar,
     validate_generate_request_body,
     websocket_matches_base_url_origin,
 )
-from ._sse import aiter_sse_payloads
+from ._sse import SSECompletion, aiter_sse_payloads
 from .errors import (
     JobFailedError,
     LoraLoadingError,
@@ -291,6 +297,9 @@ def _parse_generate_result_async(
         settled = settled_charge_from_usage(usage)
         if settled is not None:
             parsed_usage["credits_charged"], parsed_usage["rate_book_version"] = settled
+            credits_decimal = parse_credits_decimal(usage.get("credits_charged_decimal"))
+            if credits_decimal is not None:
+                parsed_usage["credits_charged_decimal"] = credits_decimal
         result["usage"] = parsed_usage
     attempt_id = data.get("attempt_id")
     if isinstance(attempt_id, str):
@@ -661,13 +670,16 @@ class SIEAsyncClient:
         timeout_s: float | None = None,
         include_base_url_headers: bool = True,
         client_timeout: aiohttp.ClientTimeout | None = None,
+        traceparent: str | None = None,
     ) -> _AioResponse:
         kw: dict[str, Any] = {}
         if data is not None:
             kw["data"] = data
         if json_data is not None:
             kw["json"] = json_data
-        request_headers = self._headers_for_request(url, headers, include_base_url_headers=include_base_url_headers)
+        request_headers = self._headers_for_request(
+            url, headers, include_base_url_headers=include_base_url_headers, traceparent=traceparent
+        )
         if request_headers:
             kw["headers"] = request_headers
         if client_timeout is not None:
@@ -717,11 +729,21 @@ class SIEAsyncClient:
         headers: Mapping[str, str] | None,
         *,
         include_base_url_headers: bool = True,
+        traceparent: str | None = None,
     ) -> dict[str, str]:
         """Build detached request headers with exact-origin edge credentials."""
         merged = dict(headers or {})
         if include_base_url_headers and self._base_url_headers and request_matches_base_url_origin(self._base_url, url):
             merged.update(self._base_url_headers)
+        if (
+            traceparent is not None
+            and include_base_url_headers
+            and request_matches_base_url_origin(self._base_url, url)
+        ):
+            merged = {
+                name: value for name, value in merged.items() if name.lower() not in {"traceparent", "tracestate"}
+            }
+            merged["traceparent"] = traceparent
         return merged
 
     def _check_server_version(self, response: _AioResponse) -> None:
@@ -743,6 +765,7 @@ class SIEAsyncClient:
         start_time: float,
         budget_s: float,
         accept: str = JSON_CONTENT_TYPE,
+        traceparent: str | None = None,
     ) -> _AioResponse:
         """Consume bounded same-origin Modal 303 result URLs without replaying POST."""
         for _ in range(MODAL_CONTINUATION_MAX_HOPS):
@@ -758,7 +781,7 @@ class SIEAsyncClient:
                     self._throttle(),
                     self._ensure_session().get(
                         path,
-                        headers=self._headers_for_request(path, {"Accept": accept}),
+                        headers=self._headers_for_request(path, {"Accept": accept}, traceparent=traceparent),
                         timeout=self._attempt_timeout(remaining),
                         allow_redirects=False,
                     ) as raw,
@@ -1327,6 +1350,7 @@ class SIEAsyncClient:
         wait_for_capacity: bool = True,
         provision_timeout_s: float | None = None,
         max_oom_retries: int = RESOURCE_EXHAUSTED_MAX_RETRIES,
+        traceparent: str | None = None,
     ) -> EncodeResult: ...
 
     @overload
@@ -1344,6 +1368,7 @@ class SIEAsyncClient:
         wait_for_capacity: bool = True,
         provision_timeout_s: float | None = None,
         max_oom_retries: int = RESOURCE_EXHAUSTED_MAX_RETRIES,
+        traceparent: str | None = None,
     ) -> list[EncodeResult]: ...
 
     async def encode(
@@ -1360,8 +1385,10 @@ class SIEAsyncClient:
         wait_for_capacity: bool = True,
         provision_timeout_s: float | None = None,
         max_oom_retries: int = RESOURCE_EXHAUSTED_MAX_RETRIES,
+        traceparent: str | None = None,
     ) -> EncodeResult | list[EncodeResult]:
         """Async version of encode(). See SIEClient.encode() for details."""
+        validate_encode_traceparent(traceparent)
         self._reset_retry_count()
         # Track if single item was passed
         single_item = not isinstance(items, list)
@@ -1440,6 +1467,7 @@ class SIEAsyncClient:
                     data=body,
                     headers=headers,
                     client_timeout=request_timeout,
+                    traceparent=traceparent,
                 )
             except _RETRYABLE_TRANSPORT_ERRORS as e:
                 if wait_for_capacity:
@@ -1486,6 +1514,7 @@ class SIEAsyncClient:
                 start_time=start_time,
                 budget_s=timeout,
                 accept=MSGPACK_CONTENT_TYPE,
+                traceparent=traceparent,
             )
 
             # Short-circuit terminal load failures.
@@ -1636,6 +1665,7 @@ class SIEAsyncClient:
                 result["timing"] = timing
 
         attach_request_metadata(results, response.headers, response_data)
+        attach_gateway_timing(results, response.headers)
         # Guard the 1:1 input↔output contract before any positional access
         # (``results[0]`` below, or batch reassembly in callers). The gateway's
         # queue path returns mixed-success batches as 200 with only the
@@ -1705,6 +1735,66 @@ class SIEAsyncClient:
 
         return cast("Recommendation", response.json())
 
+    async def system_one(
+        self,
+        model: str,
+        state: str | Mapping[str, Any] | list[Any],
+        questions: Mapping[str, Any],
+        *,
+        options: dict[str, Any] | None = None,
+        gpu: str | None = None,
+        wait_for_capacity: bool = True,
+        provision_timeout_s: float | None = None,
+    ) -> SystemOneResult:
+        """Answer typed questions about one state (System One).
+
+        Answers ``noul`` (yes/no), ``choice`` (pick one) and ``score``
+        (ordinal) questions about a text, a JSON object, or a list of
+        conversation turns with a decision model, in the response shape of
+        SIE's System One-compatible ``POST /v1/systemone``. It runs as one
+        ``extract`` call, so it waits for capacity and model loading like
+        :meth:`extract`. A state or question set that does not fit the model's
+        window raises instead of being truncated.
+
+        Args:
+            model: A decision model, e.g. ``"fastino/GLiNER2.5-Decide"``.
+            state: The text to judge, a JSON object, or a list of turns.
+            questions: Typed questions by id, ``{"type", "instructions"?,
+                "criteria"?}``; a score question takes at most 10 levels.
+            options: Runtime options, as for :meth:`extract`.
+            gpu: Target GPU type, as for :meth:`extract`.
+            wait_for_capacity: As for :meth:`extract`.
+            provision_timeout_s: As for :meth:`extract`.
+
+        Returns:
+            ``{"model", "answers", "usage"}``, one answer per question id.
+
+        Raises:
+            RequestError: A malformed question or state, input that does not
+                fit the model's window, or a model that does not answer typed
+                questions. Otherwise as :meth:`extract`.
+
+        Example:
+            >>> result = await client.system_one(
+            ...     "fastino/GLiNER2.5-Decide",
+            ...     "I was charged twice. Please fix this ASAP.",
+            ...     {"spam": {"type": "noul", "instructions": "Is this spam?"}},
+            ... )
+            >>> sorted(result["answers"]["spam"])
+            ['answer', 'confidence', 'noul', 'type']
+        """
+        item, output_schema = system_one_request(state, questions)
+        result = await self.extract(
+            model,
+            item,
+            output_schema=output_schema,
+            options={**(options or {}), **SYSTEM_ONE_OPTIONS},
+            gpu=gpu,
+            wait_for_capacity=wait_for_capacity,
+            provision_timeout_s=provision_timeout_s,
+        )
+        return system_one_result(model, result, output_schema)
+
     async def estimate(
         self,
         endpoint: str,
@@ -1739,7 +1829,7 @@ class SIEAsyncClient:
             raise_if_estimate_unroutable(response)
             handle_error(response)
 
-        return cast("CostEstimate", response.json())
+        return parse_cost_estimate(response.json())
 
     async def get_model(self, model: str) -> ModelInfo:
         """Async version of get_model(). See SIEClient.get_model() for details."""
@@ -2554,6 +2644,7 @@ class SIEAsyncClient:
         user: str | None = None,
         safety_identifier: str | None = None,
         lora_adapter: str | None = None,
+        include_reasoning: bool | None = None,
         gpu: str | None = None,
         extra_body: dict[str, Any] | None = None,
         wait_for_capacity: bool = True,
@@ -2604,6 +2695,7 @@ class SIEAsyncClient:
                 user=user,
                 safety_identifier=safety_identifier,
                 lora_adapter=lora_adapter,
+                include_reasoning=include_reasoning,
                 extra_body=extra_body,
             )
         ).encode("utf-8")
@@ -2709,6 +2801,7 @@ class SIEAsyncClient:
         safety_identifier: str | None = None,
         lora_adapter: str | None = None,
         stream_options: dict[str, Any] | None = None,
+        include_reasoning: bool | None = None,
         gpu: str | None = None,
         extra_body: dict[str, Any] | None = None,
         wait_for_capacity: bool = True,
@@ -2753,6 +2846,7 @@ class SIEAsyncClient:
                 safety_identifier=safety_identifier,
                 lora_adapter=lora_adapter,
                 stream_options=stream_options,
+                include_reasoning=include_reasoning,
                 extra_body=extra_body,
             )
         ).encode("utf-8")
@@ -2872,6 +2966,8 @@ class SIEAsyncClient:
         an HTTP 503 or as the first SSE event. Once a chunk has been yielded a
         failure is terminal (non-idempotent). The ``async with`` keeps the
         connection open while the caller consumes the generator.
+        A natural EOF requires an explicit or semantic completion marker;
+        an interrupted generation is never retried.
         """
         self._reset_retry_count()
         timeout = provision_timeout_s if provision_timeout_s is not None else DEFAULT_PROVISION_TIMEOUT_S
@@ -2929,7 +3025,13 @@ class SIEAsyncClient:
                     else:
                         self._check_server_version(_AioResponse(raw.status, b"", raw.headers))
                         yielded_chunk = False
-                        async for payload in aiter_sse_payloads(_aiter_text_lines(raw.content)):
+                        chat_choices = None
+                        if url == "/v1/chat/completions":
+                            chat_choices = json.loads(body).get("n")
+                            if chat_choices is None:
+                                chat_choices = 1
+                        completion = SSECompletion(chat_choices=chat_choices)
+                        async for payload in aiter_sse_payloads(_aiter_text_lines(raw.content), completion=completion):
                             try:
                                 chunk = json.loads(payload)
                             except json.JSONDecodeError as e:
@@ -2985,9 +3087,11 @@ class SIEAsyncClient:
                                         request=parse_request_metadata(error_headers),
                                         retry_after=float(retry_after_s) if retry_after_s is not None else None,
                                     )
+                            completion.observe(chunk)
                             yield chunk
                             yielded_chunk = True
                         else:
+                            completion.require_complete()
                             return
             except _CONNECT_PHASE_ERRORS as e:
                 if wait_for_capacity and is_transient_connect_error(e):
@@ -3525,6 +3629,7 @@ class _AsyncJobs(_AsyncNamespace):
                 "state": state,
                 "total_items": total_items,
                 "settled_credits": job.get("settled_credits"),
+                "settled_credits_decimal": parse_credits_decimal(job.get("settled_credits_decimal")),
                 "chunks": chunks,
                 "retrieved": retrieved,
                 "dims": dims,

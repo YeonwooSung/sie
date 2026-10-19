@@ -9,8 +9,10 @@ from typing import TYPE_CHECKING, Any, Literal
 import torch
 import torch.nn.functional as F
 
+from sie_server.adapters._transformers_compat import install_transformers_security_fixes
 from sie_server.adapters._vision_patch_embed import rebind_vision_patch_embed
 from sie_server.adapters.base import ModelAdapter, ModelCapabilities, ModelDims
+from sie_server.adapters.lighton_ocr._markdown import lightonocr3_markdown
 from sie_server.core.inference_output import EncodeOutput, ExtractOutput
 from sie_server.core.prepared import LightOnOCR3Payload, LightOnOCRPayload, PreparedItem
 from sie_server.core.preprocessor import LightOnOCRPreprocessor
@@ -130,6 +132,7 @@ class LightOnOCRAdapter(ModelAdapter):
             self._attn_implementation,
         )
 
+        install_transformers_security_fixes()
         self._processor = LightOnOcrProcessor.from_pretrained(
             self._model_name_or_path,
             **shared_kwargs,
@@ -535,8 +538,12 @@ class LightOnOCR3Adapter(LightOnOCRAdapter):
         top_p: float = 1.0,
         attn_implementation: str = "sdpa",
         revision: str | None = None,
+        output_postprocess: str | None = None,
         **kwargs: Any,
     ) -> None:
+        if output_postprocess not in (None, "lightonocr3_markdown"):
+            msg = "output_postprocess must be None or 'lightonocr3_markdown'"
+            raise ValueError(msg)
         if "system_prompt" in kwargs or "user_text" in kwargs:
             msg = "LightOnOCR-3 uses only its trained image-only or grounding prompt"
             raise ValueError(msg)
@@ -559,6 +566,7 @@ class LightOnOCR3Adapter(LightOnOCRAdapter):
         )
         self._temperature = temperature
         self._top_p = top_p
+        self._output_postprocess = output_postprocess
         self._generation_options({})
 
     def load(self, device: str) -> None:
@@ -571,6 +579,7 @@ class LightOnOCR3Adapter(LightOnOCRAdapter):
         shared_kwargs: dict[str, Any] = {"trust_remote_code": False}
         if self._revision is not None:
             shared_kwargs["revision"] = self._revision
+        install_transformers_security_fixes()
         self._processor = AutoProcessor.from_pretrained(self._model_name_or_path, **shared_kwargs)
         self._model = Qwen3_5ForConditionalGeneration.from_pretrained(
             self._model_name_or_path,
@@ -623,7 +632,7 @@ class LightOnOCR3Adapter(LightOnOCRAdapter):
         options: dict[str, Any] | None = None,
         prepared_items: list[Any] | None = None,
     ) -> ExtractOutput:
-        """Return raw Markdown or grounding text; only the exact trained modes are supported."""
+        """Extract with the trained prompts and optional loadtime Markdown conversion."""
         if self._model is None or self._processor is None or self._preprocessor is None or self._device is None:
             raise RuntimeError(_ERR_NOT_LOADED)
         instruction = LightOnOCR3Preprocessor.validate_instruction(instruction)
@@ -658,6 +667,8 @@ class LightOnOCR3Adapter(LightOnOCRAdapter):
             with torch.inference_mode():
                 output_ids = self._model.generate(**inputs, **generation_options)
             text = self._processor.decode(output_ids[0, prompt_len:], skip_special_tokens=True)
+            if self._output_postprocess == "lightonocr3_markdown":
+                text = lightonocr3_markdown(text)
             all_entities.append([Entity(text=text, label="markdown", score=1.0)])
         return ExtractOutput(entities=all_entities, pages=[1 for _ in items])
 

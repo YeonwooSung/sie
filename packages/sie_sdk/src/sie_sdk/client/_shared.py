@@ -28,6 +28,7 @@ _logger = logging.getLogger(__name__)
 
 _HTTP_HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _HTTP_MEDIA_TYPE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+/[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_TRACEPARENT_V00 = re.compile(r"00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}")
 _CONTENT_SAFE_MEDIA_TYPES = frozenset(
     {"application/json", "application/msgpack", "application/problem+json", "text/html"}
 )
@@ -55,6 +56,17 @@ _RESERVED_BASE_URL_HEADERS = frozenset(
 )
 MODAL_CONTINUATION_MAX_HOPS = 20
 _MODAL_CONTINUATION_QUERY_PARAMETER = "__modal_attempt_token"
+
+
+def validate_encode_traceparent(traceparent: str | None) -> None:
+    """Accept a bounded version-00 trace context without changing its flags."""
+    if traceparent is None:
+        return
+    if not isinstance(traceparent, str):
+        raise TypeError("traceparent must be a string or None")
+    match = _TRACEPARENT_V00.fullmatch(traceparent) if len(traceparent) == 55 else None
+    if match is None or match[1] == "0" * 32 or match[2] == "0" * 16:
+        raise ValueError("traceparent must be a valid W3C version-00 trace context")
 
 
 def copy_base_url_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
@@ -294,11 +306,13 @@ class _HttpResponse(Protocol):
 
 from sie_sdk.types import (
     Classification,
+    CostEstimate,
     DetectedObject,
     EncodeResult,
     EntityResult,
     ExtractItemErrorDetail,
     ExtractResult,
+    GatewayTimingInfo,
     GenerateGrammar,
     Relation,
     RequestMetadata,
@@ -306,6 +320,7 @@ from sie_sdk.types import (
     ScoreEntry,
     ScoreResult,
     SparseResult,
+    parse_credits_decimal,
 )
 
 from .errors import (
@@ -512,6 +527,13 @@ def build_estimate_envelope(endpoint: str, request: Mapping[str, Any]) -> dict[s
     return {"endpoint": endpoint, "request": dict(request)}
 
 
+def parse_cost_estimate(body: Any) -> CostEstimate:
+    """The ``/v1/estimate`` quote, without a malformed ``estimated_credits_decimal``."""
+    if isinstance(body, MutableMapping) and parse_credits_decimal(body.get("estimated_credits_decimal")) is None:
+        body.pop("estimated_credits_decimal", None)
+    return cast("CostEstimate", body)
+
+
 def raise_if_estimate_unroutable(response: _HttpResponse) -> None:
     """Raise :class:`EstimateUnroutableError` for an unpriceable estimate.
 
@@ -674,6 +696,7 @@ EXECUTION_IDENTITY_SHA256_HEADER = "X-SIE-Execution-Identity-SHA256"
 EXECUTION_BINDING_SHA256_HEADER = "X-SIE-Execution-Binding-SHA256"
 REQUEST_ID_HEADER = "X-SIE-Request-ID"
 CREDITS_DEBITED_HEADER = "X-SIE-Credits-Debited"
+CREDITS_DEBITED_DECIMAL_HEADER = "X-SIE-Credits-Debited-Decimal"
 REMOTE_HEADER = "X-SIE-Remote"
 SERVED_BY_HEADER = "X-SIE-Served-By"
 UPSTREAM_HEADER = "X-SIE-Upstream"
@@ -981,6 +1004,42 @@ def _parse_nonnegative_meter_header(headers: Any, name: str) -> int | None:
     return parsed if parsed <= _MAX_METER_VALUE else None
 
 
+_GATEWAY_TIMING_HEADERS = {
+    "publish_ms": "x-queue-publish-time",
+    "result_wait_ms": "x-queue-wait-time",
+    "worker_queue_ms_max": "x-queue-time",
+    "worker_inference_ms_max": "x-inference-time",
+    "worker_tokenization_ms_max": "x-tokenization-time",
+    "worker_postprocessing_ms_max": "x-postprocessing-time",
+    "worker_payload_fetch_ms_max": "x-payload-fetch-time",
+}
+
+
+def parse_gateway_timing(headers: Any) -> GatewayTimingInfo | None:
+    """Read bounded nonnegative decimal timing headers without inventing totals."""
+    timing: dict[str, float] = {}
+    for field, header in _GATEWAY_TIMING_HEADERS.items():
+        value = _header_value(headers, header)
+        if (
+            not isinstance(value, str)
+            or not 0 < len(value) <= 64
+            or re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value) is None
+        ):
+            continue
+        parsed = float(value)
+        if math.isfinite(parsed):
+            timing[field] = parsed
+    return cast("GatewayTimingInfo", timing) if timing else None
+
+
+def attach_gateway_timing(results: Sequence[EncodeResult], headers: Any) -> None:
+    """Attach detached terminal-response timing without altering body timing."""
+    timing = parse_gateway_timing(headers)
+    if timing is not None:
+        for result in results:
+            result["gateway_timing"] = timing.copy()
+
+
 def settled_charge_from_usage(usage: Any) -> tuple[int, str] | None:
     """The settled charge carried by one ``usage`` block (#2434).
 
@@ -1100,10 +1159,17 @@ def parse_request_metadata(headers: Any, body: Any = None) -> RequestMetadata | 
         usage["rate_book_version"] = rate_book_version
         metadata["credits_debited"] = credits_charged
         metadata["rate_book_version"] = rate_book_version
+        credits_decimal = parse_credits_decimal(body["usage"].get("credits_charged_decimal"))
+        if credits_decimal is not None:
+            usage["credits_charged_decimal"] = credits_decimal
+            metadata["credits_debited_decimal"] = credits_decimal
     else:
         credits_debited = _parse_nonnegative_meter_header(headers, CREDITS_DEBITED_HEADER)
         if credits_debited is not None:
             metadata["credits_debited"] = credits_debited
+            credits_decimal = parse_credits_decimal(_header_value(headers, CREDITS_DEBITED_DECIMAL_HEADER))
+            if credits_decimal is not None:
+                metadata["credits_debited_decimal"] = credits_decimal
 
     if usage:
         metadata["usage"] = usage
@@ -1743,6 +1809,7 @@ def build_chat_body(
     safety_identifier: str | None = None,
     lora_adapter: str | None = None,
     stream_options: dict[str, Any] | None = None,
+    include_reasoning: bool | None = None,
     extra_body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the ``/v1/chat/completions`` request body (snake_case wire shape).
@@ -1786,6 +1853,7 @@ def build_chat_body(
         "safety_identifier": safety_identifier,
         "lora_adapter": lora_adapter,
         "stream_options": stream_options,
+        "include_reasoning": include_reasoning,
     }
     body.update({key: value for key, value in optional.items() if value is not None})
     if extra_body:
