@@ -158,6 +158,7 @@ def test_default_bundle_constraints_pin_transitive_deps_and_name_the_downgrade()
     assert f"gliner=={parsed.versions['gliner']}" in constraints
     # Exact bundle pins stay requirements, not constraints.
     assert not any(line.startswith("sentence-transformers==") for line in constraints)
+    assert not any(line.startswith("transformers==") for line in constraints)
     assert not any(line.startswith("pillow==") for line in constraints)
     assert not any(line.startswith("gliformer==") for line in constraints)
     assert all("[" not in line for line in constraints)
