@@ -21,17 +21,18 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+      # Keep the same explicit selection in every exec below to avoid lazy tool installs.
       - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
         with:
           version: 2026.5.5
-          install_args: --jobs=1
+          install_args: --jobs=1 python uv github:rhysd/actionlint
           cache: false
       - run: >-
-          mise exec -- uv run --frozen --project . pytest -q
+          mise exec --no-deps python uv github:rhysd/actionlint -- uv run --frozen --project . pytest -q
           tools/ci/tests/test_required_ci.py tools/ci/tests/test_public_tree.py
-      - run: mise exec -- python tools/ci/check_public_tree.py
+      - run: mise exec --no-deps python uv github:rhysd/actionlint -- python tools/ci/check_public_tree.py
       - run: >-
-          mise exec -- actionlint
+          mise exec --no-deps python uv github:rhysd/actionlint -- actionlint
           -ignore '^unexpected key "queue" for "concurrency" section\. expected one of "cancel-in-progress", "group"$'
 
   bootstrap:
