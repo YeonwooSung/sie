@@ -1451,8 +1451,9 @@ export interface ChatCompletionRequest {
   safety_identifier?: string;
   /**
    * Multi-LoRA: served-name of the adapter to apply on the worker (SIE
-   * extension). Must be a non-empty string; unknown names are rejected by
-   * the gateway with 400 `unknown_lora`.
+   * extension). A non-empty string selects an adapter; explicit `null` or
+   * omission selects the base model. Unknown names are rejected by the
+   * gateway with 400 `unknown_lora`.
    */
   lora_adapter?: string | null;
   /** SIE-native routing affinity hint. */

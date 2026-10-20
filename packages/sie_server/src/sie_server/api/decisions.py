@@ -34,6 +34,16 @@ class DecisionRequest(BaseModel):
         min_length=1, max_length=MAX_QUESTIONS, description="Predicate, choice, or score questions, in answer order."
     )
     safety_identifier: str | None = Field(default=None, max_length=128)
+    lora_adapter: str | None = Field(
+        default=None,
+        description="SIE extension: declared LoRA name or source; null selects base, omission keeps the profile default.",
+    )
+    lora: str | None = Field(
+        default=None, description="Compatibility alias for lora_adapter; supplied aliases must agree."
+    )
+    lora_id: str | None = Field(
+        default=None, description="Compatibility alias restricted to a declared source id; supplied aliases must agree."
+    )
 
 
 class DecisionUsage(BaseModel):

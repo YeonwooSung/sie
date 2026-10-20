@@ -98,6 +98,16 @@ def test_route_uses_native_worker_and_preserves_headers(dispatch):
     assert args.kwargs["options"]["overflow_policy"] == "error"
 
 
+def test_openapi_publishes_optional_nullable_lora_extensions(dispatch):
+    schema = dispatch.client.app.openapi()["paths"]["/v1/decisions"]["post"]["requestBody"]["content"][
+        "application/json"
+    ]["schema"]
+    for field in ("lora_adapter", "lora", "lora_id"):
+        assert field not in schema["required"]
+        assert {option["type"] for option in schema["properties"][field]["anyOf"]} == {"string", "null"}
+        assert schema["properties"][field]["description"]
+
+
 @pytest.mark.parametrize("case", FIXTURE["invalid_requests"], ids=lambda case: case["name"])
 def test_invalid_request_does_not_dispatch(dispatch, case):
     response = dispatch.client.post("/v1/decisions", json=case["request"])

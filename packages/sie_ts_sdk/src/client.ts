@@ -109,7 +109,7 @@ import {
   requireConnectionSchemaPolicy,
   requireConnectorIdempotencyKey,
 } from "./jobs.js";
-import { validateLoraSelectors } from "./lora.js";
+import { normalizeLoraOptions, validateLoraSelectors } from "./lora.js";
 import { packMessage, unpackMessage } from "./msgpack.js";
 import { SSECompletion, parseSseStream } from "./sse.js";
 import {
@@ -892,12 +892,12 @@ function runtimeOptions(
   adapterOptions: Record<string, unknown> | undefined,
   typed: Record<string, unknown>,
 ): Record<string, unknown> | undefined {
-  validateLoraSelectors(adapterOptions);
+  const normalized = normalizeLoraOptions(adapterOptions);
   const set = Object.fromEntries(Object.entries(typed).filter(([, value]) => value !== undefined));
   if (adapterOptions === undefined && Object.keys(set).length === 0) {
     return undefined;
   }
-  return { ...adapterOptions, ...set };
+  return { ...normalized, ...set };
 }
 
 /** The response-level timing block, in the camelCase `TimingInfo` shape. */
@@ -2101,7 +2101,7 @@ export class SIEClient {
     items: Item[],
     options: ScoreOptions = {},
   ): Promise<ScoreResult> {
-    validateLoraSelectors(options.adapterOptions);
+    const adapterOptions = normalizeLoraOptions(options.adapterOptions);
     const queryForWire = await itemImagesForWire(query);
     const itemsForWire = await itemsImagesForWire(items);
 
@@ -2113,8 +2113,8 @@ export class SIEClient {
     if (options.instruction !== undefined) {
       body.instruction = options.instruction;
     }
-    if (options.adapterOptions !== undefined) {
-      body.options = options.adapterOptions;
+    if (adapterOptions !== undefined) {
+      body.options = adapterOptions;
     }
 
     const waitForCapacity = options.waitForCapacity ?? this.defaultWaitForCapacity;

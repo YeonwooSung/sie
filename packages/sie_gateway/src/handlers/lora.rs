@@ -41,7 +41,13 @@ pub(crate) fn validate_options_rmpv(options: Option<&rmpv::Value>) -> Result<(),
     };
     let mut selected = Map::new();
     for (key, value) in fields {
-        let Some(key) = key.as_str().filter(|key| FIELDS.contains(key)) else {
+        // The generic bridge and ancestor lookup also accept UTF-8 binary keys.
+        let key = match key {
+            rmpv::Value::String(key) => key.as_str(),
+            rmpv::Value::Binary(key) => std::str::from_utf8(key).ok(),
+            _ => None,
+        };
+        let Some(key) = key.filter(|key| FIELDS.contains(key)) else {
             continue;
         };
         let value = match value {
@@ -97,8 +103,44 @@ mod tests {
             rmpv::Value::Ext(1, vec![1]),
             rmpv::Value::Boolean(false),
         ] {
-            let options = rmpv::Value::Map(vec![("lora_adapter".into(), value)]);
-            assert!(validate_options_rmpv(Some(&options)).is_err());
+            for key in FIELDS {
+                for key in [key.into(), rmpv::Value::Binary(key.as_bytes().to_vec())] {
+                    let options = rmpv::Value::Map(vec![(key, value.clone())]);
+                    assert!(validate_options_rmpv(Some(&options)).is_err());
+                }
+            }
         }
+    }
+
+    #[test]
+    fn msgpack_binary_lora_keys_preserve_selection_and_reject_duplicates() {
+        for key in FIELDS {
+            let binary_key = rmpv::Value::Binary(key.as_bytes().to_vec());
+            for value in [rmpv::Value::Nil, "legal".into()] {
+                let options = rmpv::Value::Map(vec![(binary_key.clone(), value)]);
+                assert!(validate_options_rmpv(Some(&options)).is_ok());
+            }
+            let empty = rmpv::Value::Map(vec![(binary_key.clone(), " ".into())]);
+            assert!(validate_options_rmpv(Some(&empty)).is_err());
+            for duplicate_first in [false, true] {
+                let mut fields = vec![
+                    (key.into(), "legal".into()),
+                    (binary_key.clone(), rmpv::Value::Nil),
+                ];
+                if duplicate_first {
+                    fields.reverse();
+                }
+                let error = validate_options_rmpv(Some(&rmpv::Value::Map(fields))).unwrap_err();
+                assert!(error.contains("duplicate LoRA selector"));
+            }
+        }
+        let conflict = rmpv::Value::Map(vec![
+            (
+                rmpv::Value::Binary(b"lora_adapter".to_vec()),
+                rmpv::Value::Nil,
+            ),
+            (rmpv::Value::Binary(b"lora".to_vec()), "legal".into()),
+        ]);
+        assert!(validate_options_rmpv(Some(&conflict)).is_err());
     }
 }

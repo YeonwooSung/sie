@@ -29769,6 +29769,82 @@ profiles:
     }
 
     #[tokio::test]
+    async fn binary_lora_selector_keys_fail_before_dispatch_with_supported_ancestors() {
+        let gateway = TestGateway::new(&[LORA_MODEL]).await;
+        gateway.add_worker("local-1", LOCAL_LANE, &[]).await;
+        let binary = |key: &str| rmpv::Value::Binary(key.as_bytes().to_vec());
+        for endpoint in ["encode", "extract", "score"] {
+            for field in crate::handlers::lora::FIELDS {
+                for invalid in [
+                    vec![(binary(field), rmpv::Value::F64(f64::NAN))],
+                    vec![(binary(field), " ".into())],
+                    vec![
+                        (field.into(), "legal".into()),
+                        (binary(field), rmpv::Value::Nil),
+                    ],
+                ] {
+                    let mut options = vec![("profile".into(), "served".into())];
+                    options.extend(invalid);
+                    let options = rmpv::Value::Map(options);
+                    let mut body = vec![(
+                        "items".into(),
+                        rmpv::Value::Array(vec![rmpv::Value::Map(vec![(
+                            "text".into(),
+                            "x".into(),
+                        )])]),
+                    )];
+                    if endpoint == "score" {
+                        body.push((
+                            "query".into(),
+                            rmpv::Value::Map(vec![("text".into(), "q".into())]),
+                        ));
+                        // Score rejects binary map keys before LoRA validation.
+                        body.push(("options".into(), options));
+                    } else {
+                        body.push((
+                            binary("params"),
+                            rmpv::Value::Map(vec![
+                                (binary("options"), options),
+                                ("labels".into(), rmpv::Value::Array(vec!["a".into()])),
+                            ]),
+                        ));
+                    }
+                    let mut encoded = Vec::new();
+                    rmpv::encode::write_value(&mut encoded, &rmpv::Value::Map(body)).unwrap();
+                    let request = Request::builder()
+                        .uri(format!("/v1/{endpoint}/acme/lora"))
+                        .header("content-type", "application/msgpack")
+                        .body(Body::from(encoded))
+                        .unwrap();
+                    let response =
+                        proxy_request(State(Arc::clone(&gateway.state)), request, endpoint).await;
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::BAD_REQUEST,
+                        "{endpoint}/{field}"
+                    );
+                    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                    let value: Value = serde_json::from_slice(&body).unwrap();
+                    let expected = if endpoint == "score" {
+                        "'options' field names must be MessagePack strings"
+                    } else {
+                        "lora"
+                    };
+                    assert!(
+                        value["detail"]["message"]
+                            .as_str()
+                            .is_some_and(|message| message
+                                .to_ascii_lowercase()
+                                .contains(&expected.to_ascii_lowercase())),
+                        "{endpoint}/{field}: {value}"
+                    );
+                }
+            }
+        }
+        assert!(gateway.dispatcher.dispatched().is_empty());
+    }
+
+    #[tokio::test]
     async fn an_undeclared_lora_is_refused_on_encode_extract_and_score_before_dispatch() {
         let gateway = TestGateway::new(&[LORA_MODEL]).await;
         gateway.add_worker("local-1", LOCAL_LANE, &[]).await;

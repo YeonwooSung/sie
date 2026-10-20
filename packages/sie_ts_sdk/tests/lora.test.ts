@@ -27,6 +27,40 @@ function nativeCall(client: SIEClient, kind: string, adapterOptions: Record<stri
 
 describe("LoRA selector boundaries", () => {
   for (const kind of ["encode", "extract", "score", "systemOne"]) {
+    for (const selected of [undefined, null, "legal"]) {
+      it.each(["lora_adapter", "lora", "lora_id"])(
+        `${kind} omits undefined %s alongside ${selected}`,
+        async (key) => {
+          fetchMock.mockResolvedValueOnce(refusal());
+          const other = key === "lora_adapter" ? "lora" : "lora_adapter";
+          const options = Object.freeze({
+            [key]: undefined,
+            [other]: selected,
+            profile: "served",
+            unrelated: undefined,
+          });
+          const client = new SIEClient("http://localhost:8080");
+          await expect(nativeCall(client, kind, options)).rejects.toThrow();
+          expect(fetchMock).toHaveBeenCalledOnce();
+          const body = unpackMessage(fetchMock.mock.calls[0]?.[1].body) as {
+            options: Record<string, unknown>;
+            params: { options: Record<string, unknown> };
+          };
+          const actual = kind === "score" ? body.options : body.params.options;
+          expect(actual).not.toHaveProperty(key);
+          if (selected === undefined) expect(actual).not.toHaveProperty(other);
+          else expect(actual[other]).toBe(selected);
+          expect(actual.profile).toBe("served");
+          // Only selector omission changes; unrelated MessagePack fields retain their semantics.
+          expect(actual.unrelated).toBeNull();
+          expect(Object.hasOwn(options, key)).toBe(true);
+          expect(options[key]).toBeUndefined();
+          expect(options[other]).toBe(selected);
+          await client.close();
+        },
+      );
+    }
+
     it.each(["lora_adapter", "lora", "lora_id"])(
       `${kind} preserves explicit null via %s`,
       async (key) => {
