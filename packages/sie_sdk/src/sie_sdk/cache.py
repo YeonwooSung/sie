@@ -14,7 +14,8 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING
 
 from sie_sdk.exceptions import GatedModelError
@@ -240,7 +241,8 @@ def _download_from_cluster_cache(model_id: str, config: CacheConfig) -> bool:
         return False
 
     # Create local cache directory
-    local_model_path = config.local_cache / model_folder
+    cache_root = config.local_cache.resolve()
+    local_model_path = _cache_destination(cache_root, cache_root, model_folder, directory=True)
     local_model_path.mkdir(parents=True, exist_ok=True)
 
     # Download the entire model directory structure
@@ -252,23 +254,59 @@ def _download_from_cluster_cache(model_id: str, config: CacheConfig) -> bool:
 def _download_directory(backend: StorageBackend, src_path: str, dst_path: Path) -> None:
     """Recursively download a directory from cloud storage.
 
+    The explicitly selected root may be a symlink. Descendant directories must
+    not be symlinks, and file links must remain within that root. Downloads are
+    staged privately and replaced atomically, preserving existing files on a
+    failed transfer and never writing through an existing hardlink.
+
     Args:
         backend: Storage backend instance.
         src_path: Source path in cloud storage.
         dst_path: Destination local path.
     """
-    # Download files in current directory
+    root = dst_path.resolve()
+    _download_cache_directory(backend, src_path, root, root)
+
+
+def _cache_destination(root: Path, parent: Path, name: str, *, directory: bool) -> Path:
+    """Validate an immediate backend child and its local destination."""
+    if (
+        not isinstance(name, str)
+        or name in {"", ".", ".."}
+        or any(character in name for character in ("/", "\\", "\x00"))
+        or PureWindowsPath(name).drive
+    ):
+        raise ValueError("Invalid cluster cache child name")
+    path = parent / name
+    if not path.resolve().is_relative_to(root):
+        raise ValueError("Cluster cache destination escapes its repository")
+    # Do not let directory aliases redirect a repository or create cycles.
+    directory_path = path if directory else parent
+    for ancestor in (directory_path, *directory_path.parents):
+        if ancestor == root:
+            break
+        if ancestor.is_symlink():
+            raise ValueError("Cluster cache descendant directories cannot be symlinks")
+    return path
+
+
+def _download_cache_directory(backend: StorageBackend, src_path: str, dst_path: Path, root: Path) -> None:
+    """Walk beneath one admitted root without rebasing through child links."""
     for filename in backend.list_files(src_path):
+        dst_file = _cache_destination(root, dst_path, filename, directory=False)
         src_file = join_path(src_path, filename)
-        dst_file = dst_path / filename
-        backend.download_file(src_file, dst_file)
+        with TemporaryDirectory(prefix=".sie-cache-", dir=root) as temporary:
+            staged_file = Path(temporary) / "download"
+            backend.download_file(src_file, staged_file)
+            _cache_destination(root, dst_path, filename, directory=False)
+            staged_file.replace(dst_file)
 
     # Recursively download subdirectories
     for dirname in backend.list_dirs(src_path):
-        src_subdir = join_path(src_path, dirname)
-        dst_subdir = dst_path / dirname
+        dst_subdir = _cache_destination(root, dst_path, dirname, directory=True)
         dst_subdir.mkdir(parents=True, exist_ok=True)
-        _download_directory(backend, src_subdir, dst_subdir)
+        src_subdir = join_path(src_path, dirname)
+        _download_cache_directory(backend, src_subdir, dst_subdir, root)
 
 
 def _get_hf_ignore_patterns(
