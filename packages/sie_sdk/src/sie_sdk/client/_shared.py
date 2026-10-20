@@ -21,6 +21,7 @@ import numpy as np
 from msgpack.exceptions import UnpackException
 
 from sie_sdk._msgpack import unpackb as unpack_msgpack
+from sie_sdk.client._lora import LORA_UNSET, UnsetLora, merge_lora_extra_body
 from sie_sdk.images import convert_item_images
 
 _logger = logging.getLogger(__name__)
@@ -1807,7 +1808,7 @@ def build_chat_body(
     seed: int | None = None,
     user: str | None = None,
     safety_identifier: str | None = None,
-    lora_adapter: str | None = None,
+    lora_adapter: str | None | UnsetLora = LORA_UNSET,
     stream_options: dict[str, Any] | None = None,
     include_reasoning: bool | None = None,
     extra_body: dict[str, Any] | None = None,
@@ -1817,8 +1818,9 @@ def build_chat_body(
     Only fields the caller set are included so the gateway applies its own
     defaults for the rest. ``extra_body`` is merged LAST so a caller can still
     override / supply any forward-compat field not yet named on the typed
-    surface (the typed kwargs win unless the caller explicitly puts the same
-    key into ``extra_body``). Shared by the sync and async clients.
+    surface. LoRA selectors must agree with the typed selection, including
+    explicit null; conflicting selectors raise before sending. Shared by the
+    sync and async clients.
 
     Field set mirrors ``packages/sie_gateway/src/handlers/proxy.rs::chat_params_from_json``:
     the gateway rejects unknown keys with 400 ``unsupported_field`` and
@@ -1851,14 +1853,13 @@ def build_chat_body(
         "seed": seed,
         "user": user,
         "safety_identifier": safety_identifier,
-        "lora_adapter": lora_adapter,
         "stream_options": stream_options,
         "include_reasoning": include_reasoning,
     }
     body.update({key: value for key, value in optional.items() if value is not None})
-    if extra_body:
-        body.update(extra_body)
-    return body
+    if lora_adapter is not LORA_UNSET:
+        body["lora_adapter"] = lora_adapter
+    return merge_lora_extra_body(body, extra_body)
 
 
 def build_responses_body(
