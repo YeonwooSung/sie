@@ -52,6 +52,13 @@ import httpx
 
 from sie_sdk._msgpack import packb as pack_msgpack
 from sie_sdk.audio import convert_item_audio
+from sie_sdk.client._lora import (
+    LORA_UNSET,
+    UnsetLora,
+    lora_selection,
+    merge_lora_extra_body,
+    merge_runtime_lora_options,
+)
 from sie_sdk.documents import convert_item_document
 from sie_sdk.files import resolve_upload
 from sie_sdk.images import ImageLike, convert_images_for_json, convert_item_images
@@ -712,12 +719,7 @@ class SIEClient:
 
     def _resolve_options(self, options: dict[str, Any] | None) -> dict[str, Any] | None:
         """Resolve options, merging with defaults (per-call takes precedence)."""
-        if self._default_options is None:
-            return options
-        if options is None:
-            return self._default_options
-        # Merge: defaults first, then per-call overrides
-        return {**self._default_options, **options}
+        return merge_runtime_lora_options(self._default_options, options)
 
     def _resolve_pool_and_gpu(self, gpu: str | None) -> tuple[str | None, str | None]:
         """Resolve pool name and GPU type from gpu parameter.
@@ -1549,7 +1551,8 @@ class SIEClient:
 
                     if lora_retries > LORA_LOADING_MAX_RETRIES:
                         # Extract lora from options for error message
-                        lora_name = resolved_options.get("lora") if resolved_options else None
+                        selected_lora = lora_selection(resolved_options)
+                        lora_name = None if selected_lora is LORA_UNSET else selected_lora
                         msg = f"LoRA loading timeout after {lora_retries} retries"
                         raise LoraLoadingError(
                             msg,
@@ -2577,7 +2580,7 @@ class SIEClient:
         routing_key: str | None = None,
         prompt_cache_key: str | None = None,
         safety_identifier: str | None = None,
-        lora_adapter: str | None = None,
+        lora_adapter: str | None | UnsetLora = LORA_UNSET,
         options: dict[str, Any] | None = None,
         gpu: str | None = None,
         wait_for_capacity: bool = True,
@@ -2693,9 +2696,11 @@ class SIEClient:
             "routing_key": routing_key,
             "prompt_cache_key": prompt_cache_key,
             "safety_identifier": safety_identifier,
-            "lora_adapter": lora_adapter,
         }
         request_body.update({key: value for key, value in optional_fields.items() if value is not None})
+        if lora_adapter is not LORA_UNSET:
+            request_body["lora_adapter"] = lora_adapter
+        lora_selection(request_body)
         validate_generate_request_body(request_body)
 
         body = json.dumps(request_body).encode("utf-8")
@@ -3040,7 +3045,7 @@ class SIEClient:
         seed: int | None = None,
         user: str | None = None,
         safety_identifier: str | None = None,
-        lora_adapter: str | None = None,
+        lora_adapter: str | None | UnsetLora = LORA_UNSET,
         include_reasoning: bool | None = None,
         gpu: str | None = None,
         extra_body: dict[str, Any] | None = None,
@@ -3191,7 +3196,7 @@ class SIEClient:
         seed: int | None = None,
         user: str | None = None,
         safety_identifier: str | None = None,
-        lora_adapter: str | None = None,
+        lora_adapter: str | None | UnsetLora = LORA_UNSET,
         stream_options: dict[str, Any] | None = None,
         include_reasoning: bool | None = None,
         gpu: str | None = None,
@@ -3277,7 +3282,7 @@ class SIEClient:
         routing_key: str | None = None,
         prompt_cache_key: str | None = None,
         safety_identifier: str | None = None,
-        lora_adapter: str | None = None,
+        lora_adapter: str | None | UnsetLora = LORA_UNSET,
         gpu: str | None = None,
         options: dict[str, Any] | None = None,
         extra_body: dict[str, Any] | None = None,
@@ -3325,15 +3330,15 @@ class SIEClient:
             "routing_key": routing_key,
             "prompt_cache_key": prompt_cache_key,
             "safety_identifier": safety_identifier,
-            "lora_adapter": lora_adapter,
         }
         req.update({key: value for key, value in optional_fields.items() if value is not None})
+        if lora_adapter is not LORA_UNSET:
+            req["lora_adapter"] = lora_adapter
         if logprobs:
             req["logprobs"] = True
             if top_logprobs is not None:
                 req["top_logprobs"] = top_logprobs
-        if extra_body:
-            req.update(extra_body)
+        req = merge_lora_extra_body(req, extra_body)
         validate_generate_request_body(req)
         if not req.get("logprobs"):
             req.pop("top_logprobs", None)
