@@ -822,7 +822,7 @@ def serve(
         typer.echo("")
     cache_config = get_cache_config()
     if cache_config.cluster_cache:
-        typer.echo(f"Cluster cache: {cache_config.cluster_cache}")
+        typer.echo("Cluster cache: configured")
     if not cache_config.hf_fallback:
         typer.echo("HuggingFace Hub fallback: disabled")
 

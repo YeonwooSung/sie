@@ -98,3 +98,34 @@ def test_cli_cache_directory_precedence(
     assert observed[0].hf_fallback is False
     assert os.environ.get(environment_name) == expected_environment
     assert ("Cluster cache:" in result.output) is bool(observed[0].cluster_cache)
+
+
+@pytest.mark.parametrize("source", ["environment", "flag"])
+@pytest.mark.parametrize(
+    "cache_url",
+    [
+        "oss://example-user:synthetic-cache-marker@bucket/cache",
+        "abfss://container@account.invalid/cache?sv=example&sig=synthetic-sas-marker",
+    ],
+)
+def test_cluster_cache_banner_never_echoes_the_url(
+    monkeypatch: pytest.MonkeyPatch, source: str, cache_url: str
+) -> None:
+    observed = []
+    monkeypatch.setattr(cli, "run_server", Mock(side_effect=lambda **_kwargs: observed.append(get_cache_config())))
+    args = ["serve", "--host", "127.0.0.1"]
+    if source == "environment":
+        monkeypatch.setenv("SIE_CLUSTER_CACHE", cache_url)
+    else:
+        args.extend(["--cluster-cache", cache_url])
+
+    result = CliRunner().invoke(cli.app, args)
+
+    assert result.exit_code == 0, result.output
+    assert len(observed) == 1
+    assert observed[0].cluster_cache == cache_url
+    assert os.environ["SIE_CLUSTER_CACHE"] == cache_url
+    assert "Cluster cache: configured" in result.output
+    assert cache_url not in result.output
+    assert "synthetic-cache-marker" not in result.output
+    assert "synthetic-sas-marker" not in result.output
