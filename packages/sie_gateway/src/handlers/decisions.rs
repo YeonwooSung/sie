@@ -167,7 +167,15 @@ fn normalize_request(parsed: &Value) -> Result<(Value, Vec<Value>), Invalid> {
         .ok_or_else(|| invalid("request body must be a JSON object", ""))?;
     fields(
         body,
-        &["model", "input", "questions", "safety_identifier"],
+        &[
+            "model",
+            "input",
+            "questions",
+            "safety_identifier",
+            "lora_adapter",
+            "lora",
+            "lora_id",
+        ],
         "",
     )?;
     let model = text(body.get("model"), "model")?;
@@ -300,10 +308,11 @@ fn normalize_request(parsed: &Value) -> Result<(Value, Vec<Value>), Invalid> {
         }
         native.insert(format!("question_{index}"), normalized);
     }
-    Ok((
-        json!({"model": model, "state": body["input"], "questions": native}),
-        questions.clone(),
-    ))
+    let selectors =
+        super::lora::selectors(body).map_err(|message| invalid(message, "lora_adapter"))?;
+    let mut request = json!({"model": model, "state": body["input"], "questions": native});
+    request.as_object_mut().unwrap().extend(selectors);
+    Ok((request, questions.clone()))
 }
 
 fn probability(value: &Value) -> Result<f64, &'static str> {
@@ -633,6 +642,26 @@ mod tests {
             }
             _ => assert_eq!(actual, expected),
         }
+    }
+
+    #[test]
+    fn lora_selectors_survive_both_decision_translations() {
+        for field in super::super::lora::FIELDS {
+            for value in [Value::Null, json!("org/legal")] {
+                let mut body = predicate_request();
+                body[field] = value.clone();
+                let (native, _) = normalize_request(&body).unwrap();
+                let request = super::super::systemone::normalize_request(&native).unwrap();
+                assert_eq!(
+                    super::super::systemone::extract_body(&request)["params"]["options"][field],
+                    value
+                );
+            }
+        }
+        let mut conflict = predicate_request();
+        conflict["lora_adapter"] = Value::Null;
+        conflict["lora"] = json!("legal");
+        assert!(normalize_request(&conflict).is_err());
     }
 
     #[test]

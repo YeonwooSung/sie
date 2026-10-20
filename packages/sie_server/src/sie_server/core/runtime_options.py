@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from sie_server.types.inputs import InvalidInputError
+from sie_server.types.lora import InvalidLoraSelectionError, split_lora_selection
 from sie_server.types.overflow_policy import VALID_OVERFLOW_POLICIES
 
 if TYPE_CHECKING:
@@ -71,7 +72,11 @@ def check_overflow_policy(options: dict[str, Any]) -> None:
 
 
 class UndeclaredLoraError(InvalidInputError):
-    """``options.lora`` or ``options.lora_id`` names a LoRA the model's configuration does not declare."""
+    """A request selector names a LoRA the model's configuration does not declare."""
+
+
+class InvalidLoraOptionError(InvalidInputError):
+    """A request's LoRA aliases have invalid or conflicting values."""
 
 
 def _check_declared_lora(
@@ -87,7 +92,11 @@ def _check_declared_lora(
     Raises:
         UndeclaredLoraError: Either option is not null and not one of those names.
     """
-    for key, declared in (("lora_id", resolved.lora_ids), ("lora", resolved.lora_names)):
+    for key, declared in (
+        ("lora_id", resolved.lora_ids),
+        ("lora", resolved.lora_names),
+        ("lora_adapter", resolved.lora_names),
+    ):
         value = request_options.get(key)
         if value is None:
             continue
@@ -110,10 +119,18 @@ def merge_runtime_options_with_profile(
             ``overflow_policy`` is not a valid policy name.
     """
     resolved = _resolve_profile_or_raise(config, request_options)
-    merged: dict[str, Any] = dict(resolved.runtime)
-    if request_options:
-        _check_declared_lora(config, resolved, request_options.get("profile") or "default", request_options)
-        merged |= {key: value for key, value in request_options.items() if key != "profile"}
+    try:
+        selection, request = split_lora_selection(request_options or {})
+    except InvalidLoraSelectionError as exc:
+        raise InvalidLoraOptionError(str(exc)) from exc
+    defaults, merged = split_lora_selection(resolved.runtime)
+    if selection.provided:
+        _check_declared_lora(config, resolved, request.get("profile") or "default", request_options or {})
+    else:
+        selection = defaults
+    merged |= {key: value for key, value in request.items() if key != "profile"}
+    if selection.provided:
+        merged["lora"] = selection.value
     check_overflow_policy(merged)
     return merged, resolved
 

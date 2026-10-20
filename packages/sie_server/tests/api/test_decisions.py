@@ -10,7 +10,7 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from sie_server.api import decisions, systemone
-from sie_server.config.model import ExtractTask, ModelConfig, ProfileConfig, Tasks
+from sie_server.config.model import AdapterOptions, ExtractTask, ModelConfig, ProfileConfig, Tasks
 from sie_server.core.inference_output import ExtractItemError, ExtractOutput
 from sie_server.core.registry import ModelRegistry
 from sie_server.core.timing import RequestTiming
@@ -191,6 +191,67 @@ def test_malformed_worker_results_keep_the_public_error_envelope(dispatch, endpo
     error = response.json()["error" if endpoint == "decisions" else "detail"]
     assert error["code"] == "INTERNAL_ERROR"
     assert error["message"] == "model returned an invalid decision result"
+
+
+@pytest.mark.parametrize("endpoint", ["decisions", "systemone"])
+@pytest.mark.parametrize("selector", ["lora_adapter", "lora", "lora_id"])
+@pytest.mark.parametrize("value", [None, "org/legal"])
+def test_lora_selection_reaches_worker_without_losing_explicit_null(dispatch, endpoint, selector, value):
+    config = dispatch.registry.get_config.return_value
+    config.profiles["default"].adapter_options = AdapterOptions(
+        loadtime={"lora_paths": {"legal": "org/legal"}}, runtime={"lora_id": "org/legal"}
+    )
+    case = FIXTURE["requests"][0]
+    body = copy.deepcopy(case["request"] if endpoint == "decisions" else case["systemone"])
+    body[selector] = value
+    response = dispatch.client.post(f"/v1/{endpoint}", json=body)
+    assert response.status_code == 200, response.text
+    assert dispatch.worker.call_args.kwargs["options"] == {"overflow_policy": "error", "lora": value}
+    assert dispatch.route.call_args.kwargs["request_options"][selector] == value
+
+
+@pytest.mark.parametrize("endpoint", ["decisions", "systemone"])
+@pytest.mark.parametrize(
+    "selectors",
+    [
+        {"lora_adapter": "legal"},
+        {"lora": "legal"},
+        {"lora_adapter": "legal", "lora": "legal"},
+    ],
+)
+def test_served_lora_alias_is_admitted_on_decision_routes(dispatch, endpoint, selectors):
+    dispatch.registry.get_config.return_value.profiles["default"].adapter_options = AdapterOptions(
+        loadtime={"lora_paths": {"legal": "org/legal"}}
+    )
+    case = FIXTURE["requests"][0]
+    body = copy.deepcopy(case["request"] if endpoint == "decisions" else case["systemone"])
+    response = dispatch.client.post(f"/v1/{endpoint}", json={**body, **selectors})
+    assert response.status_code == 200, response.text
+    assert dispatch.worker.call_args.kwargs["options"]["lora"] == "legal"
+
+
+@pytest.mark.parametrize("endpoint", ["decisions", "systemone"])
+@pytest.mark.parametrize(
+    "selectors",
+    [
+        {"lora_adapter": None, "lora": "org/legal"},
+        {"lora_adapter": "org/legal", "lora_id": "other"},
+        {"lora_adapter": False},
+        {"lora_adapter": " "},
+        {"lora_id": "legal"},  # Legacy lora_id remains source-ID-only.
+        {"lora_adapter": "org/undeclared"},
+    ],
+)
+def test_bad_lora_selection_is_rejected_before_route_or_worker(dispatch, endpoint, selectors):
+    dispatch.registry.get_config.return_value.profiles["default"].adapter_options = AdapterOptions(
+        loadtime={"lora_paths": {"legal": "org/legal"}}
+    )
+    case = FIXTURE["requests"][0]
+    body = copy.deepcopy(case["request"] if endpoint == "decisions" else case["systemone"])
+    response = dispatch.client.post(f"/v1/{endpoint}", json={**body, **selectors})
+    assert response.status_code == (400 if endpoint == "decisions" else 422), response.text
+    dispatch.route.assert_not_awaited()
+    dispatch.worker.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

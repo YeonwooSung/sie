@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from sie_server.api import systemone
 from sie_server.api.helpers import openai_error_response, read_bounded_request_body
 from sie_server.api.routing import error_code, fallback_refusal, remote_routing
+from sie_server.types.lora import LORA_SELECTION_FIELDS, InvalidLoraSelectionError, split_lora_selection
 
 router = APIRouter(prefix="/v1", tags=["openai-compat"], dependencies=[Depends(remote_routing)])
 
@@ -119,7 +120,11 @@ def normalize_request(body: Any) -> tuple[systemone.SystemOneRequest, list[dict[
     """
     if not isinstance(body, dict):
         raise invalid("request body must be a JSON object")
-    _fields(body, {"model", "input", "questions", "safety_identifier"}, "")
+    _fields(body, {"model", "input", "questions", "safety_identifier", *LORA_SELECTION_FIELDS}, "")
+    try:
+        split_lora_selection(body)
+    except InvalidLoraSelectionError as exc:
+        raise invalid(str(exc), "lora_adapter") from exc
     model = _text(body.get("model"), "model")
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", model) is None or ".." in model:
         raise invalid("invalid model id", "model")
@@ -182,7 +187,12 @@ def normalize_request(body: Any) -> tuple[systemone.SystemOneRequest, list[dict[
                 else descriptions
             )
         native[f"question_{index}"] = normalized
-    return systemone.SystemOneRequest(model=model, state=state, questions=native), questions
+    return systemone.SystemOneRequest(
+        model=model,
+        state=state,
+        questions=native,
+        **{key: body[key] for key in LORA_SELECTION_FIELDS if key in body},
+    ), questions
 
 
 def _probability(value: Any) -> float:

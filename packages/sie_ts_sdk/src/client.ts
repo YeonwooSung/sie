@@ -109,6 +109,7 @@ import {
   requireConnectionSchemaPolicy,
   requireConnectorIdempotencyKey,
 } from "./jobs.js";
+import { validateLoraSelectors } from "./lora.js";
 import { packMessage, unpackMessage } from "./msgpack.js";
 import { SSECompletion, parseSseStream } from "./sse.js";
 import {
@@ -549,6 +550,7 @@ function validateGenerateGrammar(grammar: GenerateGrammar | Record<string, unkno
 
 /** Serialize the controls shared by blocking and streaming native generation. */
 function applyGenerateOptions(body: Record<string, unknown>, options: GenerateOptions): void {
+  validateLoraSelectors({ lora_adapter: options.loraAdapter });
   if (options.temperature !== undefined) body.temperature = options.temperature;
   if (options.topP !== undefined) body.top_p = options.topP;
   if (options.adapterOptions !== undefined) body.options = options.adapterOptions;
@@ -890,6 +892,7 @@ function runtimeOptions(
   adapterOptions: Record<string, unknown> | undefined,
   typed: Record<string, unknown>,
 ): Record<string, unknown> | undefined {
+  validateLoraSelectors(adapterOptions);
   const set = Object.fromEntries(Object.entries(typed).filter(([, value]) => value !== undefined));
   if (adapterOptions === undefined && Object.keys(set).length === 0) {
     return undefined;
@@ -1631,6 +1634,7 @@ export class SIEClient {
     req: ChatCompletionRequest,
     options: ChatCompletionOptions = {},
   ): Promise<ChatCompletion> {
+    validateLoraSelectors({ lora_adapter: req.lora_adapter });
     if (req.stream === true) {
       throw new RequestError(
         "chatCompletions() cannot be used with stream:true — use streamChatCompletions() instead.",
@@ -1728,6 +1732,7 @@ export class SIEClient {
     req: ChatCompletionRequest,
     signal?: AbortSignal,
   ): AsyncGenerator<ChatCompletionChunk, void, undefined> {
+    validateLoraSelectors({ lora_adapter: req.lora_adapter });
     if (req.seed !== undefined) {
       validateGenerationSeed(req.seed);
     }
@@ -2096,6 +2101,7 @@ export class SIEClient {
     items: Item[],
     options: ScoreOptions = {},
   ): Promise<ScoreResult> {
+    validateLoraSelectors(options.adapterOptions);
     const queryForWire = await itemImagesForWire(query);
     const itemsForWire = await itemsImagesForWire(items);
 

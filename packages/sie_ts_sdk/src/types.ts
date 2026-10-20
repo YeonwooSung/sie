@@ -1214,7 +1214,7 @@ export interface GenerateOptions {
   /** Opaque privacy-preserving safety identifier. */
   safetyIdentifier?: string;
   /** Served LoRA adapter name. */
-  loraAdapter?: string;
+  loraAdapter?: string | null;
   /**
    * Governed generation runtime options forwarded as `options`. Typed native
    * fields still win when both surfaces provide the same sampler control.
@@ -1454,7 +1454,7 @@ export interface ChatCompletionRequest {
    * extension). Must be a non-empty string; unknown names are rejected by
    * the gateway with 400 `unknown_lora`.
    */
-  lora_adapter?: string;
+  lora_adapter?: string | null;
   /** SIE-native routing affinity hint. */
   routing_key?: string;
   /** SIE-native prompt-cache hint. */
