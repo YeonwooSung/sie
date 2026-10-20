@@ -191,3 +191,19 @@ def test_malformed_worker_results_keep_the_public_error_envelope(dispatch, endpo
     error = response.json()["error" if endpoint == "decisions" else "detail"]
     assert error["code"] == "INTERNAL_ERROR"
     assert error["message"] == "model returned an invalid decision result"
+
+
+@pytest.mark.parametrize(
+    "adapter_path",
+    [
+        "sie_server.adapters.gliner2.decide_lora:GLiNER2DecideLoraAdapter",
+        "sie_server.adapters.laya.runtime_lora:LayaLoraAdapter",
+        "sie_server.adapters.pplx_decider.runtime_lora:PerplexityDecisionLoraAdapter",
+    ],
+)
+def test_explicit_decision_facade_paths_are_admitted_without_loading_them(dispatch, adapter_path):
+    # Admission contract only; facade execution is covered by its owning adapter tests.
+    dispatch.registry.get_config.return_value.profiles["default"].adapter_path = adapter_path
+    response = dispatch.client.post("/v1/decisions", json=FIXTURE["requests"][0]["request"])
+    assert response.status_code == 200, response.text
+    dispatch.worker.assert_awaited_once()

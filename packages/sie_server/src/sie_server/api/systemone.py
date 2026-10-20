@@ -63,8 +63,11 @@ router = APIRouter(prefix="/v1", tags=["systemone"], dependencies=[Depends(remot
 DECISION_ADAPTERS = frozenset(
     {
         "sie_server.adapters.gliner2.decide:GLiNER2DecideAdapter",
+        "sie_server.adapters.gliner2.decide_lora:GLiNER2DecideLoraAdapter",
         "sie_server.adapters.laya.adapter:LayaAdapter",
+        "sie_server.adapters.laya.runtime_lora:LayaLoraAdapter",
         "sie_server.adapters.pplx_decider.adapter:PerplexityDecisionAdapter",
+        "sie_server.adapters.pplx_decider.runtime_lora:PerplexityDecisionLoraAdapter",
     }
 )
 
