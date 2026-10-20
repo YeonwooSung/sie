@@ -41,6 +41,7 @@ from sie_sdk.bundle_utils import (
     match_bundle_model_adapters,
     match_bundle_models,
 )
+from sie_sdk.cache import get_cache_config
 
 import sie_server
 from sie_server.api.decisions import router as decisions_router
@@ -513,7 +514,11 @@ def serve(
         "--cluster-cache",
         help="Cluster cache URL (s3://, gs://, abfs(s)://, or oss://)",
     ),
-    hf_fallback: bool = typer.Option(True, "--hf-fallback/--no-hf-fallback", help="Enable HuggingFace Hub fallback"),
+    hf_fallback: bool | None = typer.Option(
+        None,
+        "--hf-fallback/--no-hf-fallback",
+        help="Override HuggingFace Hub fallback (default: SIE_HF_FALLBACK or enabled)",
+    ),
     reload: bool = typer.Option(default=False, help="Enable auto-reload for development"),
     tracing: bool = typer.Option(default=False, help="Enable OpenTelemetry tracing (exports to localhost:4317)"),
     instrumentation: bool = typer.Option(False, "--instrumentation", "-i", help="Enable batch instrumentation logging"),
@@ -771,15 +776,16 @@ def serve(
     # Pass cache config via environment variables
     if local_cache:
         os.environ["SIE_LOCAL_CACHE"] = str(Path(local_cache).resolve())
-    elif "SIE_LOCAL_CACHE" in os.environ:
+    elif local_cache is not None and "SIE_LOCAL_CACHE" in os.environ:
         del os.environ["SIE_LOCAL_CACHE"]
 
     if cluster_cache:
         os.environ["SIE_CLUSTER_CACHE"] = cluster_cache
-    elif "SIE_CLUSTER_CACHE" in os.environ:
+    elif cluster_cache is not None and "SIE_CLUSTER_CACHE" in os.environ:
         del os.environ["SIE_CLUSTER_CACHE"]
 
-    os.environ["SIE_HF_FALLBACK"] = "true" if hf_fallback else "false"
+    if hf_fallback is not None:
+        os.environ["SIE_HF_FALLBACK"] = "true" if hf_fallback else "false"
 
     # Configure tracing via environment variables
     if tracing:
@@ -814,9 +820,10 @@ def serve(
             f"    →  OpenAI base  http://localhost:{port}/v1   (embeddings · rerank; chat/completions with -b sglang)"
         )
         typer.echo("")
-    if cluster_cache:
-        typer.echo(f"Cluster cache: {cluster_cache}")
-    if not hf_fallback:
+    cache_config = get_cache_config()
+    if cache_config.cluster_cache:
+        typer.echo("Cluster cache: configured")
+    if not cache_config.hf_fallback:
         typer.echo("HuggingFace Hub fallback: disabled")
 
     # Handle preload models (CLI flag takes precedence, then env var from Helm configmap)
