@@ -778,3 +778,73 @@ class TestGatedModelErrorHandling:
             mock_download.assert_called_once()
             call_kwargs = mock_download.call_args[1]
             assert call_kwargs["cache_dir"] == str(tmp_path)
+
+
+@pytest.mark.parametrize("allow_patterns", [None, ["adapter_config.json", "adapter_model.safetensors"]])
+def test_hub_download_pattern_filter_is_optional_and_forwarded(
+    tmp_path: Path, allow_patterns: list[str] | None
+) -> None:
+    config = CacheConfig(local_cache=tmp_path, hf_fallback=True)
+    revision = "a" * 40
+    with patch("huggingface_hub.snapshot_download") as download:
+        if allow_patterns is None:
+            result = ensure_model_cached("org/model", config, revision=revision)
+        else:
+            result = ensure_model_cached("org/model", config, revision=revision, allow_patterns=allow_patterns)
+    assert result == tmp_path / "models--org--model"
+    download.assert_called_once()
+    assert download.call_args.args == ("org/model",)
+    assert download.call_args.kwargs["revision"] == revision
+    assert download.call_args.kwargs["cache_dir"] == str(tmp_path)
+    assert download.call_args.kwargs.get("allow_patterns") == allow_patterns
+
+
+@pytest.mark.parametrize("revision", [None, "a" * 40])
+@pytest.mark.parametrize("required_files", [None, [], ["adapter_config.json"], ["adapter_model.safetensors"]])
+def test_opt_in_cache_completeness_keeps_ordinary_semantics(
+    tmp_path: Path, revision: str | None, required_files: list[str] | None
+) -> None:
+    directory = tmp_path / "models--org--model" / "snapshots" / ("a" * 40)
+    directory.mkdir(parents=True)
+    (directory / "adapter_config.json").write_bytes(b"{}")
+    config = CacheConfig(local_cache=tmp_path, hf_fallback=False)
+
+    assert is_model_cached("org/model", config, revision=revision) is True
+    assert is_model_cached("org/model", config, revision=revision, required_files=required_files) is (
+        required_files != ["adapter_model.safetensors"]
+    )
+
+
+@pytest.mark.parametrize("lookup", [is_model_cached, ensure_model_cached])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",
+        ".",
+        "..",
+        "/absolute",
+        "../weights",
+        "nested/../../weights",
+        "nested//weights",
+        "nested\\weights",
+        "C:weights",
+        "file:stream",
+        "bad\x00name",
+        "./weights",
+    ],
+)
+def test_required_cache_files_refuse_unsafe_relative_names(tmp_path: Path, lookup, name: str) -> None:
+    config = CacheConfig(local_cache=tmp_path, cluster_cache="s3://must-not-contact", hf_fallback=True)
+    with (
+        patch("sie_sdk.cache.get_storage_backend", side_effect=AssertionError("storage must not be contacted")),
+        patch("huggingface_hub.snapshot_download", side_effect=AssertionError("Hub must not be contacted")),
+        pytest.raises(ValueError, match="safe relative paths"),
+    ):
+        lookup("org/model", config, required_files=[name])
+
+
+def test_required_cache_files_support_safe_nested_files(tmp_path: Path) -> None:
+    directory = tmp_path / "models--org--model" / "snapshots" / ("a" * 40)
+    (directory / "nested").mkdir(parents=True)
+    (directory / "nested" / "config.json").write_bytes(b"{}")
+    assert is_model_cached("org/model", CacheConfig(local_cache=tmp_path), required_files=["nested/config.json"])

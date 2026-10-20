@@ -98,6 +98,8 @@ def is_model_cached(
     model_id: str,
     config: CacheConfig | None = None,
     revision: str | None = None,
+    *,
+    required_files: list[str] | None = None,
 ) -> bool:
     """Check if a model is already in local cache.
 
@@ -108,12 +110,23 @@ def is_model_cached(
         config: Cache configuration. If None, reads from environment.
         revision: Exact snapshot commit, branch, or tag to require. Branches
             and tags resolve through the local Hugging Face ``refs`` cache.
+        required_files: Safe relative files required for a cache hit. By
+            default, any file preserves the existing model-cache semantics.
 
     Returns:
         True if model appears to be cached locally.
     """
     if config is None:
         config = get_cache_config()
+
+    if required_files is not None:
+        for name in required_files:
+            if (
+                not isinstance(name, str)
+                or any(character in name for character in ("\\", "\x00", ":"))
+                or any(part in {"", ".", ".."} for part in name.split("/"))
+            ):
+                raise ValueError("Required cache files must be safe relative paths")
 
     # HF Hub cache structure: models--{org}--{model}/snapshots/{revision}/
     cache_dir = config.local_cache / f"models--{model_id.replace('/', '--')}"
@@ -143,15 +156,27 @@ def is_model_cached(
         ):
             return False
         snapshot = snapshots_dir / resolved_revision
-        return snapshot.is_dir() and any(snapshot.iterdir())
+        return (
+            snapshot.is_dir()
+            and any(snapshot.iterdir())
+            and (required_files is None or all((snapshot / name).is_file() for name in required_files))
+        )
 
-    return any(snapshot.is_dir() and any(snapshot.iterdir()) for snapshot in snapshots_dir.iterdir())
+    return any(
+        snapshot.is_dir()
+        and any(snapshot.iterdir())
+        and (required_files is None or all((snapshot / name).is_file() for name in required_files))
+        for snapshot in snapshots_dir.iterdir()
+    )
 
 
 def ensure_model_cached(
     model_id: str,
     config: CacheConfig | None = None,
     revision: str | None = None,
+    *,
+    allow_patterns: list[str] | None = None,
+    required_files: list[str] | None = None,
 ) -> Path:
     """Ensure model weights are in local cache.
 
@@ -164,6 +189,10 @@ def ensure_model_cached(
         model_id: HuggingFace model ID (e.g., "BAAI/bge-m3").
         config: Cache configuration. If None, reads from environment.
         revision: Specific model revision (commit hash, branch, or tag).
+        allow_patterns: Optional file filter for Hub downloads only. Local and
+            cluster cache lookup and population remain unchanged.
+        required_files: Files required for a local or cluster hit. A partial
+            snapshot continues through the existing fallback tiers.
 
     Returns:
         Path to cached model in local cache.
@@ -176,20 +205,22 @@ def ensure_model_cached(
         config = get_cache_config()
 
     # Check local cache first
-    if is_model_cached(model_id, config, revision=revision):
+    if is_model_cached(model_id, config, revision=revision, required_files=required_files):
         logger.debug("Model %s found in local cache", model_id)
         return _get_model_cache_path(model_id, config)
 
     # Try cluster cache if configured
     if config.cluster_cache:
-        if _download_from_cluster_cache(model_id, config) and is_model_cached(model_id, config, revision=revision):
+        if _download_from_cluster_cache(model_id, config) and is_model_cached(
+            model_id, config, revision=revision, required_files=required_files
+        ):
             logger.info("Downloaded %s from cluster cache", model_id)
             return _get_model_cache_path(model_id, config)
 
     # Download from HuggingFace Hub if fallback enabled
     if config.hf_fallback:
         logger.info("Downloading %s from HuggingFace Hub", model_id)
-        return _download_from_huggingface(model_id, config, revision)
+        return _download_from_huggingface(model_id, config, revision, allow_patterns=allow_patterns)
 
     # Not in any cache and HF fallback disabled
     raise RuntimeError(
@@ -344,6 +375,8 @@ def _download_from_huggingface(
     model_id: str,
     config: CacheConfig,
     revision: str | None = None,
+    *,
+    allow_patterns: list[str] | None = None,
 ) -> Path:
     """Download model from HuggingFace Hub to local cache.
 
@@ -354,6 +387,7 @@ def _download_from_huggingface(
         model_id: HuggingFace model ID.
         config: Cache configuration.
         revision: Specific model revision.
+        allow_patterns: Optional file filter passed to snapshot_download.
 
     Returns:
         Path to the model in local cache.
@@ -379,6 +413,7 @@ def _download_from_huggingface(
             revision=revision,
             token=token,
             cache_dir=str(config.local_cache),  # Points to HF_HOME/hub
+            allow_patterns=allow_patterns,
             ignore_patterns=_get_hf_ignore_patterns(model_id, revision, token),
         )
         return _get_model_cache_path(model_id, config)
