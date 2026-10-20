@@ -513,7 +513,12 @@ def serve(
         "--cluster-cache",
         help="Cluster cache URL (s3://, gs://, abfs(s)://, or oss://)",
     ),
-    hf_fallback: bool = typer.Option(True, "--hf-fallback/--no-hf-fallback", help="Enable HuggingFace Hub fallback"),
+    hf_fallback: bool = typer.Option(
+        True,
+        "--hf-fallback/--no-hf-fallback",
+        envvar="SIE_HF_FALLBACK",
+        help="Enable HuggingFace Hub fallback",
+    ),
     reload: bool = typer.Option(default=False, help="Enable auto-reload for development"),
     tracing: bool = typer.Option(default=False, help="Enable OpenTelemetry tracing (exports to localhost:4317)"),
     instrumentation: bool = typer.Option(False, "--instrumentation", "-i", help="Enable batch instrumentation logging"),
